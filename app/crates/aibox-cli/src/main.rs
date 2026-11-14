@@ -5,6 +5,7 @@ mod json;
 mod models;
 mod safetensors;
 mod sampling;
+mod server;
 
 use std::env;
 use std::process::ExitCode;
@@ -23,7 +24,8 @@ fn print_usage() {
          \x20 aibox list                  Liste les modèles en cache local\n\
          \x20 aibox inspect <model|dir>   Vérifie config.json, quant_config.json et SafeTensors\n\
          \x20 aibox selftest              Vérifie le backend CPU (AVX2/Scalar) bout en bout\n\
-         \x20 aibox bench-forward         Benchmark SERV-03 (Prefill/Decode Transformer synthétique)"
+         \x20 aibox bench-forward         Benchmark SERV-03 (Prefill/Decode Transformer synthétique)\n\
+         \x20 aibox serve [--port 11434]  Démarre le serveur HTTP OpenAI + Ollama (SERV-04)"
     );
 }
 
@@ -109,6 +111,30 @@ fn run_bench_forward() -> Result<(), String> {
     Ok(())
 }
 
+fn run_serve(args: &[String]) -> Result<(), String> {
+    let mut config = server::ServerConfig::default();
+    let mut idx = 0usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--host" => {
+                idx += 1;
+                let host = args.get(idx).ok_or_else(|| "Valeur manquante pour --host".to_string())?;
+                config.host = host.clone();
+            }
+            "--port" => {
+                idx += 1;
+                let port_str = args.get(idx).ok_or_else(|| "Valeur manquante pour --port".to_string())?;
+                config.port = port_str
+                    .parse::<u16>()
+                    .map_err(|_| format!("Port invalide '{port_str}'"))?;
+            }
+            other => return Err(format!("Option inconnue pour serve : '{other}'")),
+        }
+        idx += 1;
+    }
+    server::run_server(config)
+}
+
 fn dispatch(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         None | Some("-h") | Some("--help") | Some("help") => {
@@ -143,6 +169,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         }
         Some("selftest") => run_selftest(),
         Some("bench-forward") => run_bench_forward(),
+        Some("serve") => run_serve(&args[1..]),
         Some(other) => Err(format!("Commande inconnue '{other}'. Lancez `aibox --help`.")),
     }
 }
