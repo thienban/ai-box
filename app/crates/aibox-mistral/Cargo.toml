@@ -5,9 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "Adaptateur KERN-07 : couche linéaire ternaire AI Box pour mistral.rs / candle"
 
+[features]
+default = []
+mistral = []
+
 [dependencies]
 aibox-kernels = { path = "../aibox-kernels" }
 
-# Décommenter lors de l'intégration en ligne (PC / Colab avec accès crates.io) :
-# candle-core = "0.8"
+# Décommenter lors de la compilation en ligne (PowerShell / Colab) avec `--features mistral` :
+# candle-core = "0.11.1"
 # mistralrs-quant = { git = "https://github.com/EricLBuehler/mistral.rs.git" }

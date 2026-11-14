@@ -4,6 +4,7 @@ use aibox_kernels::tensor::TernaryTensor;
 use aibox_kernels::{BackendError, TernaryHadamardBackend, TmacCpuBackend};
 
 /// Couche linéaire ternaire prête à être encapsulée dans `mistralrs_quant::QuantMethod`.
+#[derive(Debug)]
 pub struct AiboxTernaryLinear {
     tensor: TernaryTensor,
     backend: TmacCpuBackend,
@@ -35,6 +36,102 @@ impl AiboxTernaryLinear {
             self.tensor.n_rows,
             self.tensor.k_cols,
         )
+    }
+}
+
+#[cfg(feature = "mistral")]
+mod mistral_impl {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    use aibox_kernels::tensor::{f16_to_f32, unpack_ternary_2bit_rows};
+    use aibox_kernels::GROUP_SIZE;
+    use candle_core::{DType, Device, Result as CandleResult, Tensor};
+    use mistralrs_quant::{
+        IsqPlanParams, IsqRequest, IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard,
+        QuantizedSerde,
+    };
+
+    use super::AiboxTernaryLinear;
+
+    impl QuantizedSerde for AiboxTernaryLinear {
+        fn name(&self) -> &'static str {
+            "aibox_ternary_hadamard"
+        }
+    }
+
+    impl QuantMethod for AiboxTernaryLinear {
+        fn new(_method: QuantMethodConfig) -> CandleResult<Self> {
+            candle_core::bail!("Use AiboxTernaryLinear::new(TernaryTensor) directly")
+        }
+
+        fn dequantize_w(&self) -> CandleResult<Tensor> {
+            let unpacked = unpack_ternary_2bit_rows(
+                &self.tensor.packed_weights,
+                self.tensor.n_rows,
+                self.tensor.k_cols,
+            )
+            .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+
+            let groups_per_row = self.tensor.k_cols / GROUP_SIZE;
+            let mut weights_f32 = Vec::with_capacity(self.tensor.n_rows * self.tensor.k_cols);
+            for (idx, &ternary_val) in unpacked.iter().enumerate() {
+                let row = idx / self.tensor.k_cols;
+                let group = (idx % self.tensor.k_cols) / GROUP_SIZE;
+                let scale = f16_to_f32(self.tensor.scales_fp16[row * groups_per_row + group]);
+                weights_f32.push((ternary_val as f32) * scale);
+            }
+            Tensor::from_vec(
+                weights_f32,
+                (self.tensor.n_rows, self.tensor.k_cols),
+                &Device::Cpu,
+            )
+        }
+
+        fn forward_raw(&self, a: &Tensor) -> CandleResult<Tensor> {
+            let orig_dims = a.dims();
+            let k = *orig_dims
+                .last()
+                .ok_or_else(|| candle_core::Error::Msg("Input tensor has 0 dimensions".into()))?;
+            let m = a.elem_count() / k;
+            let act_vec = a.flatten_all()?.to_vec1::<f32>()?;
+            let out_vec = self
+                .forward_f32(&act_vec, m)
+                .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+
+            let mut out_dims = orig_dims.to_vec();
+            if let Some(last) = out_dims.last_mut() {
+                *last = self.tensor.n_rows;
+            }
+            Tensor::from_vec(out_vec, out_dims, a.device())
+        }
+
+        fn quantized_act_type(&self) -> Option<DType> {
+            Some(DType::F32)
+        }
+
+        fn dtype_and_device(&self) -> (DType, Device) {
+            (DType::F32, Device::Cpu)
+        }
+
+        fn plan_isq(&self, _request: &IsqRequest) -> CandleResult<IsqPlanParams> {
+            candle_core::bail!("Already quantized as aibox_ternary_hadamard")
+        }
+
+        fn add_delta_w(&self, _delta: &Tensor) -> CandleResult<Arc<dyn QuantMethod>> {
+            candle_core::bail!("LoRA delta_w not supported on aibox_ternary_hadamard")
+        }
+
+        fn apply_isq(
+            self: Arc<Self>,
+            _dtype: Option<IsqType>,
+            _device: Device,
+            _n_quantized: &AtomicUsize,
+            _imatrix_weight: Option<Vec<f32>>,
+            _guard: QuantizeOntoGuard,
+        ) -> CandleResult<Arc<dyn QuantMethod>> {
+            Ok(self)
+        }
     }
 }
 
