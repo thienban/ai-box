@@ -136,6 +136,23 @@ def should_include_tensor(name: str, max_layers: int | None) -> bool:
     return True
 
 
+def dequantize_q1_0(data: np.ndarray) -> np.ndarray:
+    """Dequantize GGUF Q1_0 (128 poids/bloc : 2 octets fp16 scale + 16 octets bits)."""
+    raw = np.ascontiguousarray(data.view(np.uint8))
+    out_shape = (*raw.shape[:-1], (raw.shape[-1] // 18) * GROUP_SIZE)
+    blocks = raw.reshape(-1, 18)
+    scales = blocks[:, :2].view(np.float16).astype(np.float32)
+    bits = np.unpackbits(blocks[:, 2:], axis=1, bitorder="little").astype(np.float32)
+    signs = bits * 2.0 - 1.0
+    return (signs * scales).reshape(out_shape)
+
+
+def dequantize_tensor(tensor: Any, gguf_mod: Any) -> np.ndarray:
+    if getattr(tensor.tensor_type, "name", "") == "Q1_0":
+        return dequantize_q1_0(tensor.data)
+    return gguf_mod.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
+
+
 def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None) -> None:
     import gguf
     from safetensors.numpy import save_file
@@ -169,7 +186,7 @@ def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None) -> None
         if not should_include_tensor(tensor.name, max_layers):
             continue
 
-        dequant = gguf.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
+        dequant = dequantize_tensor(tensor, gguf)
         target_name = normalize_tensor_name(tensor.name)
 
         if tensor.name.endswith(TERNARY_SUFFIXES) and dequant.ndim == 2:
