@@ -137,28 +137,64 @@ impl<'a> Parser<'a> {
         Err(format!("Invalid literal at pos {}", self.pos))
     }
 
+    fn parse_hex4(&mut self) -> Result<u16, String> {
+        let mut val = 0u16;
+        for _ in 0..4 {
+            let b = self.next_byte()?;
+            let digit = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                _ => return Err(format!("Invalid hex digit '{}' in \\u escape", b as char)),
+            };
+            val = (val << 4) | (digit as u16);
+        }
+        Ok(val)
+    }
+
     fn parse_string(&mut self) -> Result<String, String> {
         if self.next_byte()? != b'"' {
             return Err("Expected '\"'".to_string());
         }
-        let mut out = String::new();
+        let mut raw = Vec::new();
         loop {
             let b = self.next_byte()?;
             match b {
-                b'"' => return Ok(out),
+                b'"' => {
+                    return String::from_utf8(raw)
+                        .map_err(|e| format!("Invalid UTF-8 in JSON string: {e}"));
+                }
                 b'\\' => {
                     let esc = self.next_byte()?;
                     match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        _ => out.push(esc as char),
+                        b'"' => raw.push(b'"'),
+                        b'\\' => raw.push(b'\\'),
+                        b'/' => raw.push(b'/'),
+                        b'b' => raw.push(0x08),
+                        b'f' => raw.push(0x0c),
+                        b'n' => raw.push(b'\n'),
+                        b'r' => raw.push(b'\r'),
+                        b't' => raw.push(b'\t'),
+                        b'u' => {
+                            let code = self.parse_hex4()?;
+                            let ch = if (0xD800..=0xDBFF).contains(&code)
+                                && self.bytes.get(self.pos..self.pos + 2) == Some(b"\\u")
+                            {
+                                self.pos += 2;
+                                let low = self.parse_hex4()?;
+                                let combined = 0x10000
+                                    + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
+                                char::from_u32(combined).unwrap_or('\u{FFFD}')
+                            } else {
+                                char::from_u32(code as u32).unwrap_or('\u{FFFD}')
+                            };
+                            let mut buf = [0u8; 4];
+                            raw.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
+                        _ => raw.push(esc),
                     }
                 }
-                other => out.push(other as char),
+                other => raw.push(other),
             }
         }
     }

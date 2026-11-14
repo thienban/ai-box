@@ -21,15 +21,34 @@ impl TernaryHadamardBackend for ScalarBackend {
         n: usize,
         k: usize,
     ) -> Result<Vec<f32>, BackendError> {
+        self.matmul_ternary(activations, packed_weights, scales_fp16, m, n, k, true)
+    }
+
+    fn matmul_ternary(
+        &self,
+        activations: &[f32],
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        m: usize,
+        n: usize,
+        k: usize,
+        use_hadamard: bool,
+    ) -> Result<Vec<f32>, BackendError> {
         validate_matmul_inputs(activations, packed_weights, scales_fp16, m, n, k)?;
 
-        let rotated_x = apply_fwht_128_rows(activations, m, k)?;
+        let rotated_x;
+        let x_input = if use_hadamard {
+            rotated_x = apply_fwht_128_rows(activations, m, k)?;
+            rotated_x.as_slice()
+        } else {
+            activations
+        };
         let groups_per_row = k / GROUP_SIZE;
         let packed_row_stride = groups_per_row * PACKED_BYTES_PER_GROUP;
         let mut output = vec![0.0f32; m * n];
 
         for row_m in 0..m {
-            let x_row = &rotated_x[row_m * k..(row_m + 1) * k];
+            let x_row = &x_input[row_m * k..(row_m + 1) * k];
             let out_row = &mut output[row_m * n..(row_m + 1) * n];
 
             for row_n in 0..n {

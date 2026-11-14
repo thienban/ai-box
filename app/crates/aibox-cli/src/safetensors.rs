@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use aibox_kernels::tensor::TernaryTensor;
+use aibox_kernels::tensor::{f16_to_f32, TernaryTensor};
 use aibox_kernels::GROUP_SIZE;
 
 use crate::json::{parse_json, JsonValue};
@@ -166,6 +166,63 @@ impl SafeTensorsFile {
 
         TernaryTensor::from_raw(n_rows, k_cols, packed_weights, scales_fp16)
             .map_err(|e| format!("Invalid TernaryTensor '{weight_name}': {e}"))
+    }
+
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
+    /// Charge un tenseur F16 ou F32 (normes, embeddings) en `Vec<f32>`.
+    pub fn load_f32_vector(&mut self, name: &str) -> Result<Vec<f32>, String> {
+        let dtype = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("Missing tensor '{name}'"))?
+            .dtype
+            .clone();
+        let bytes = self.read_tensor_bytes(name)?;
+        match dtype.as_str() {
+            "F16" => {
+                if bytes.len() % 2 != 0 {
+                    return Err(format!("Invalid F16 byte length for '{name}'"));
+                }
+                Ok(bytes
+                    .chunks_exact(2)
+                    .map(|pair| f16_to_f32(u16::from_le_bytes([pair[0], pair[1]])))
+                    .collect())
+            }
+            "F32" => {
+                if bytes.len() % 4 != 0 {
+                    return Err(format!("Invalid F32 byte length for '{name}'"));
+                }
+                Ok(bytes
+                    .chunks_exact(4)
+                    .map(|quad| f32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
+                    .collect())
+            }
+            other => Err(format!("Unsupported dtype '{other}' for '{name}' (expected F16 or F32)")),
+        }
+    }
+
+    /// Charge un tenseur F16 brut en `Vec<u16>` (divise par 2 l'empreinte RAM des embeddings).
+    pub fn load_f16_raw(&mut self, name: &str) -> Result<Vec<u16>, String> {
+        let dtype = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("Missing tensor '{name}'"))?
+            .dtype
+            .clone();
+        if dtype != "F16" {
+            return Err(format!("Tensor '{name}' must be F16, got '{dtype}'"));
+        }
+        let bytes = self.read_tensor_bytes(name)?;
+        if bytes.len() % 2 != 0 {
+            return Err(format!("Invalid F16 byte length for '{name}'"));
+        }
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect())
     }
 }
 

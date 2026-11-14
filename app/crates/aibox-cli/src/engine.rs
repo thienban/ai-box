@@ -1,12 +1,15 @@
 //! SERV-03 : Boucle d'inférence autorégressive Transformer (GQA + RoPE + SwiGLU + KV Cache)
 //! utilisant `TernaryHadamardBackend`.
 
+use std::fs;
+use std::path::Path;
 use std::time::Instant;
 
-use aibox_kernels::tensor::{f32_to_f16, pack_ternary_2bit_rows, TernaryTensor};
+use aibox_kernels::tensor::{f16_to_f32, f32_to_f16, pack_ternary_2bit_rows, TernaryTensor};
 use aibox_kernels::{TernaryHadamardBackend, GROUP_SIZE};
 
-use crate::json::JsonValue;
+use crate::json::{parse_json, JsonValue};
+use crate::safetensors::SafeTensorsFile;
 use crate::sampling::{sample_token, softmax_inplace, SamplingParams, XorShift64};
 
 #[derive(Debug, Clone)]
@@ -16,14 +19,20 @@ pub struct ModelConfig {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    pub head_dim: usize,
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    pub use_hadamard: bool,
 }
 
 impl ModelConfig {
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        if self.head_dim > 0 {
+            self.head_dim
+        } else {
+            self.hidden_size / self.num_attention_heads
+        }
     }
 
     pub fn from_json(val: &JsonValue) -> Result<Self, String> {
@@ -43,6 +52,11 @@ impl ModelConfig {
             .and_then(JsonValue::as_u64)
             .map(|num| num as usize)
             .unwrap_or(num_attention_heads);
+        let head_dim = obj
+            .get("head_dim")
+            .and_then(JsonValue::as_u64)
+            .map(|num| num as usize)
+            .unwrap_or(hidden_size / num_attention_heads);
 
         Ok(Self {
             hidden_size,
@@ -50,6 +64,7 @@ impl ModelConfig {
             num_hidden_layers: get_usize("num_hidden_layers")?,
             num_attention_heads,
             num_key_value_heads,
+            head_dim,
             vocab_size: get_usize("vocab_size")?,
             rms_norm_eps: match obj.get("rms_norm_eps") {
                 Some(JsonValue::Number(num)) => *num as f32,
@@ -59,8 +74,57 @@ impl ModelConfig {
                 Some(JsonValue::Number(num)) => *num as f32,
                 _ => 10_000.0,
             },
+            use_hadamard: true,
         })
     }
+}
+
+pub enum EmbeddingTable {
+    F32(Vec<f32>),
+    F16(Vec<u16>),
+}
+
+impl EmbeddingTable {
+    fn read_row(&self, token_id: usize, hidden_size: usize) -> Vec<f32> {
+        let start = token_id * hidden_size;
+        match self {
+            Self::F32(data) => data[start..start + hidden_size].to_vec(),
+            Self::F16(data) => data[start..start + hidden_size]
+                .iter()
+                .map(|&raw| f16_to_f32(raw))
+                .collect(),
+        }
+    }
+
+    fn dot_all_rows(&self, hidden: &[f32], vocab_size: usize, hidden_size: usize) -> Vec<f32> {
+        let mut logits = Vec::with_capacity(vocab_size);
+        match self {
+            Self::F32(data) => {
+                for row in 0..vocab_size {
+                    let row_slice = &data[row * hidden_size..(row + 1) * hidden_size];
+                    let sum: f32 = row_slice.iter().zip(hidden.iter()).map(|(&w, &x)| w * x).sum();
+                    logits.push(sum);
+                }
+            }
+            Self::F16(data) => {
+                for row in 0..vocab_size {
+                    let row_slice = &data[row * hidden_size..(row + 1) * hidden_size];
+                    let sum: f32 = row_slice
+                        .iter()
+                        .zip(hidden.iter())
+                        .map(|(&w_u16, &x)| f16_to_f32(w_u16) * x)
+                        .sum();
+                    logits.push(sum);
+                }
+            }
+        }
+        logits
+    }
+}
+
+pub enum LmHead {
+    Ternary(TernaryTensor),
+    TiedEmbedding,
 }
 
 pub struct TernaryLayerWeights {
@@ -69,6 +133,8 @@ pub struct TernaryLayerWeights {
     pub attn_k: TernaryTensor,
     pub attn_v: TernaryTensor,
     pub attn_o: TernaryTensor,
+    pub attn_q_norm: Option<Vec<f32>>,
+    pub attn_k_norm: Option<Vec<f32>>,
     pub ffn_norm: Vec<f32>,
     pub ffn_gate: TernaryTensor,
     pub ffn_up: TernaryTensor,
@@ -77,10 +143,10 @@ pub struct TernaryLayerWeights {
 
 pub struct TransformerModel {
     pub config: ModelConfig,
-    pub token_embeddings: Vec<f32>,
+    pub token_embeddings: EmbeddingTable,
     pub layers: Vec<TernaryLayerWeights>,
     pub final_norm: Vec<f32>,
-    pub lm_head: TernaryTensor,
+    pub lm_head: LmHead,
 }
 
 pub struct KvCache {
@@ -152,17 +218,30 @@ fn project_ternary(
     backend: &dyn TernaryHadamardBackend,
     input: &[f32],
     tensor: &TernaryTensor,
+    use_hadamard: bool,
 ) -> Result<Vec<f32>, String> {
     backend
-        .matmul_hadamard_ternary(
+        .matmul_ternary(
             input,
             &tensor.packed_weights,
             &tensor.scales_fp16,
             1,
             tensor.n_rows,
             tensor.k_cols,
+            use_hadamard,
         )
         .map_err(|err| err.to_string())
+}
+
+fn rms_norm_heads_inplace(vec: &mut [f32], num_heads: usize, head_dim: usize, weight: &[f32], eps: f32) {
+    for head in 0..num_heads {
+        let slice = &mut vec[head * head_dim..(head + 1) * head_dim];
+        let mean_sq = slice.iter().map(|&val| val * val).sum::<f32>() / (head_dim as f32);
+        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+        for (val, &w) in slice.iter_mut().zip(weight.iter()) {
+            *val = *val * inv_rms * w;
+        }
+    }
 }
 
 fn compute_head_attention(
@@ -207,7 +286,8 @@ fn attention_gqa(
     let head_dim = config.head_dim();
     let kv_dim = config.num_key_value_heads * head_dim;
     let heads_per_kv = config.num_attention_heads / config.num_key_value_heads;
-    let mut output = vec![0.0f32; config.hidden_size];
+    let q_dim = config.num_attention_heads * head_dim;
+    let mut output = vec![0.0f32; q_dim];
 
     for q_head in 0..config.num_attention_heads {
         let kv_offset = (q_head / heads_per_kv) * head_dim;
@@ -231,6 +311,73 @@ fn silu(val: f32) -> f32 {
 }
 
 impl TransformerModel {
+    /// Charge un modèle réel AI Box (config.json + quant_config.json + model.safetensors).
+    pub fn load_from_dir(model_dir: &Path) -> Result<Self, String> {
+        let cfg_raw = fs::read_to_string(model_dir.join("config.json"))
+            .map_err(|e| format!("Failed to read config.json: {e}"))?;
+        let mut config = ModelConfig::from_json(&parse_json(&cfg_raw)?)?;
+
+        let qcfg_raw = fs::read_to_string(model_dir.join("quant_config.json"))
+            .map_err(|e| format!("Failed to read quant_config.json: {e}"))?;
+        let qcfg = parse_json(&qcfg_raw)?;
+        if let Some(hadamard) = qcfg.as_object().and_then(|o| o.get("hadamard")).and_then(JsonValue::as_bool) {
+            config.use_hadamard = hadamard;
+        }
+
+        let mut st = SafeTensorsFile::open(model_dir.join("model.safetensors"))?;
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for idx in 0..config.num_hidden_layers {
+            let p = format!("blk.{idx}");
+            let attn_q = st.load_ternary_layer(&format!("{p}.attn_q.weight"), &format!("{p}.attn_q.scales"))?;
+            if idx == 0 {
+                config.head_dim = attn_q.n_rows / config.num_attention_heads;
+            }
+            let attn_q_norm = if st.has_tensor(&format!("{p}.attn_q_norm.weight")) {
+                Some(st.load_f32_vector(&format!("{p}.attn_q_norm.weight"))?)
+            } else {
+                None
+            };
+            let attn_k_norm = if st.has_tensor(&format!("{p}.attn_k_norm.weight")) {
+                Some(st.load_f32_vector(&format!("{p}.attn_k_norm.weight"))?)
+            } else {
+                None
+            };
+            layers.push(TernaryLayerWeights {
+                attn_norm: st.load_f32_vector(&format!("{p}.attn_norm.weight"))?,
+                attn_q,
+                attn_k: st.load_ternary_layer(&format!("{p}.attn_k.weight"), &format!("{p}.attn_k.scales"))?,
+                attn_v: st.load_ternary_layer(&format!("{p}.attn_v.weight"), &format!("{p}.attn_v.scales"))?,
+                attn_o: st.load_ternary_layer(&format!("{p}.attn_o.weight"), &format!("{p}.attn_o.scales"))?,
+                attn_q_norm,
+                attn_k_norm,
+                ffn_norm: st.load_f32_vector(&format!("{p}.ffn_norm.weight"))?,
+                ffn_gate: st.load_ternary_layer(&format!("{p}.ffn_gate.weight"), &format!("{p}.ffn_gate.scales"))?,
+                ffn_up: st.load_ternary_layer(&format!("{p}.ffn_up.weight"), &format!("{p}.ffn_up.scales"))?,
+                ffn_down: st.load_ternary_layer(&format!("{p}.ffn_down.weight"), &format!("{p}.ffn_down.scales"))?,
+            });
+        }
+
+        let token_embeddings = if st.tensors().get("token_embd.weight").map(|m| m.dtype.as_str()) == Some("F16") {
+            EmbeddingTable::F16(st.load_f16_raw("token_embd.weight")?)
+        } else {
+            EmbeddingTable::F32(st.load_f32_vector("token_embd.weight")?)
+        };
+        let final_norm = st.load_f32_vector("output_norm.weight")?;
+        let lm_head = if st.has_tensor("output.weight") && st.has_tensor("output.scales") {
+            LmHead::Ternary(st.load_ternary_layer("output.weight", "output.scales")?)
+        } else {
+            LmHead::TiedEmbedding
+        };
+
+        Ok(Self {
+            config,
+            token_embeddings,
+            layers,
+            final_norm,
+            lm_head,
+        })
+    }
+
     fn forward_attention_block(
         &self,
         hidden: &mut [f32],
@@ -241,10 +388,30 @@ impl TransformerModel {
         backend: &dyn TernaryHadamardBackend,
     ) -> Result<(), String> {
         let head_dim = self.config.head_dim();
+        let use_hadamard = self.config.use_hadamard;
         let normed = rms_norm(hidden, &layer.attn_norm, self.config.rms_norm_eps);
-        let mut query = project_ternary(backend, &normed, &layer.attn_q)?;
-        let mut key = project_ternary(backend, &normed, &layer.attn_k)?;
-        let value = project_ternary(backend, &normed, &layer.attn_v)?;
+        let mut query = project_ternary(backend, &normed, &layer.attn_q, use_hadamard)?;
+        let mut key = project_ternary(backend, &normed, &layer.attn_k, use_hadamard)?;
+        let value = project_ternary(backend, &normed, &layer.attn_v, use_hadamard)?;
+
+        if let Some(ref q_norm) = layer.attn_q_norm {
+            rms_norm_heads_inplace(
+                &mut query,
+                self.config.num_attention_heads,
+                head_dim,
+                q_norm,
+                self.config.rms_norm_eps,
+            );
+        }
+        if let Some(ref k_norm) = layer.attn_k_norm {
+            rms_norm_heads_inplace(
+                &mut key,
+                self.config.num_key_value_heads,
+                head_dim,
+                k_norm,
+                self.config.rms_norm_eps,
+            );
+        }
 
         apply_rope_inplace(&mut query, self.config.num_attention_heads, head_dim, pos, self.config.rope_theta);
         apply_rope_inplace(&mut key, self.config.num_key_value_heads, head_dim, pos, self.config.rope_theta);
@@ -253,7 +420,7 @@ impl TransformerModel {
         kv_cache.values[layer_idx].extend_from_slice(&value);
 
         let attn_ctx = attention_gqa(&query, &kv_cache.keys[layer_idx], &kv_cache.values[layer_idx], &self.config);
-        let attn_proj = project_ternary(backend, &attn_ctx, &layer.attn_o)?;
+        let attn_proj = project_ternary(backend, &attn_ctx, &layer.attn_o, use_hadamard)?;
         add_residual(hidden, &attn_proj);
         Ok(())
     }
@@ -264,15 +431,16 @@ impl TransformerModel {
         layer: &TernaryLayerWeights,
         backend: &dyn TernaryHadamardBackend,
     ) -> Result<(), String> {
+        let use_hadamard = self.config.use_hadamard;
         let normed = rms_norm(hidden, &layer.ffn_norm, self.config.rms_norm_eps);
-        let gate = project_ternary(backend, &normed, &layer.ffn_gate)?;
-        let up = project_ternary(backend, &normed, &layer.ffn_up)?;
+        let gate = project_ternary(backend, &normed, &layer.ffn_gate, use_hadamard)?;
+        let up = project_ternary(backend, &normed, &layer.ffn_up, use_hadamard)?;
         let swiglu: Vec<f32> = gate
             .iter()
             .zip(up.iter())
             .map(|(&gate_val, &up_val)| silu(gate_val) * up_val)
             .collect();
-        let ffn_out = project_ternary(backend, &swiglu, &layer.ffn_down)?;
+        let ffn_out = project_ternary(backend, &swiglu, &layer.ffn_down, use_hadamard)?;
         add_residual(hidden, &ffn_out);
         Ok(())
     }
@@ -289,8 +457,7 @@ impl TransformerModel {
             return Err(format!("token_id {token_id} >= vocab_size {}", self.config.vocab_size));
         }
 
-        let start = token_id * hidden_size;
-        let mut hidden = self.token_embeddings[start..start + hidden_size].to_vec();
+        let mut hidden = self.token_embeddings.read_row(token_id, hidden_size);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.forward_attention_block(&mut hidden, layer, layer_idx, pos, kv_cache, backend)?;
@@ -298,7 +465,16 @@ impl TransformerModel {
         }
 
         let final_hidden = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
-        project_ternary(backend, &final_hidden, &self.lm_head)
+        match &self.lm_head {
+            LmHead::Ternary(tensor) => {
+                project_ternary(backend, &final_hidden, tensor, self.config.use_hadamard)
+            }
+            LmHead::TiedEmbedding => Ok(self.token_embeddings.dot_all_rows(
+                &final_hidden,
+                self.config.vocab_size,
+                hidden_size,
+            )),
+        }
     }
 
     fn prefill_prompt(
@@ -372,9 +548,11 @@ mod tests {
             num_hidden_layers: 2,
             num_attention_heads: 4,
             num_key_value_heads: 2,
+            head_dim: 32,
             vocab_size: 256,
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
+            use_hadamard: true,
         };
 
         let layers = (0..config.num_hidden_layers)
@@ -384,6 +562,8 @@ mod tests {
                 attn_k: build_synthetic_tensor(64, config.hidden_size, layer_idx + 2).unwrap(),
                 attn_v: build_synthetic_tensor(64, config.hidden_size, layer_idx + 3).unwrap(),
                 attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 4).unwrap(),
+                attn_q_norm: None,
+                attn_k_norm: None,
                 ffn_norm: vec![1.0; config.hidden_size],
                 ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 5).unwrap(),
                 ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 6).unwrap(),
@@ -392,12 +572,14 @@ mod tests {
             .collect();
 
         let model = TransformerModel {
-            token_embeddings: (0..(config.vocab_size * config.hidden_size))
-                .map(|idx| ((idx as f32) * 0.01).sin())
-                .collect(),
+            token_embeddings: EmbeddingTable::F32(
+                (0..(config.vocab_size * config.hidden_size))
+                    .map(|idx| ((idx as f32) * 0.01).sin())
+                    .collect(),
+            ),
             layers,
             final_norm: vec![1.0; config.hidden_size],
-            lm_head: build_synthetic_tensor(config.vocab_size, config.hidden_size, 99).unwrap(),
+            lm_head: LmHead::Ternary(build_synthetic_tensor(config.vocab_size, config.hidden_size, 99).unwrap()),
             config,
         };
 

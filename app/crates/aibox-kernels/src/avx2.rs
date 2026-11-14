@@ -30,6 +30,19 @@ impl TernaryHadamardBackend for Avx2Backend {
         n: usize,
         k: usize,
     ) -> Result<Vec<f32>, BackendError> {
+        self.matmul_ternary(activations, packed_weights, scales_fp16, m, n, k, true)
+    }
+
+    fn matmul_ternary(
+        &self,
+        activations: &[f32],
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        m: usize,
+        n: usize,
+        k: usize,
+        use_hadamard: bool,
+    ) -> Result<Vec<f32>, BackendError> {
         if !is_x86_feature_detected!("avx2") {
             return Err(BackendError::UnsupportedFeature(
                 "AVX2 is not available on this CPU".to_string(),
@@ -37,12 +50,18 @@ impl TernaryHadamardBackend for Avx2Backend {
         }
         validate_matmul_inputs(activations, packed_weights, scales_fp16, m, n, k)?;
 
-        let rotated_x = apply_fwht_128_rows(activations, m, k)?;
+        let rotated_x;
+        let x_input = if use_hadamard {
+            rotated_x = apply_fwht_128_rows(activations, m, k)?;
+            rotated_x.as_slice()
+        } else {
+            activations
+        };
         let mut output = vec![0.0f32; m * n];
 
         unsafe {
             matmul_avx2_dispatch(
-                &rotated_x,
+                x_input,
                 packed_weights,
                 scales_fp16,
                 &mut output,

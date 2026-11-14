@@ -6,13 +6,17 @@ mod models;
 mod safetensors;
 mod sampling;
 mod server;
+mod tokenizer;
 
 use std::env;
 use std::process::ExitCode;
 
 use aibox_kernels::tensor::{f32_to_f16, pack_ternary_2bit_rows};
 use aibox_kernels::{TernaryHadamardBackend, TmacCpuBackend, GROUP_SIZE};
-use engine::{build_synthetic_tensor, ModelConfig, TernaryLayerWeights, TransformerModel};
+use engine::{
+    build_synthetic_tensor, EmbeddingTable, LmHead, ModelConfig, TernaryLayerWeights,
+    TransformerModel,
+};
 use sampling::SamplingParams;
 
 fn print_usage() {
@@ -23,9 +27,10 @@ fn print_usage() {
          \x20 aibox pull <org/repo-hf>    Télécharge un modèle depuis Hugging Face (~/.aibox/models)\n\
          \x20 aibox list                  Liste les modèles en cache local\n\
          \x20 aibox inspect <model|dir>   Vérifie config.json, quant_config.json et SafeTensors\n\
+         \x20 aibox run <model|dir> <txt> Lance l'inférence réelle sur un modèle SafeTensors\n\
          \x20 aibox selftest              Vérifie le backend CPU (AVX2/Scalar) bout en bout\n\
          \x20 aibox bench-forward         Benchmark SERV-03 (Prefill/Decode Transformer synthétique)\n\
-         \x20 aibox serve [--port 11434]  Démarre le serveur HTTP OpenAI + Ollama (SERV-04)"
+         \x20 aibox serve [--model dir]   Démarre le serveur HTTP OpenAI + Ollama (SERV-04)"
     );
 }
 
@@ -68,9 +73,11 @@ fn run_bench_forward() -> Result<(), String> {
         num_hidden_layers: 4,
         num_attention_heads: 8,
         num_key_value_heads: 2,
+        head_dim: 128,
         vocab_size: 1024,
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
+        use_hadamard: true,
     };
     let kv_dim = config.num_key_value_heads * config.head_dim();
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -81,6 +88,8 @@ fn run_bench_forward() -> Result<(), String> {
             attn_k: build_synthetic_tensor(kv_dim, config.hidden_size, layer_idx + 2)?,
             attn_v: build_synthetic_tensor(kv_dim, config.hidden_size, layer_idx + 3)?,
             attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 4)?,
+            attn_q_norm: None,
+            attn_k_norm: None,
             ffn_norm: vec![1.0; config.hidden_size],
             ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 5)?,
             ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 6)?,
@@ -88,10 +97,10 @@ fn run_bench_forward() -> Result<(), String> {
         });
     }
     let model = TransformerModel {
-        token_embeddings: vec![0.02; config.vocab_size * config.hidden_size],
+        token_embeddings: EmbeddingTable::F32(vec![0.02; config.vocab_size * config.hidden_size]),
         layers,
         final_norm: vec![1.0; config.hidden_size],
-        lm_head: build_synthetic_tensor(config.vocab_size, config.hidden_size, 99)?,
+        lm_head: LmHead::Ternary(build_synthetic_tensor(config.vocab_size, config.hidden_size, 99)?),
         config,
     };
 
@@ -111,6 +120,61 @@ fn run_bench_forward() -> Result<(), String> {
     Ok(())
 }
 
+fn resolve_model_path(target: &str) -> Result<std::path::PathBuf, String> {
+    let direct = std::path::PathBuf::from(target);
+    if direct.is_dir() {
+        return Ok(direct);
+    }
+    let cached = models::resolve_models_dir()?.join(models::sanitize_repo_id(target)?);
+    if cached.is_dir() {
+        return Ok(cached);
+    }
+    Err(format!("Modèle introuvable : '{target}'"))
+}
+
+fn run_inference_cli(args: &[String]) -> Result<(), String> {
+    let target = args
+        .first()
+        .ok_or_else(|| "Usage: aibox run <model|dir> <prompt> [--max-tokens N]".to_string())?;
+    let prompt = args
+        .get(1)
+        .ok_or_else(|| "Usage: aibox run <model|dir> <prompt> [--max-tokens N]".to_string())?;
+    let mut max_tokens = 32usize;
+    if args.get(2).map(String::as_str) == Some("--max-tokens") {
+        if let Some(val) = args.get(3) {
+            max_tokens = val.parse::<usize>().map_err(|_| format!("max-tokens invalide: '{val}'"))?;
+        }
+    }
+
+    let model_dir = resolve_model_path(target)?;
+    println!("Chargement du modèle depuis {}...", model_dir.display());
+    let model = TransformerModel::load_from_dir(&model_dir)?;
+    let tok = tokenizer::SimpleTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
+    let prompt_ids = tok.encode_chat(prompt);
+
+    let backend = TmacCpuBackend::new();
+    let params = SamplingParams {
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        seed: 42,
+    };
+    let stats = model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &backend)?;
+    let text = tok.decode(&stats.tokens);
+    let decode_tok_s = (stats.tokens.len() as f64) / (stats.decode_ms / 1000.0).max(1e-6);
+
+    println!("\n{text}");
+    println!(
+        "\n[Prefill {} tok: {:.1} ms | Decode {} tok: {:.1} ms ({:.2} tok/s)]",
+        prompt_ids.len(),
+        stats.prefill_ms,
+        stats.tokens.len(),
+        stats.decode_ms,
+        decode_tok_s
+    );
+    Ok(())
+}
+
 fn run_serve(args: &[String]) -> Result<(), String> {
     let mut config = server::ServerConfig::default();
     let mut idx = 0usize;
@@ -127,6 +191,11 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 config.port = port_str
                     .parse::<u16>()
                     .map_err(|_| format!("Port invalide '{port_str}'"))?;
+            }
+            "--model" => {
+                idx += 1;
+                let model = args.get(idx).ok_or_else(|| "Valeur manquante pour --model".to_string())?;
+                config.model_dir = Some(resolve_model_path(model)?);
             }
             other => return Err(format!("Option inconnue pour serve : '{other}'")),
         }
@@ -167,6 +236,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
                 .ok_or_else(|| "Usage: aibox inspect <org/repo-hf | path>".to_string())?;
             models::inspect_model(target)
         }
+        Some("run") => run_inference_cli(&args[1..]),
         Some("selftest") => run_selftest(),
         Some("bench-forward") => run_bench_forward(),
         Some("serve") => run_serve(&args[1..]),

@@ -56,6 +56,26 @@ pub trait TernaryHadamardBackend: Send + Sync {
         n: usize,
         k: usize,
     ) -> Result<Vec<f32>, BackendError>;
+
+    /// Exécute la multiplication ternaire avec ou sans rotation Hadamard `H_128`.
+    fn matmul_ternary(
+        &self,
+        activations: &[f32],
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        m: usize,
+        n: usize,
+        k: usize,
+        use_hadamard: bool,
+    ) -> Result<Vec<f32>, BackendError> {
+        if use_hadamard {
+            self.matmul_hadamard_ternary(activations, packed_weights, scales_fp16, m, n, k)
+        } else {
+            Err(BackendError::UnsupportedFeature(
+                "Plain ternary matmul (hadamard=false) not implemented for this backend".to_string(),
+            ))
+        }
+    }
 }
 
 /// Valide la géométrie d'un tenseur ternaire par groupes de 128 poids.
@@ -162,13 +182,40 @@ impl TernaryHadamardBackend for TmacCpuBackend {
         n: usize,
         k: usize,
     ) -> Result<Vec<f32>, BackendError> {
+        self.matmul_ternary(activations, packed_weights, scales_fp16, m, n, k, true)
+    }
+
+    fn matmul_ternary(
+        &self,
+        activations: &[f32],
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        m: usize,
+        n: usize,
+        k: usize,
+        use_hadamard: bool,
+    ) -> Result<Vec<f32>, BackendError> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if self.uses_avx2() {
-            return avx2::Avx2Backend
-                .matmul_hadamard_ternary(activations, packed_weights, scales_fp16, m, n, k);
+            return avx2::Avx2Backend.matmul_ternary(
+                activations,
+                packed_weights,
+                scales_fp16,
+                m,
+                n,
+                k,
+                use_hadamard,
+            );
         }
 
-        scalar::ScalarBackend
-            .matmul_hadamard_ternary(activations, packed_weights, scales_fp16, m, n, k)
+        scalar::ScalarBackend.matmul_ternary(
+            activations,
+            packed_weights,
+            scales_fp16,
+            m,
+            n,
+            k,
+            use_hadamard,
+        )
     }
 }

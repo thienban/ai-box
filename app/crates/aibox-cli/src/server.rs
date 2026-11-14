@@ -3,16 +3,21 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aibox_kernels::TmacCpuBackend;
 
-use crate::engine::{build_synthetic_tensor, ModelConfig, TernaryLayerWeights, TransformerModel};
+use crate::engine::{
+    build_synthetic_tensor, EmbeddingTable, LmHead, ModelConfig, TernaryLayerWeights,
+    TransformerModel,
+};
 use crate::json::{escape_json_string, parse_json, JsonValue};
 use crate::models;
 use crate::sampling::SamplingParams;
+use crate::tokenizer::SimpleTokenizer;
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 11434;
@@ -22,6 +27,7 @@ const DEFAULT_MODEL_NAME: &str = "aibox-ternary-demo";
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    pub model_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -29,13 +35,15 @@ impl Default for ServerConfig {
         Self {
             host: DEFAULT_HOST.to_string(),
             port: DEFAULT_PORT,
+            model_dir: None,
         }
     }
 }
 
 struct ServerState {
     backend: TmacCpuBackend,
-    demo_model: TransformerModel,
+    model: TransformerModel,
+    tokenizer: Option<SimpleTokenizer>,
 }
 
 struct HttpRequest {
@@ -73,11 +81,15 @@ pub fn run_server(config: ServerConfig) -> Result<(), String> {
         .map_err(|err| format!("Erreur lecture adresse locale: {err}"))?;
     println!("Serveur AI Box (OpenAI + Ollama) à l'écoute sur http://{local_addr}");
     println!("Endpoints : /v1/chat/completions, /v1/models, /api/chat, /api/generate, /api/tags");
-    serve_listener(listener)
+    serve_listener_with_config(listener, &config)
 }
 
 pub fn serve_listener(listener: TcpListener) -> Result<(), String> {
-    let state = Arc::new(build_server_state()?);
+    serve_listener_with_config(listener, &ServerConfig::default())
+}
+
+pub fn serve_listener_with_config(listener: TcpListener, config: &ServerConfig) -> Result<(), String> {
+    let state = Arc::new(build_server_state(config)?);
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(stream) => stream,
@@ -96,16 +108,29 @@ pub fn serve_listener(listener: TcpListener) -> Result<(), String> {
     Ok(())
 }
 
-fn build_server_state() -> Result<ServerState, String> {
+fn build_server_state(server_cfg: &ServerConfig) -> Result<ServerState, String> {
+    if let Some(ref model_dir) = server_cfg.model_dir {
+        println!("Chargement du modèle réel depuis {}...", model_dir.display());
+        let model = TransformerModel::load_from_dir(model_dir)?;
+        let tokenizer = SimpleTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
+        return Ok(ServerState {
+            backend: TmacCpuBackend::new(),
+            model,
+            tokenizer: Some(tokenizer),
+        });
+    }
+
     let config = ModelConfig {
         hidden_size: 256,
         intermediate_size: 512,
         num_hidden_layers: 2,
         num_attention_heads: 4,
         num_key_value_heads: 2,
+        head_dim: 64,
         vocab_size: 256,
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
+        use_hadamard: true,
     };
     let kv_dim = config.num_key_value_heads * config.head_dim();
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -116,6 +141,8 @@ fn build_server_state() -> Result<ServerState, String> {
             attn_k: build_synthetic_tensor(kv_dim, config.hidden_size, idx + 2)?,
             attn_v: build_synthetic_tensor(kv_dim, config.hidden_size, idx + 3)?,
             attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, idx + 4)?,
+            attn_q_norm: None,
+            attn_k_norm: None,
             ffn_norm: vec![1.0; config.hidden_size],
             ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, idx + 5)?,
             ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, idx + 6)?,
@@ -123,16 +150,17 @@ fn build_server_state() -> Result<ServerState, String> {
         });
     }
     let demo_model = TransformerModel {
-        token_embeddings: vec![0.02; config.vocab_size * config.hidden_size],
+        token_embeddings: EmbeddingTable::F32(vec![0.02; config.vocab_size * config.hidden_size]),
         layers,
         final_norm: vec![1.0; config.hidden_size],
-        lm_head: build_synthetic_tensor(config.vocab_size, config.hidden_size, 99)?,
+        lm_head: LmHead::Ternary(build_synthetic_tensor(config.vocab_size, config.hidden_size, 99)?),
         config,
     };
 
     Ok(ServerState {
         backend: TmacCpuBackend::new(),
-        demo_model,
+        model: demo_model,
+        tokenizer: None,
     })
 }
 
@@ -408,8 +436,11 @@ fn parse_sampling_params(
 }
 
 fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<InferenceOutput, String> {
-    let vocab_size = state.demo_model.config.vocab_size;
-    let prompt_ids: Vec<usize> = if req.prompt.is_empty() {
+    let vocab_size = state.model.config.vocab_size;
+    let prompt_ids: Vec<usize> = if let Some(ref tok) = state.tokenizer {
+        let ids = tok.encode_chat(&req.prompt);
+        if ids.is_empty() { vec![1] } else { ids }
+    } else if req.prompt.is_empty() {
         vec![1]
     } else {
         req.prompt
@@ -419,26 +450,31 @@ fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<Inferen
             .collect()
     };
 
-    let stats = state.demo_model.generate_tokens(
+    let eos_id = state.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
+    let stats = state.model.generate_tokens(
         &prompt_ids,
         req.max_tokens,
-        None,
+        eos_id,
         req.sampling,
         &state.backend,
     )?;
 
-    let chunks: Vec<String> = stats
-        .tokens
-        .iter()
-        .enumerate()
-        .map(|(idx, tok)| {
-            if idx == 0 {
-                format!("[tmac:{tok}]")
-            } else {
-                format!(" tok_{tok}")
-            }
-        })
-        .collect();
+    let chunks: Vec<String> = if let Some(ref tok) = state.tokenizer {
+        stats.tokens.iter().map(|&t| tok.decode_token(t)).collect()
+    } else {
+        stats
+            .tokens
+            .iter()
+            .enumerate()
+            .map(|(idx, tok)| {
+                if idx == 0 {
+                    format!("[tmac:{tok}]")
+                } else {
+                    format!(" tok_{tok}")
+                }
+            })
+            .collect()
+    };
     let full_text = chunks.concat();
     let total_duration_ns = ((stats.prefill_ms + stats.decode_ms) * 1_000_000.0) as u128;
 
@@ -572,6 +608,7 @@ mod tests {
         let listener = bind_server(&ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 0,
+            model_dir: None,
         })
         .expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local addr");
