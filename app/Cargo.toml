@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/aibox-kernels",
     "crates/aibox-cli",
+    "crates/aibox-mistral",
 ]
 
 [workspace.package]

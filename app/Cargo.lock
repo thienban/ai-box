@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "aibox-kernels"
 version = "0.1.0"
+
+[[package]]
+name = "aibox-mistral"
+version = "0.1.0"
+dependencies = [
+ "aibox-kernels",
+]
