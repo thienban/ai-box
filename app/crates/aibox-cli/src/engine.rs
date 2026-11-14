@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use aibox_kernels::tensor::{f16_to_f32, f32_to_f16, pack_ternary_2bit_rows, TernaryTensor};
@@ -79,6 +80,11 @@ impl ModelConfig {
     }
 }
 
+fn f16_lut() -> &'static [f32] {
+    static LUT: OnceLock<Vec<f32>> = OnceLock::new();
+    LUT.get_or_init(|| (0..=u16::MAX).map(f16_to_f32).collect())
+}
+
 pub enum EmbeddingTable {
     F32(Vec<f32>),
     F16(Vec<u16>),
@@ -89,33 +95,60 @@ impl EmbeddingTable {
         let start = token_id * hidden_size;
         match self {
             Self::F32(data) => data[start..start + hidden_size].to_vec(),
-            Self::F16(data) => data[start..start + hidden_size]
-                .iter()
-                .map(|&raw| f16_to_f32(raw))
-                .collect(),
+            Self::F16(data) => {
+                let lut = f16_lut();
+                data[start..start + hidden_size]
+                    .iter()
+                    .map(|&raw| lut[raw as usize])
+                    .collect()
+            }
         }
     }
 
     fn dot_all_rows(&self, hidden: &[f32], vocab_size: usize, hidden_size: usize) -> Vec<f32> {
-        let mut logits = Vec::with_capacity(vocab_size);
+        let mut logits = vec![0.0f32; vocab_size];
+        let num_threads = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1);
+        let chunk_rows = if vocab_size >= 1024 && num_threads > 1 {
+            vocab_size.div_ceil(num_threads)
+        } else {
+            vocab_size
+        };
+
         match self {
             Self::F32(data) => {
-                for row in 0..vocab_size {
-                    let row_slice = &data[row * hidden_size..(row + 1) * hidden_size];
-                    let sum: f32 = row_slice.iter().zip(hidden.iter()).map(|(&w, &x)| w * x).sum();
-                    logits.push(sum);
-                }
+                std::thread::scope(|scope| {
+                    for (chunk_idx, out_chunk) in logits.chunks_mut(chunk_rows).enumerate() {
+                        let start_row = chunk_idx * chunk_rows;
+                        let data_slice = &data[start_row * hidden_size..];
+                        scope.spawn(move || {
+                            for (local_row, slot) in out_chunk.iter_mut().enumerate() {
+                                let row_slice = &data_slice[local_row * hidden_size..(local_row + 1) * hidden_size];
+                                *slot = row_slice.iter().zip(hidden.iter()).map(|(&w, &x)| w * x).sum();
+                            }
+                        });
+                    }
+                });
             }
             Self::F16(data) => {
-                for row in 0..vocab_size {
-                    let row_slice = &data[row * hidden_size..(row + 1) * hidden_size];
-                    let sum: f32 = row_slice
-                        .iter()
-                        .zip(hidden.iter())
-                        .map(|(&w_u16, &x)| f16_to_f32(w_u16) * x)
-                        .sum();
-                    logits.push(sum);
-                }
+                let lut = f16_lut();
+                std::thread::scope(|scope| {
+                    for (chunk_idx, out_chunk) in logits.chunks_mut(chunk_rows).enumerate() {
+                        let start_row = chunk_idx * chunk_rows;
+                        let data_slice = &data[start_row * hidden_size..];
+                        scope.spawn(move || {
+                            for (local_row, slot) in out_chunk.iter_mut().enumerate() {
+                                let row_slice = &data_slice[local_row * hidden_size..(local_row + 1) * hidden_size];
+                                *slot = row_slice
+                                    .iter()
+                                    .zip(hidden.iter())
+                                    .map(|(&w_u16, &x)| lut[w_u16 as usize] * x)
+                                    .sum();
+                            }
+                        });
+                    }
+                });
             }
         }
         logits
@@ -452,6 +485,17 @@ impl TransformerModel {
         kv_cache: &mut KvCache,
         backend: &dyn TernaryHadamardBackend,
     ) -> Result<Vec<f32>, String> {
+        self.forward_token_internal(token_id, pos, kv_cache, backend, true)
+    }
+
+    fn forward_token_internal(
+        &self,
+        token_id: usize,
+        pos: usize,
+        kv_cache: &mut KvCache,
+        backend: &dyn TernaryHadamardBackend,
+        compute_logits: bool,
+    ) -> Result<Vec<f32>, String> {
         let hidden_size = self.config.hidden_size;
         if token_id >= self.config.vocab_size {
             return Err(format!("token_id {token_id} >= vocab_size {}", self.config.vocab_size));
@@ -462,6 +506,10 @@ impl TransformerModel {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             self.forward_attention_block(&mut hidden, layer, layer_idx, pos, kv_cache, backend)?;
             self.forward_ffn_block(&mut hidden, layer, backend)?;
+        }
+
+        if !compute_logits {
+            return Ok(Vec::new());
         }
 
         let final_hidden = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
@@ -483,9 +531,11 @@ impl TransformerModel {
         kv_cache: &mut KvCache,
         backend: &dyn TernaryHadamardBackend,
     ) -> Result<Vec<f32>, String> {
+        let last_idx = prompt_tokens.len() - 1;
         let mut last_logits = Vec::new();
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            last_logits = self.forward_token(tok, pos, kv_cache, backend)?;
+            let need_logits = pos == last_idx;
+            last_logits = self.forward_token_internal(tok, pos, kv_cache, backend, need_logits)?;
         }
         Ok(last_logits)
     }

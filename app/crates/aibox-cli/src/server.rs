@@ -84,6 +84,7 @@ pub fn run_server(config: ServerConfig) -> Result<(), String> {
     serve_listener_with_config(listener, &config)
 }
 
+#[cfg(test)]
 pub fn serve_listener(listener: TcpListener) -> Result<(), String> {
     serve_listener_with_config(listener, &ServerConfig::default())
 }

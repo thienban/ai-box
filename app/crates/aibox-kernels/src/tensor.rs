@@ -106,7 +106,7 @@ impl TernaryTensor {
 }
 
 /// Convertit un `u16` IEEE-754 half-precision (FP16) en `f32`.
-#[inline]
+#[inline(always)]
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits & 0x8000) as u32) << 16;
     let exp = ((bits & 0x7C00) >> 10) as u32;
