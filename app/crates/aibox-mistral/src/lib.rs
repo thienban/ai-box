@@ -164,4 +164,41 @@ mod tests {
         let out = linear.forward_f32(&act, batch_seq).expect("forward failed");
         assert_eq!(out.len(), batch_seq * n_rows);
     }
+
+    #[cfg(feature = "mistral")]
+    #[test]
+    fn quant_method_forward_and_dequantize_work() {
+        use candle_core::{Device, Tensor};
+        use mistralrs_quant::{QuantMethod, QuantizedSerde};
+
+        let n_rows = 32;
+        let k_cols = 256;
+        let weights: Vec<i8> = (0..(n_rows * k_cols))
+            .map(|idx| match idx % 3 {
+                0 => 0,
+                1 => 1,
+                _ => -1,
+            })
+            .collect();
+        let packed = pack_ternary_2bit_rows(&weights, n_rows, k_cols).unwrap();
+        let scales = vec![f32_to_f16(0.25); n_rows * (k_cols / GROUP_SIZE)];
+        let tensor = TernaryTensor::from_raw(n_rows, k_cols, packed, scales).unwrap();
+        let linear = AiboxTernaryLinear::new(tensor);
+        assert_eq!(linear.name(), "aibox_ternary_hadamard");
+
+        let act_vec = vec![0.5f32; 2 * k_cols];
+        let expected = linear.forward_f32(&act_vec, 2).unwrap();
+
+        let act_tensor = Tensor::from_vec(act_vec, (1, 2, k_cols), &Device::Cpu).unwrap();
+        let out_tensor = linear.forward(&act_tensor).expect("QuantMethod::forward failed");
+        assert_eq!(out_tensor.dims(), &[1, 2, n_rows]);
+
+        let got = out_tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (&exp_val, &got_val) in expected.iter().zip(got.iter()) {
+            assert!((exp_val - got_val).abs() < 1e-6);
+        }
+
+        let dequant = linear.dequantize_w().expect("dequantize_w failed");
+        assert_eq!(dequant.dims(), &[n_rows, k_cols]);
+    }
 }
