@@ -1,0 +1,25 @@
+# Documentation (ignored as requested)
+docs/
+
+# Rust build artifacts
+target/
+app/target/
+**/*.rs.bk
+
+# Python / Jupyter
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Environment & Model weights
+.env
+.env.*
+*.gguf
+*.safetensors
+*.bin
+
+# OS
+.DS_Store
+Thumbs.db

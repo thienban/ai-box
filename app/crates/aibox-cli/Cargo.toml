@@ -1,0 +1,9 @@
+[package]
+name = "aibox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI et moteur d'inférence local AI Box (SafeTensors + T-MAC)"
+
+[dependencies]
+aibox-kernels = { path = "../aibox-kernels" }

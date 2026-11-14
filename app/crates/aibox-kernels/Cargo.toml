@@ -1,0 +1,6 @@
+[package]
+name = "aibox-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "T-MAC CPU (AVX2/Scalar) & Ternary Hadamard kernels for AI Box"
