@@ -96,7 +96,13 @@ class TernaryLinear:
 
 
 class BonsaiAiboxModel:
-    def __init__(self, model_dir: Path, device: torch.device, max_layers: int | None = None) -> None:
+    def __init__(
+        self,
+        model_dir: Path,
+        device: torch.device,
+        max_layers: int | None = None,
+        gguf_path: Path | None = None,
+    ) -> None:
         self.device = device
         self.config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
         self.quant_config = json.loads((model_dir / "quant_config.json").read_text(encoding="utf-8"))
@@ -114,20 +120,38 @@ class BonsaiAiboxModel:
         self.h_128 = build_hadamard_128(device, torch.float16)
         self.tensors: dict[str, torch.Tensor] = {}
 
-        safetensors_path = model_dir / "model.safetensors"
-        print(f"Chargement de {safetensors_path} sur {device}...")
-        with safe_open(str(safetensors_path), framework="pt", device=str(device)) as f:
-            keys = sorted(f.keys())
-            print(f"Total tenseurs dans SafeTensors : {len(keys)}")
-            blk0 = [k for k in keys if k.startswith("blk.0.")]
-            print(f"Exemple tenseurs couche 0 ({len(blk0)}) : {blk0}")
+        if gguf_path is not None:
+            import gguf
+            import numpy as np
+            from convert_gguf_to_aibox import dequantize_tensor, normalize_tensor_name
 
-            for key in keys:
-                if key.startswith("blk."):
-                    layer_idx = int(key.split(".")[1])
-                    if layer_idx >= self.num_layers:
-                        continue
-                self.tensors[key] = f.get_tensor(key)
+            print(f"Chargement direct GGUF FP16 (sans re-quantification) : {gguf_path}...")
+            reader = gguf.GGUFReader(str(gguf_path), mode="r")
+            seen_types: set[str] = set()
+            for tensor in reader.tensors:
+                tname = getattr(tensor.tensor_type, "name", str(tensor.tensor_type))
+                seen_types.add(tname)
+                name = normalize_tensor_name(tensor.name)
+                if name.startswith("blk.") and int(name.split(".")[1]) >= self.num_layers:
+                    continue
+                arr = dequantize_tensor(tensor, gguf, target_dtype=np.float16)
+                self.tensors[name] = torch.from_numpy(np.array(arr, copy=True)).to(device=device)
+            print(f"Types GGUF détectés : {sorted(seen_types)}")
+        else:
+            safetensors_path = model_dir / "model.safetensors"
+            print(f"Chargement de {safetensors_path} sur {device}...")
+            with safe_open(str(safetensors_path), framework="pt", device=str(device)) as f:
+                keys = sorted(f.keys())
+                print(f"Total tenseurs dans SafeTensors : {len(keys)}")
+                blk0 = [k for k in keys if k.startswith("blk.0.")]
+                print(f"Exemple tenseurs couche 0 ({len(blk0)}) : {blk0}")
+
+                for key in keys:
+                    if key.startswith("blk."):
+                        layer_idx = int(key.split(".")[1])
+                        if layer_idx >= self.num_layers:
+                            continue
+                    self.tensors[key] = f.get_tensor(key)
 
         if "blk.0.attn_q.weight" in self.tensors:
             q_shape = self.tensors["blk.0.attn_q.weight"].shape
@@ -230,6 +254,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Test d'inférence réel sur modèle AI Box")
     parser.add_argument("--repo", default="BtbAgent/bonsai-27b-aibox", help="Dépôt Hugging Face")
     parser.add_argument("--local-dir", type=Path, default=None, help="Dossier local converti (skip HF download)")
+    parser.add_argument("--gguf", type=Path, default=None, help="Test témoin FP16 direct depuis le GGUF")
     parser.add_argument("--tokenizer", default="Qwen/Qwen3-4B", help="Tokenizer complet de secours")
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--max-layers", type=int, default=None)
@@ -241,7 +266,7 @@ def main() -> None:
     print("quant_config.json :", json.loads((local_dir / "quant_config.json").read_text(encoding="utf-8")))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BonsaiAiboxModel(local_dir, device=device, max_layers=args.max_layers)
+    model = BonsaiAiboxModel(local_dir, device=device, max_layers=args.max_layers, gguf_path=args.gguf)
     if args.inspect_only:
         return
 
