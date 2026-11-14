@@ -144,7 +144,12 @@ class BonsaiAiboxModel:
         return F.linear(x, self.tensors[w_key].to(x.dtype))
 
     @torch.no_grad()
-    def generate(self, input_ids: list[int], max_new_tokens: int) -> list[int]:
+    def generate(
+        self,
+        input_ids: list[int],
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+    ) -> list[int]:
         tokens = list(input_ids)
         kv_cache: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * self.num_layers
         emb_table = self.tensors["token_embd.weight"]
@@ -203,6 +208,8 @@ class BonsaiAiboxModel:
             logits = F.linear(h, head_weight.to(h.dtype))
             next_id = int(torch.argmax(logits[0, 0]).item())
             tokens.append(next_id)
+            if eos_token_id is not None and next_id == eos_token_id:
+                break
 
         return tokens[len(input_ids):]
 
@@ -220,15 +227,16 @@ def load_tokenizer(model_dir: Path, fallback_repo: str) -> Any:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Test d'inférence réel sur BtbAgent/bonsai-27b-aibox")
+    parser = argparse.ArgumentParser(description="Test d'inférence réel sur modèle AI Box")
     parser.add_argument("--repo", default="BtbAgent/bonsai-27b-aibox", help="Dépôt Hugging Face")
-    parser.add_argument("--tokenizer", default="Qwen/Qwen3-32B", help="Tokenizer complet de secours")
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--local-dir", type=Path, default=None, help="Dossier local converti (skip HF download)")
+    parser.add_argument("--tokenizer", default="Qwen/Qwen3-4B", help="Tokenizer complet de secours")
+    parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--max-layers", type=int, default=None)
     parser.add_argument("--inspect-only", action="store_true")
     args = parser.parse_args()
 
-    local_dir = Path(snapshot_download(repo_id=args.repo))
+    local_dir = args.local_dir if args.local_dir is not None else Path(snapshot_download(repo_id=args.repo))
     print("config.json :", json.loads((local_dir / "config.json").read_text(encoding="utf-8")))
     print("quant_config.json :", json.loads((local_dir / "quant_config.json").read_text(encoding="utf-8")))
 
@@ -239,14 +247,25 @@ def main() -> None:
 
     tokenizer = load_tokenizer(local_dir, args.tokenizer)
     prompts = [
-        "Quelle est la capitale de la France ? Réponds en une phrase :",
-        "Explain in two short sentences what a GPU is:",
+        "Quelle est la capitale de la France ? Réponds en une phrase.",
+        "Explain in two short sentences what a GPU is.",
     ]
 
     for prompt in prompts:
-        ids = tokenizer.encode(prompt, add_special_tokens=True)
+        if getattr(tokenizer, "chat_template", None):
+            ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+        else:
+            ids = tokenizer.encode(prompt, add_special_tokens=True)
         t0 = time.perf_counter()
-        out_ids = model.generate(ids, max_new_tokens=args.max_new_tokens)
+        out_ids = model.generate(
+            ids,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        )
         dt = time.perf_counter() - t0
         text = tokenizer.decode(out_ids, skip_special_tokens=True)
         print("\n" + "=" * 60)
