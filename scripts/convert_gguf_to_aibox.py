@@ -136,21 +136,28 @@ def should_include_tensor(name: str, max_layers: int | None) -> bool:
     return True
 
 
-def dequantize_q1_0(data: np.ndarray) -> np.ndarray:
-    """Dequantize GGUF Q1_0 (128 poids/bloc : 2 octets fp16 scale + 16 octets bits)."""
+def dequantize_q1_0(data: np.ndarray, target_dtype: Any = np.float32) -> np.ndarray:
+    """Dequantize GGUF Q1_0 par tranches de lignes pour limiter la RAM (128 poids/bloc)."""
     raw = np.ascontiguousarray(data.view(np.uint8))
     out_shape = (*raw.shape[:-1], (raw.shape[-1] // 18) * GROUP_SIZE)
+    if raw.ndim == 2 and raw.shape[0] > 4096:
+        out = np.empty(out_shape, dtype=target_dtype)
+        for start in range(0, raw.shape[0], 4096):
+            end = min(start + 4096, raw.shape[0])
+            out[start:end] = dequantize_q1_0(raw[start:end], target_dtype)
+        return out
+
     blocks = raw.reshape(-1, 18)
     scales = blocks[:, :2].view(np.float16).astype(np.float32)
-    bits = np.unpackbits(blocks[:, 2:], axis=1, bitorder="little").astype(np.float32)
-    signs = bits * 2.0 - 1.0
-    return (signs * scales).reshape(out_shape)
+    bits = np.unpackbits(blocks[:, 2:], axis=1, bitorder="little")
+    signs = bits.astype(np.float32) * 2.0 - 1.0
+    return (signs * scales).astype(target_dtype).reshape(out_shape)
 
 
-def dequantize_tensor(tensor: Any, gguf_mod: Any) -> np.ndarray:
+def dequantize_tensor(tensor: Any, gguf_mod: Any, target_dtype: Any = np.float32) -> np.ndarray:
     if getattr(tensor.tensor_type, "name", "") == "Q1_0":
-        return dequantize_q1_0(tensor.data)
-    return gguf_mod.quants.dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
+        return dequantize_q1_0(tensor.data, target_dtype=target_dtype)
+    return gguf_mod.quants.dequantize(tensor.data, tensor.tensor_type).astype(target_dtype)
 
 
 def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None) -> None:
@@ -186,18 +193,20 @@ def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None) -> None
         if not should_include_tensor(tensor.name, max_layers):
             continue
 
-        dequant = dequantize_tensor(tensor, gguf)
         target_name = normalize_tensor_name(tensor.name)
+        is_ternary = tensor.name.endswith(TERNARY_SUFFIXES) and len(tensor.shape) == 2
 
-        if tensor.name.endswith(TERNARY_SUFFIXES) and dequant.ndim == 2:
+        if is_ternary:
+            dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
             packed_u8, scales_f16 = quantize_hadamard_ternary(dequant, h_128, device)
             scale_name = target_name.removesuffix(".weight") + ".scales"
             tensors_out[target_name] = packed_u8
             tensors_out[scale_name] = scales_f16
-            print(f"  [2-bit] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}")
+            print(f"  [2-bit] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
         else:
-            tensors_out[target_name] = dequant.astype(np.float16)
-            print(f"  [FP16 ] {target_name:32s} -> {dequant.shape}")
+            dequant_f16 = dequantize_tensor(tensor, gguf, target_dtype=np.float16)
+            tensors_out[target_name] = dequant_f16
+            print(f"  [FP16 ] {target_name:32s} -> {dequant_f16.shape}", flush=True)
 
     save_file(tensors_out, str(out_dir / "model.safetensors"))
     print(f"Export terminé dans {out_dir} ({len(tensors_out)} tenseurs).")
