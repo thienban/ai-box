@@ -253,11 +253,12 @@ def main() -> None:
 
     for prompt in prompts:
         if getattr(tokenizer, "chat_template", None):
-            ids = tokenizer.apply_chat_template(
+            formatted = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
-                tokenize=True,
+                tokenize=False,
                 add_generation_prompt=True,
             )
+            ids = tokenizer.encode(formatted, add_special_tokens=False)
         else:
             ids = tokenizer.encode(prompt, add_special_tokens=True)
         t0 = time.perf_counter()
