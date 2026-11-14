@@ -23,6 +23,9 @@ TERNARY_SUFFIXES = (
     "attn_k.weight",
     "attn_v.weight",
     "attn_output.weight",
+    "attn_qkv.weight",
+    "attn_gate.weight",
+    "ssm_out.weight",
     "ffn_gate.weight",
     "ffn_up.weight",
     "ffn_down.weight",
@@ -83,7 +86,9 @@ def get_gguf_scalar(reader: Any, keys: list[str], default: Any = None) -> Any:
 
 def extract_model_config(reader: Any, max_layers: int | None) -> dict[str, Any]:
     arch = get_gguf_scalar(reader, ["general.architecture"], "llama")
-    if isinstance(arch, bytes):
+    if isinstance(arch, list):
+        arch = bytes(arch).decode("utf-8")
+    elif isinstance(arch, bytes):
         arch = arch.decode("utf-8")
 
     num_layers = int(get_gguf_scalar(reader, [f"{arch}.block_count"], 64))
