@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::engine::ModelConfig;
 use crate::json::parse_json;
 use crate::safetensors::SafeTensorsFile;
 
@@ -119,7 +120,18 @@ pub fn inspect_model(target: &str) -> Result<(), String> {
     let quant_raw = fs::read_to_string(model_dir.join("quant_config.json"))
         .map_err(|e| format!("Cannot read quant_config.json: {e}"))?;
     let quant_json = parse_json(&quant_raw)?;
+    let config_raw = fs::read_to_string(model_dir.join("config.json"))
+        .map_err(|e| format!("Cannot read config.json: {e}"))?;
+    let model_cfg = ModelConfig::from_json(&parse_json(&config_raw)?)?;
     println!("Modèle        : {}", model_dir.display());
+    println!(
+        "Architecture  : {} couches, hidden={}, heads={} (kv={}), vocab={}",
+        model_cfg.num_hidden_layers,
+        model_cfg.hidden_size,
+        model_cfg.num_attention_heads,
+        model_cfg.num_key_value_heads,
+        model_cfg.vocab_size
+    );
     if let Some(obj) = quant_json.as_object() {
         let summary: Vec<String> = obj.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
         println!("Quant config  : {}", summary.join(", "));
