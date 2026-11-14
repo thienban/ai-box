@@ -159,13 +159,28 @@ def dequantize_q1_0(data: np.ndarray, target_dtype: Any = np.float32) -> np.ndar
     return (signs * scales).astype(target_dtype).reshape(out_shape)
 
 
+def q1_0_to_ternary_2bit(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Convertit GGUF Q1_0 sans perte vers le format 2-bit AI Box (1->+1, 3->-1) + scales FP16."""
+    raw = np.ascontiguousarray(data.view(np.uint8))
+    n_rows = raw.shape[0]
+    n_groups = raw.shape[1] // 18
+    k_cols = n_groups * GROUP_SIZE
+    blocks = raw.reshape(n_rows, n_groups, 18)
+
+    scales_f16 = np.ascontiguousarray(blocks[:, :, :2]).view(np.float16).reshape(n_rows, n_groups)
+    bits = np.unpackbits(blocks[:, :, 2:], axis=2, bitorder="little").reshape(n_rows, k_cols)
+    codes = np.where(bits == 1, np.uint8(1), np.uint8(3)).reshape(n_rows, k_cols // 4, 4)
+    packed_u8 = codes[..., 0] | (codes[..., 1] << 2) | (codes[..., 2] << 4) | (codes[..., 3] << 6)
+    return np.ascontiguousarray(packed_u8), np.ascontiguousarray(scales_f16)
+
+
 def dequantize_tensor(tensor: Any, gguf_mod: Any, target_dtype: Any = np.float32) -> np.ndarray:
     if getattr(tensor.tensor_type, "name", "") == "Q1_0":
         return dequantize_q1_0(tensor.data, target_dtype=target_dtype)
     return gguf_mod.quants.dequantize(tensor.data, tensor.tensor_type).astype(target_dtype)
 
 
-def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None) -> None:
+def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None, force_hadamard: bool = False) -> None:
     import gguf
     from safetensors.numpy import save_file
 
@@ -176,6 +191,9 @@ def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None) -> None
 
     reader = gguf.GGUFReader(str(gguf_path), mode="r")
     config = extract_model_config(reader, max_layers)
+    has_q1_0 = any(getattr(t.tensor_type, "name", "") == "Q1_0" for t in reader.tensors)
+    use_hadamard = force_hadamard or not has_q1_0
+    print(f"Mode quantification : hadamard={use_hadamard} (Q1_0 détecté={has_q1_0})")
 
     with open(out_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
@@ -185,7 +203,7 @@ def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None) -> None
                 "bits": 2,
                 "format": "ternary_2bit",
                 "group_size": GROUP_SIZE,
-                "hadamard": True,
+                "hadamard": use_hadamard,
             },
             f,
             indent=2,
@@ -202,8 +220,11 @@ def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None) -> None
         is_ternary = tensor.name.endswith(TERNARY_SUFFIXES) and len(tensor.shape) == 2
 
         if is_ternary:
-            dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
-            packed_u8, scales_f16 = quantize_hadamard_ternary(dequant, h_128, device)
+            if not use_hadamard and getattr(tensor.tensor_type, "name", "") == "Q1_0":
+                packed_u8, scales_f16 = q1_0_to_ternary_2bit(tensor.data)
+            else:
+                dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
+                packed_u8, scales_f16 = quantize_hadamard_ternary(dequant, h_128, device)
             scale_name = target_name.removesuffix(".weight") + ".scales"
             tensors_out[target_name] = packed_u8
             tensors_out[scale_name] = scales_f16
@@ -227,8 +248,13 @@ def main() -> None:
         default=None,
         help="Limiter le nombre de couches exportées (utile pour test rapide)",
     )
+    parser.add_argument(
+        "--force-hadamard",
+        action="store_true",
+        help="Forcer la rotation Hadamard + re-quantification même sur Q1_0",
+    )
     args = parser.parse_args()
-    convert_gguf(args.gguf, args.out, args.max_layers)
+    convert_gguf(args.gguf, args.out, args.max_layers, force_hadamard=args.force_hadamard)
 
 
 if __name__ == "__main__":

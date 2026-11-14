@@ -75,7 +75,7 @@ def apply_rope(
 
 
 class TernaryLinear:
-    def __init__(self, packed_u8: torch.Tensor, scales_f16: torch.Tensor, h_128: torch.Tensor) -> None:
+    def __init__(self, packed_u8: torch.Tensor, scales_f16: torch.Tensor, h_128: torch.Tensor | None) -> None:
         self.packed_u8 = packed_u8
         self.scales_f16 = scales_f16
         self.h_128 = h_128
@@ -84,14 +84,18 @@ class TernaryLinear:
         orig_shape = x.shape
         x_2d = x.reshape(-1, orig_shape[-1])
         m, k = x_2d.shape
-        x_rot = (x_2d.reshape(m, k // GROUP_SIZE, GROUP_SIZE) @ self.h_128).reshape(m, k)
+        x_in = (
+            (x_2d.reshape(m, k // GROUP_SIZE, GROUP_SIZE) @ self.h_128).reshape(m, k)
+            if self.h_128 is not None
+            else x_2d
+        )
 
         w_tern = unpack_ternary_2bit(self.packed_u8)
         n = w_tern.shape[0]
         w_scaled = (
             w_tern.reshape(n, k // GROUP_SIZE, GROUP_SIZE) * self.scales_f16.unsqueeze(-1)
         ).reshape(n, k)
-        out = F.linear(x_rot, w_scaled)
+        out = F.linear(x_in, w_scaled)
         return out.reshape(*orig_shape[:-1], n)
 
 
@@ -164,7 +168,8 @@ class BonsaiAiboxModel:
         w_key = f"{prefix}.weight"
         s_key = f"{prefix}.scales"
         if s_key in self.tensors:
-            return TernaryLinear(self.tensors[w_key], self.tensors[s_key], self.h_128).forward(x)
+            h_mat = self.h_128 if self.quant_config.get("hadamard", True) else None
+            return TernaryLinear(self.tensors[w_key], self.tensors[s_key], h_mat).forward(x)
         return F.linear(x, self.tensors[w_key].to(x.dtype))
 
     @torch.no_grad()
