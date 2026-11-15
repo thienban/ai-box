@@ -27,6 +27,9 @@ ScratchBuffer g_dev_out;
 ScratchBuffer g_dev_argmax_vals;
 ScratchBuffer g_dev_argmax_idxs;
 ScratchBuffer g_dev_argmax_out;
+ScratchBuffer g_dev_cand_idxs;
+ScratchBuffer g_dev_cand_vals;
+ScratchBuffer g_dev_cand_count;
 
 cudaStream_t g_active_stream = nullptr;
 cudaStream_t g_graph_stream = nullptr;
@@ -297,7 +300,7 @@ __global__ void argmax_stage1_kernel(
 }
 
 __global__ void argmax_stage2_kernel(
-    const float* __restrict__ block_vals,
+    float* __restrict__ block_vals,
     const uint32_t* __restrict__ block_idxs,
     int num_blocks,
     uint32_t* __restrict__ out_idx
@@ -328,7 +331,33 @@ __global__ void argmax_stage2_kernel(
     }
 
     if (tid == 0) {
+        block_vals[0] = s_val[0];
         *out_idx = s_idx[0];
+    }
+}
+
+__global__ void filter_candidates_kernel(
+    const float* __restrict__ logits,
+    int len,
+    const float* __restrict__ max_val_ptr,
+    float margin,
+    uint32_t* __restrict__ out_idxs,
+    float* __restrict__ out_vals,
+    int max_out,
+    int* __restrict__ out_count
+) {
+    float threshold = *max_val_ptr - margin;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (; idx < len; idx += stride) {
+        float val = logits[idx];
+        if (val >= threshold) {
+            int pos = atomicAdd(out_count, 1);
+            if (pos < max_out) {
+                out_idxs[pos] = static_cast<uint32_t>(idx);
+                out_vals[pos] = val;
+            }
+        }
     }
 }
 
@@ -401,6 +430,28 @@ static __device__ __forceinline__ float dot_binary_nibble_h4(uint8_t nibble, __h
     return s0 * f0.x + s1 * f0.y + s2 * f1.x + s3 * f1.y;
 }
 
+template <int Bits>
+static __device__ __forceinline__ float dot_packed_chunk(
+    const uint16_t* __restrict__ w_u16,
+    const uint32_t* __restrict__ w_u32,
+    int idx,
+    const __half2* h0,
+    const __half2* h1
+) {
+    if (Bits == 1) {
+        uint16_t packed2 = w_u16[idx];
+        return dot_binary_nibble_h4(packed2 & 0x0F, h0[0], h0[1])
+             + dot_binary_nibble_h4((packed2 >> 4) & 0x0F, h0[2], h0[3])
+             + dot_binary_nibble_h4((packed2 >> 8) & 0x0F, h1[0], h1[1])
+             + dot_binary_nibble_h4((packed2 >> 12) & 0x0F, h1[2], h1[3]);
+    }
+    uint32_t packed4 = w_u32[idx];
+    return dot_packed_byte_h4(packed4 & 0xFF, h0[0], h0[1])
+         + dot_packed_byte_h4((packed4 >> 8) & 0xFF, h0[2], h0[3])
+         + dot_packed_byte_h4((packed4 >> 16) & 0xFF, h1[0], h1[1])
+         + dot_packed_byte_h4((packed4 >> 24) & 0xFF, h1[2], h1[3]);
+}
+
 template <bool AddResidual, typename OutT, int Bits = 2>
 __global__ void ternary_gemv_f16_kernel(
     const __half* __restrict__ x,
@@ -439,20 +490,7 @@ __global__ void ternary_gemv_f16_kernel(
         const __half2* h0 = reinterpret_cast<const __half2*>(&u0);
         const __half2* h1 = reinterpret_cast<const __half2*>(&u1);
 
-        float partial;
-        if (Bits == 1) {
-            uint16_t packed2 = w_u16[cur_g * 8 + sub_lane];
-            partial = dot_binary_nibble_h4(packed2 & 0x0F, h0[0], h0[1])
-                    + dot_binary_nibble_h4((packed2 >> 4) & 0x0F, h0[2], h0[3])
-                    + dot_binary_nibble_h4((packed2 >> 8) & 0x0F, h1[0], h1[1])
-                    + dot_binary_nibble_h4((packed2 >> 12) & 0x0F, h1[2], h1[3]);
-        } else {
-            uint32_t packed4 = w_u32[cur_g * 8 + sub_lane];
-            partial = dot_packed_byte_h4(packed4 & 0xFF, h0[0], h0[1])
-                    + dot_packed_byte_h4((packed4 >> 8) & 0xFF, h0[2], h0[3])
-                    + dot_packed_byte_h4((packed4 >> 16) & 0xFF, h1[0], h1[1])
-                    + dot_packed_byte_h4((packed4 >> 24) & 0xFF, h1[2], h1[3]);
-        }
+        float partial = dot_packed_chunk<Bits>(w_u16, w_u32, cur_g * 8 + sub_lane, h0, h1);
 
         partial += __shfl_down_sync(0xFFFFFFFF, partial, 4);
         partial += __shfl_down_sync(0xFFFFFFFF, partial, 2);
@@ -487,6 +525,76 @@ __global__ void ternary_gemv_f16_kernel(
     if (lane == 0) {
         size_t out_idx = (size_t)row_m * n + row_n;
         store_gemv_out<AddResidual>(out, out_idx, total);
+    }
+}
+
+template <int Bits = 2>
+__global__ void ternary_gemv_swiglu_f16_kernel(
+    const __half* __restrict__ x,
+    const uint8_t* __restrict__ w_gate_packed,
+    const uint16_t* __restrict__ scales_gate,
+    const uint8_t* __restrict__ w_up_packed,
+    const uint16_t* __restrict__ scales_up,
+    __half* __restrict__ out,
+    int n,
+    int k
+) {
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int row_n = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    if (row_n >= n) {
+        return;
+    }
+
+    int groups_per_row = k / GROUP_SIZE;
+    const int bytes_per_group = (Bits == 1) ? BINARY_PACKED_BYTES_PER_GROUP : PACKED_BYTES_PER_GROUP;
+    size_t row_w_offset = (size_t)row_n * groups_per_row * bytes_per_group;
+    size_t row_s_offset = (size_t)row_n * groups_per_row;
+
+    const uint32_t* wg_u32 = reinterpret_cast<const uint32_t*>(w_gate_packed + row_w_offset);
+    const uint16_t* wg_u16 = reinterpret_cast<const uint16_t*>(w_gate_packed + row_w_offset);
+    const uint16_t* sg_row = scales_gate + row_s_offset;
+
+    const uint32_t* wu_u32 = reinterpret_cast<const uint32_t*>(w_up_packed + row_w_offset);
+    const uint16_t* wu_u16 = reinterpret_cast<const uint16_t*>(w_up_packed + row_w_offset);
+    const uint16_t* su_row = scales_up + row_s_offset;
+
+    float total_g = 0.0f;
+    float total_u = 0.0f;
+    int sub_g = lane >> 3;
+    int sub_lane = lane & 7;
+
+    for (int g = 0; g + 4 <= groups_per_row; g += 4) {
+        int cur_g = g + sub_g;
+        const uint4* x_u4 = reinterpret_cast<const uint4*>(&x[cur_g * GROUP_SIZE + sub_lane * 16]);
+        uint4 u0 = x_u4[0];
+        uint4 u1 = x_u4[1];
+        const __half2* h0 = reinterpret_cast<const __half2*>(&u0);
+        const __half2* h1 = reinterpret_cast<const __half2*>(&u1);
+
+        int chunk_idx = cur_g * 8 + sub_lane;
+        float pg = dot_packed_chunk<Bits>(wg_u16, wg_u32, chunk_idx, h0, h1);
+        float pu = dot_packed_chunk<Bits>(wu_u16, wu_u32, chunk_idx, h0, h1);
+
+        pg += __shfl_down_sync(0xFFFFFFFF, pg, 4);
+        pg += __shfl_down_sync(0xFFFFFFFF, pg, 2);
+        pg += __shfl_down_sync(0xFFFFFFFF, pg, 1);
+
+        pu += __shfl_down_sync(0xFFFFFFFF, pu, 4);
+        pu += __shfl_down_sync(0xFFFFFFFF, pu, 2);
+        pu += __shfl_down_sync(0xFFFFFFFF, pu, 1);
+
+        if (sub_lane == 0) {
+            total_g += pg * __half2float(*reinterpret_cast<const __half*>(&sg_row[cur_g]));
+            total_u += pu * __half2float(*reinterpret_cast<const __half*>(&su_row[cur_g]));
+        }
+    }
+
+    total_g += __shfl_down_sync(0xFFFFFFFF, total_g, 16);
+    total_g += __shfl_down_sync(0xFFFFFFFF, total_g, 8);
+    total_u += __shfl_down_sync(0xFFFFFFFF, total_u, 16);
+    total_u += __shfl_down_sync(0xFFFFFFFF, total_u, 8);
+    if (lane == 0) {
+        out[row_n] = __float2half((total_g / (1.0f + expf(-total_g))) * total_u);
     }
 }
 
@@ -949,6 +1057,15 @@ __global__ void lm_head_quant_act_f16_kernel(
     int vocab_size,
     int hidden_size
 ) {
+    extern __shared__ __half s_hidden[];
+    const uint4* hid_u4 = reinterpret_cast<const uint4*>(hidden);
+    uint4* sh_u4 = reinterpret_cast<uint4*>(s_hidden);
+    int chunks_u4 = hidden_size >> 3;
+    for (int i = threadIdx.x; i < chunks_u4; i += blockDim.x) {
+        sh_u4[i] = hid_u4[i];
+    }
+    __syncthreads();
+
     int lane = threadIdx.x & (WARP_SIZE - 1);
     int v = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
     if (v >= vocab_size) {
@@ -961,30 +1078,64 @@ __global__ void lm_head_quant_act_f16_kernel(
     const uint16_t* s_row = scales + (size_t)v * groups_per_row;
     float total = 0.0f;
 
-    for (int g = 0; g < groups_per_row; ++g) {
-        uint2 x_u2 = *reinterpret_cast<const uint2*>(&hidden[g * GROUP_SIZE + lane * 4]);
-        const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
-        float2 x0 = __half22float2(h2[0]);
-        float2 x1 = __half22float2(h2[1]);
-        float scale = __half2float(*reinterpret_cast<const __half*>(&s_row[g]));
-        float dot = 0.0f;
-
-        if (Bits == 8) {
-            uint32_t w4 = *reinterpret_cast<const uint32_t*>(&w_row[g * 128 + lane * 4]);
-            int8_t q0 = static_cast<int8_t>(w4 & 0xFF);
-            int8_t q1 = static_cast<int8_t>((w4 >> 8) & 0xFF);
-            int8_t q2 = static_cast<int8_t>((w4 >> 16) & 0xFF);
-            int8_t q3 = static_cast<int8_t>((w4 >> 24) & 0xFF);
-            dot = (float)q0 * x0.x + (float)q1 * x0.y + (float)q2 * x1.x + (float)q3 * x1.y;
-        } else {
-            uint16_t w2 = *reinterpret_cast<const uint16_t*>(&w_row[g * 64 + lane * 2]);
-            float q0 = (float)((w2 & 0x0F)) - 8.0f;
-            float q1 = (float)(((w2 >> 4) & 0x0F)) - 8.0f;
-            float q2 = (float)(((w2 >> 8) & 0x0F)) - 8.0f;
-            float q3 = (float)(((w2 >> 12) & 0x0F)) - 8.0f;
-            dot = q0 * x0.x + q1 * x0.y + q2 * x1.x + q3 * x1.y;
+    if (Bits == 4) {
+        int sub = lane & 3;
+        int g_off = lane >> 2;
+        for (int g_base = 0; g_base < groups_per_row; g_base += 8) {
+            int g = g_base + g_off;
+            if (g < groups_per_row) {
+                uint4 w16 = *reinterpret_cast<const uint4*>(&w_row[g * 64 + sub * 16]);
+                const uint32_t* w32 = reinterpret_cast<const uint32_t*>(&w16);
+                const uint4* sh_sub = reinterpret_cast<const uint4*>(&s_hidden[g * GROUP_SIZE + sub * 32]);
+                float scale = __half2float(*reinterpret_cast<const __half*>(&s_row[g]));
+                float dot = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    uint32_t w = w32[j];
+                    uint4 x_u4 = sh_sub[j];
+                    const __half2* xh2 = reinterpret_cast<const __half2*>(&x_u4);
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        float2 xf = __half22float2(xh2[k]);
+                        uint32_t byte_val = (w >> (k * 8)) & 0xFF;
+                        float q0 = static_cast<float>(byte_val & 0x0F) - 8.0f;
+                        float q1 = static_cast<float>((byte_val >> 4) & 0x0F) - 8.0f;
+                        dot += q0 * xf.x + q1 * xf.y;
+                    }
+                }
+                total += dot * scale;
+            }
         }
-        total += dot * scale;
+    } else {
+        int sub = lane & 7;
+        int g_off = lane >> 3;
+        for (int g_base = 0; g_base < groups_per_row; g_base += 4) {
+            int g = g_base + g_off;
+            if (g < groups_per_row) {
+                uint4 w16 = *reinterpret_cast<const uint4*>(&w_row[g * 128 + sub * 16]);
+                const uint32_t* w32 = reinterpret_cast<const uint32_t*>(&w16);
+                const uint4* sh_sub = reinterpret_cast<const uint4*>(&s_hidden[g * GROUP_SIZE + sub * 16]);
+                float scale = __half2float(*reinterpret_cast<const __half*>(&s_row[g]));
+                float dot = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    uint4 x_u4 = sh_sub[j];
+                    const __half2* xh2 = reinterpret_cast<const __half2*>(&x_u4);
+                    #pragma unroll
+                    for (int half_idx = 0; half_idx < 2; ++half_idx) {
+                        uint32_t w = w32[j * 2 + half_idx];
+                        float2 xf0 = __half22float2(xh2[half_idx * 2 + 0]);
+                        float2 xf1 = __half22float2(xh2[half_idx * 2 + 1]);
+                        int8_t q0 = static_cast<int8_t>(w & 0xFF);
+                        int8_t q1 = static_cast<int8_t>((w >> 8) & 0xFF);
+                        int8_t q2 = static_cast<int8_t>((w >> 16) & 0xFF);
+                        int8_t q3 = static_cast<int8_t>((w >> 24) & 0xFF);
+                        dot += (float)q0 * xf0.x + (float)q1 * xf0.y + (float)q2 * xf1.x + (float)q3 * xf1.y;
+                    }
+                }
+                total += dot * scale;
+            }
+        }
     }
 
     total = warp_reduce_sum(total);
@@ -1087,6 +1238,60 @@ int aibox_gpu_argmax_f32(const float* dev_logits, int len, uint32_t* host_out_id
     }
     if (cudaMemcpy(host_out_idx, dev_out, sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
         return -3;
+    }
+    return 0;
+}
+
+int aibox_gpu_sample_candidates_f32(
+    const float* dev_logits,
+    int len,
+    float margin,
+    uint32_t* host_idxs,
+    float* host_vals,
+    int max_out,
+    int* host_count
+) {
+    if (len <= 0 || max_out <= 0 || host_idxs == nullptr || host_vals == nullptr || host_count == nullptr) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_scratch_mutex);
+    if (!ensure_scratch_capacity(g_dev_argmax_vals, ARGMAX_BLOCKS * sizeof(float))
+        || !ensure_scratch_capacity(g_dev_argmax_idxs, ARGMAX_BLOCKS * sizeof(uint32_t))
+        || !ensure_scratch_capacity(g_dev_argmax_out, sizeof(uint32_t))
+        || !ensure_scratch_capacity(g_dev_cand_idxs, (size_t)max_out * sizeof(uint32_t))
+        || !ensure_scratch_capacity(g_dev_cand_vals, (size_t)max_out * sizeof(float))
+        || !ensure_scratch_capacity(g_dev_cand_count, sizeof(int))) {
+        return -1;
+    }
+    float* dev_vals = static_cast<float*>(g_dev_argmax_vals.ptr);
+    uint32_t* dev_idxs = static_cast<uint32_t*>(g_dev_argmax_idxs.ptr);
+    uint32_t* dev_out = static_cast<uint32_t*>(g_dev_argmax_out.ptr);
+    uint32_t* dev_cand_idxs = static_cast<uint32_t*>(g_dev_cand_idxs.ptr);
+    float* dev_cand_vals = static_cast<float*>(g_dev_cand_vals.ptr);
+    int* dev_cand_count = static_cast<int*>(g_dev_cand_count.ptr);
+
+    argmax_stage1_kernel<<<ARGMAX_BLOCKS, 256>>>(dev_logits, len, dev_vals, dev_idxs);
+    argmax_stage2_kernel<<<1, ARGMAX_BLOCKS>>>(dev_vals, dev_idxs, ARGMAX_BLOCKS, dev_out);
+    if (cudaMemsetAsync(dev_cand_count, 0, sizeof(int)) != cudaSuccess) {
+        return -2;
+    }
+    filter_candidates_kernel<<<ARGMAX_BLOCKS, 256>>>(
+        dev_logits, len, dev_vals, margin, dev_cand_idxs, dev_cand_vals, max_out, dev_cand_count
+    );
+    if (cudaGetLastError() != cudaSuccess) {
+        return -2;
+    }
+    int count = 0;
+    if (cudaMemcpy(&count, dev_cand_count, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return -3;
+    }
+    *host_count = count;
+    int n_copy = (count < max_out) ? count : max_out;
+    if (n_copy > 0) {
+        if (cudaMemcpy(host_idxs, dev_cand_idxs, (size_t)n_copy * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess
+            || cudaMemcpy(host_vals, dev_cand_vals, (size_t)n_copy * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return -3;
+        }
     }
     return 0;
 }
@@ -1343,6 +1548,36 @@ int aibox_gpu_lm_head_f16_act_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
+int aibox_gpu_matmul_ternary_swiglu_f16_dev(
+    const uint16_t* dev_x,
+    const uint8_t* dev_w_gate,
+    const uint16_t* dev_scales_gate,
+    const uint8_t* dev_w_up,
+    const uint16_t* dev_scales_up,
+    uint16_t* dev_out,
+    int n,
+    int k,
+    int bits
+) {
+    if ((bits != 1 && bits != 2) || ((k / GROUP_SIZE) % 4) != 0) {
+        return -1;
+    }
+    dim3 block(128);
+    dim3 grid((n + 3) / 4, 1);
+    const __half* hx = reinterpret_cast<const __half*>(dev_x);
+    __half* hout = reinterpret_cast<__half*>(dev_out);
+    if (bits == 1) {
+        ternary_gemv_swiglu_f16_kernel<1><<<grid, block, 0, g_active_stream>>>(
+            hx, dev_w_gate, dev_scales_gate, dev_w_up, dev_scales_up, hout, n, k
+        );
+    } else {
+        ternary_gemv_swiglu_f16_kernel<2><<<grid, block, 0, g_active_stream>>>(
+            hx, dev_w_gate, dev_scales_gate, dev_w_up, dev_scales_up, hout, n, k
+        );
+    }
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
 int aibox_gpu_lm_head_f32_act_f16(
     const uint16_t* dev_hidden,
     const float* dev_emb_f32,
@@ -1374,13 +1609,14 @@ int aibox_gpu_lm_head_quant_act_f16(
         return -1;
     }
     int blocks = (vocab_size + 3) / 4;
+    size_t smem_bytes = (size_t)hidden_size * sizeof(__half);
     const __half* hx = reinterpret_cast<const __half*>(dev_hidden);
     if (bits == 4) {
-        lm_head_quant_act_f16_kernel<4><<<blocks, 128, 0, g_active_stream>>>(
+        lm_head_quant_act_f16_kernel<4><<<blocks, 128, smem_bytes, g_active_stream>>>(
             hx, dev_w, dev_scales, dev_logits, vocab_size, hidden_size
         );
     } else {
-        lm_head_quant_act_f16_kernel<8><<<blocks, 128, 0, g_active_stream>>>(
+        lm_head_quant_act_f16_kernel<8><<<blocks, 128, smem_bytes, g_active_stream>>>(
             hx, dev_w, dev_scales, dev_logits, vocab_size, hidden_size
         );
     }

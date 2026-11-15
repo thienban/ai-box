@@ -59,20 +59,18 @@ pub fn softmax_inplace(values: &mut [f32]) {
     }
 }
 
-pub fn sample_token(logits: &[f32], params: SamplingParams, rng: &mut XorShift64) -> Result<usize, String> {
-    if logits.is_empty() {
-        return Err("Cannot sample from empty logits".to_string());
+pub fn sample_from_candidates(
+    candidates: &mut Vec<(usize, f32)>,
+    params: SamplingParams,
+    rng: &mut XorShift64,
+) -> Result<usize, String> {
+    if candidates.is_empty() {
+        return Err("Cannot sample from empty candidates".to_string());
     }
-    if params.temperature <= 0.0 {
-        return Ok(argmax(logits));
-    }
-
     let inv_temp = 1.0 / params.temperature;
-    let mut candidates: Vec<(usize, f32)> = logits
-        .iter()
-        .enumerate()
-        .map(|(idx, &val)| (idx, val * inv_temp))
-        .collect();
+    for (_, val) in candidates.iter_mut() {
+        *val *= inv_temp;
+    }
 
     candidates.sort_by(|left, right| right.1.total_cmp(&left.1));
     if params.top_k > 0 && candidates.len() > params.top_k {
@@ -94,6 +92,18 @@ pub fn sample_token(logits: &[f32], params: SamplingParams, rng: &mut XorShift64
         }
     }
     Ok(candidates[0].0)
+}
+
+pub fn sample_token(logits: &[f32], params: SamplingParams, rng: &mut XorShift64) -> Result<usize, String> {
+    if logits.is_empty() {
+        return Err("Cannot sample from empty logits".to_string());
+    }
+    if params.temperature <= 0.0 {
+        return Ok(argmax(logits));
+    }
+
+    let mut candidates: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    sample_from_candidates(&mut candidates, params, rng)
 }
 
 fn argmax(values: &[f32]) -> usize {

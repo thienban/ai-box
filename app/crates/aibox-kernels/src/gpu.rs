@@ -72,6 +72,28 @@ type FnLmHeadF32ActF16 = unsafe extern "C" fn(*const u16, *const f32, *mut f32, 
 type FnLmHeadQuantActF16 =
     unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut f32, c_int, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
+type FnMatmulTernarySwigluF16Dev = unsafe extern "C" fn(
+    *const u16,
+    *const u8,
+    *const u16,
+    *const u8,
+    *const u16,
+    *mut u16,
+    c_int,
+    c_int,
+    c_int,
+) -> c_int;
+#[cfg(target_os = "linux")]
+type FnSampleCandidatesF32 = unsafe extern "C" fn(
+    *const f32,
+    c_int,
+    f32,
+    *mut u32,
+    *mut f32,
+    c_int,
+    *mut c_int,
+) -> c_int;
+#[cfg(target_os = "linux")]
 type FnGraphCapture = unsafe extern "C" fn() -> c_int;
 #[cfg(target_os = "linux")]
 type FnGraphLaunch = unsafe extern "C" fn(*mut u16, *const u16, c_int, c_int) -> c_int;
@@ -127,6 +149,8 @@ struct CudaSymbols {
     lm_head_f16_act_f16: FnLmHeadF16ActF16,
     lm_head_f32_act_f16: FnLmHeadF32ActF16,
     lm_head_quant_act_f16: FnLmHeadQuantActF16,
+    matmul_ternary_swiglu_f16_dev: FnMatmulTernarySwigluF16Dev,
+    sample_candidates_f32: FnSampleCandidatesF32,
     graph_begin_capture: FnGraphCapture,
     graph_end_capture: FnGraphCapture,
     graph_launch: FnGraphLaunch,
@@ -377,6 +401,8 @@ impl GpuBackend {
                 lm_head_f16_act_f16: load_symbol(handle, "aibox_gpu_lm_head_f16_act_f16")?,
                 lm_head_f32_act_f16: load_symbol(handle, "aibox_gpu_lm_head_f32_act_f16")?,
                 lm_head_quant_act_f16: load_symbol(handle, "aibox_gpu_lm_head_quant_act_f16")?,
+                matmul_ternary_swiglu_f16_dev: load_symbol(handle, "aibox_gpu_matmul_ternary_swiglu_f16_dev")?,
+                sample_candidates_f32: load_symbol(handle, "aibox_gpu_sample_candidates_f32")?,
                 graph_begin_capture: load_symbol(handle, "aibox_gpu_graph_begin_capture")?,
                 graph_end_capture: load_symbol(handle, "aibox_gpu_graph_end_capture")?,
                 graph_launch: load_symbol(handle, "aibox_gpu_graph_launch")?,
@@ -716,6 +742,76 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_lm_head_quant_act_f16", status)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_ternary_swiglu_f16_dev(
+        &self,
+        x: &GpuBuffer<'_, u16>,
+        gate_w: &[u8],
+        gate_scales: &[u16],
+        up_w: &[u8],
+        up_scales: &[u16],
+        out: &mut GpuBuffer<'_, u16>,
+        n: usize,
+        k: usize,
+        bits: u8,
+    ) -> Result<(), BackendError> {
+        let (dev_wg, dev_sg) = self.get_or_upload_weights(gate_w, gate_scales)?;
+        let (dev_wu, dev_su) = self.get_or_upload_weights(up_w, up_scales)?;
+        let status = unsafe {
+            (self.symbols.matmul_ternary_swiglu_f16_dev)(
+                x.as_ptr(),
+                dev_wg,
+                dev_sg,
+                dev_wu,
+                dev_su,
+                out.as_mut_ptr(),
+                n as c_int,
+                k as c_int,
+                bits as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_matmul_ternary_swiglu_f16_dev", status)
+    }
+
+    pub fn sample_candidates_f32(
+        &self,
+        logits: &GpuBuffer<'_, f32>,
+        len: usize,
+        margin: f32,
+        max_out: usize,
+    ) -> Result<Option<Vec<(usize, f32)>>, BackendError> {
+        const STACK_CAP: usize = 1024;
+        if max_out > STACK_CAP {
+            return Ok(None);
+        }
+        let mut idxs = [0u32; STACK_CAP];
+        let mut vals = [0.0f32; STACK_CAP];
+        let mut count: c_int = 0;
+        let status = unsafe {
+            (self.symbols.sample_candidates_f32)(
+                logits.as_ptr(),
+                len as c_int,
+                margin,
+                idxs.as_mut_ptr(),
+                vals.as_mut_ptr(),
+                max_out as c_int,
+                &mut count,
+            )
+        };
+        check_cuda_status("aibox_gpu_sample_candidates_f32", status)?;
+        let count_usize = count.max(0) as usize;
+        if count_usize > max_out {
+            return Ok(None);
+        }
+        Ok(Some(
+            idxs[..count_usize]
+                .iter()
+                .zip(vals[..count_usize].iter())
+                .map(|(&idx, &val)| (idx as usize, val))
+                .collect(),
+        ))
+    }
+
     pub fn graph_begin_capture(&self) -> Result<(), BackendError> {
         let status = unsafe { (self.symbols.graph_begin_capture)() };
         check_cuda_status("aibox_gpu_graph_begin_capture", status)
@@ -877,6 +973,13 @@ impl GpuBackend {
     }
     #[allow(clippy::too_many_arguments)]
     pub fn lm_head_quant_act_f16(&self, _hidden: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _logits: &mut GpuBuffer<'_, f32>, _v: usize, _h: usize, _bits: u8) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_ternary_swiglu_f16_dev(&self, _x: &GpuBuffer<'_, u16>, _gw: &[u8], _gs: &[u16], _uw: &[u8], _us: &[u16], _out: &mut GpuBuffer<'_, u16>, _n: usize, _k: usize, _bits: u8) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn sample_candidates_f32(&self, _logits: &GpuBuffer<'_, f32>, _len: usize, _margin: f32, _max_out: usize) -> Result<Option<Vec<(usize, f32)>>, BackendError> {
         Err(linux_only_err())
     }
     pub fn graph_begin_capture(&self) -> Result<(), BackendError> {

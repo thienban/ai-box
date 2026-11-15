@@ -880,6 +880,16 @@ impl TransformerModel {
         if params.temperature <= 0.0 {
             return gpu.argmax_f32(&s.logits, self.config.vocab_size).map_err(|e| e.to_string());
         }
+        let margin = (16.0 * params.temperature).max(12.0);
+        if let Some(mut candidates) = gpu
+            .sample_candidates_f32(&s.logits, self.config.vocab_size, margin, 1024)
+            .map_err(|e| e.to_string())?
+        {
+            let enough_for_top_k = params.top_k == 0 || candidates.len() >= params.top_k;
+            if enough_for_top_k && !candidates.is_empty() {
+                return crate::sampling::sample_from_candidates(&mut candidates, params, rng);
+            }
+        }
         let mut host_logits = vec![0.0f32; self.config.vocab_size];
         s.logits.download(&mut host_logits).map_err(|e| e.to_string())?;
         sample_token(&host_logits, params, rng)
@@ -954,12 +964,27 @@ impl TransformerModel {
             gpu.rms_norm_f16(&s.hidden, &layer.ffn_norm, &mut s.normed, m, h, self.config.rms_norm_eps)
                 .map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_gate.packed_weights, &layer.ffn_gate.scales_fp16, &mut s.gate, m, inter, h, layer.ffn_gate.bits).map_err(|e| e.to_string())?;
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_up.packed_weights, &layer.ffn_up.scales_fp16, &mut s.up, m, inter, h, layer.ffn_up.bits).map_err(|e| e.to_string())?;
-        if use_hadamard {
-            gpu.swiglu_fwht128_inplace_f16(&mut s.gate, &s.up, m * inter).map_err(|e| e.to_string())?;
+        if m == 1 && !use_hadamard && h % 512 == 0 && layer.ffn_gate.bits == layer.ffn_up.bits {
+            gpu.matmul_ternary_swiglu_f16_dev(
+                &s.normed,
+                &layer.ffn_gate.packed_weights,
+                &layer.ffn_gate.scales_fp16,
+                &layer.ffn_up.packed_weights,
+                &layer.ffn_up.scales_fp16,
+                &mut s.gate,
+                inter,
+                h,
+                layer.ffn_gate.bits,
+            )
+            .map_err(|e| e.to_string())?;
         } else {
-            gpu.swiglu_inplace_f16(&mut s.gate, &s.up, m * inter).map_err(|e| e.to_string())?;
+            gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_gate.packed_weights, &layer.ffn_gate.scales_fp16, &mut s.gate, m, inter, h, layer.ffn_gate.bits).map_err(|e| e.to_string())?;
+            gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_up.packed_weights, &layer.ffn_up.scales_fp16, &mut s.up, m, inter, h, layer.ffn_up.bits).map_err(|e| e.to_string())?;
+            if use_hadamard {
+                gpu.swiglu_fwht128_inplace_f16(&mut s.gate, &s.up, m * inter).map_err(|e| e.to_string())?;
+            } else {
+                gpu.swiglu_inplace_f16(&mut s.gate, &s.up, m * inter).map_err(|e| e.to_string())?;
+            }
         }
         gpu.matmul_ternary_f16_add_dev(&s.gate, &layer.ffn_down.packed_weights, &layer.ffn_down.scales_fp16, &mut s.hidden, m, h, inter, layer.ffn_down.bits)
             .map_err(|e| e.to_string())
