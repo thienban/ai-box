@@ -339,4 +339,47 @@ mod tests {
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-3, "max_diff={max_diff} >= 1e-3");
     }
+
+    #[test]
+    fn avx2_matches_scalar_without_hadamard_and_with_outliers() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let m = 2;
+        let n = 69;
+        let k = 512;
+        let groups = k / GROUP_SIZE;
+
+        let mut activations: Vec<f32> = (0..(m * k)).map(|i| ((i as f32) * 0.073).sin()).collect();
+        // Injecte des outliers réalistes (non lissés quand hadamard=false)
+        activations[3] = 42.5;
+        activations[k + 129] = -38.0;
+
+        let weights: Vec<i8> = (0..(n * k))
+            .map(|i| match (i * 11 + 5) % 3 {
+                0 => 0,
+                1 => 1,
+                _ => -1,
+            })
+            .collect();
+        let scales_fp16: Vec<u16> = (0..(n * groups))
+            .map(|i| f32_to_f16(0.02 + 0.005 * ((i % 17) as f32)))
+            .collect();
+        let packed = pack_ternary_2bit_rows(&weights, n, k).unwrap();
+
+        let ref_out = ScalarBackend
+            .matmul_ternary(&activations, &packed, &scales_fp16, m, n, k, false)
+            .unwrap();
+        let avx_out = Avx2Backend
+            .matmul_ternary(&activations, &packed, &scales_fp16, m, n, k, false)
+            .unwrap();
+
+        let max_rel_diff = ref_out
+            .iter()
+            .zip(avx_out.iter())
+            .map(|(&r, &a)| (r - a).abs() / r.abs().max(1.0))
+            .fold(0.0f32, f32::max);
+        assert!(max_rel_diff < 1e-3, "max_rel_diff={max_rel_diff} >= 1e-3");
+    }
 }
