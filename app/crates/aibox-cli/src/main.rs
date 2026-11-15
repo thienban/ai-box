@@ -12,7 +12,7 @@ use std::env;
 use std::process::ExitCode;
 
 use aibox_kernels::tensor::{f32_to_f16, pack_ternary_2bit_rows};
-use aibox_kernels::{TernaryHadamardBackend, TmacCpuBackend, GROUP_SIZE};
+use aibox_kernels::{select_backend, TernaryHadamardBackend, TmacCpuBackend, GROUP_SIZE};
 use engine::{
     build_synthetic_tensor, EmbeddingTable, LmHead, ModelConfig, TernaryLayerWeights,
     TransformerModel,
@@ -27,10 +27,10 @@ fn print_usage() {
          \x20 aibox pull <org/repo-hf>    Télécharge un modèle depuis Hugging Face (~/.aibox/models)\n\
          \x20 aibox list                  Liste les modèles en cache local\n\
          \x20 aibox inspect <model|dir>   Vérifie config.json, quant_config.json et SafeTensors\n\
-         \x20 aibox run <model|dir> <txt> Lance l'inférence réelle sur un modèle SafeTensors\n\
+         \x20 aibox run <model|dir> <txt> [--max-tokens N] [--gpu] Inférence réelle SafeTensors\n\
          \x20 aibox selftest              Vérifie le backend CPU (AVX2/Scalar) bout en bout\n\
          \x20 aibox bench-forward         Benchmark SERV-03 (Prefill/Decode Transformer synthétique)\n\
-         \x20 aibox serve [--model dir]   Démarre le serveur HTTP OpenAI + Ollama (SERV-04)"
+         \x20 aibox serve [--model dir] [--gpu] Démarre le serveur HTTP OpenAI + Ollama (SERV-04)"
     );
 }
 
@@ -140,10 +140,25 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
         .get(1)
         .ok_or_else(|| "Usage: aibox run <model|dir> <prompt> [--max-tokens N]".to_string())?;
     let mut max_tokens = 32usize;
-    if args.get(2).map(String::as_str) == Some("--max-tokens") {
-        if let Some(val) = args.get(3) {
-            max_tokens = val.parse::<usize>().map_err(|_| format!("max-tokens invalide: '{val}'"))?;
+    let mut use_gpu = false;
+    let mut idx = 2usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--max-tokens" => {
+                idx += 1;
+                let val = args
+                    .get(idx)
+                    .ok_or_else(|| "Valeur manquante pour --max-tokens".to_string())?;
+                max_tokens = val
+                    .parse::<usize>()
+                    .map_err(|_| format!("max-tokens invalide: '{val}'"))?;
+            }
+            "--gpu" => {
+                use_gpu = true;
+            }
+            other => return Err(format!("Option inconnue pour run : '{other}'")),
         }
+        idx += 1;
     }
 
     let model_dir = resolve_model_path(target)?;
@@ -152,14 +167,14 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
     let tok = tokenizer::SimpleTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
     let prompt_ids = tok.encode_chat(prompt);
 
-    let backend = TmacCpuBackend::new();
+    let backend = select_backend(use_gpu);
     let params = SamplingParams {
         temperature: 0.0,
         top_k: 1,
         top_p: 1.0,
         seed: 42,
     };
-    let stats = model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &backend)?;
+    let stats = model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &*backend)?;
     let text = tok.decode(&stats.tokens);
     let decode_tok_s = (stats.tokens.len() as f64) / (stats.decode_ms / 1000.0).max(1e-6);
 
@@ -196,6 +211,9 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 idx += 1;
                 let model = args.get(idx).ok_or_else(|| "Valeur manquante pour --model".to_string())?;
                 config.model_dir = Some(resolve_model_path(model)?);
+            }
+            "--gpu" => {
+                config.use_gpu = true;
             }
             other => return Err(format!("Option inconnue pour serve : '{other}'")),
         }

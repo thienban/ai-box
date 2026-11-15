@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aibox_kernels::TmacCpuBackend;
+use aibox_kernels::{select_backend, TernaryHadamardBackend};
 
 use crate::engine::{
     build_synthetic_tensor, EmbeddingTable, LmHead, ModelConfig, TernaryLayerWeights,
@@ -28,6 +28,7 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub model_dir: Option<PathBuf>,
+    pub use_gpu: bool,
 }
 
 impl Default for ServerConfig {
@@ -36,12 +37,13 @@ impl Default for ServerConfig {
             host: DEFAULT_HOST.to_string(),
             port: DEFAULT_PORT,
             model_dir: None,
+            use_gpu: false,
         }
     }
 }
 
 struct ServerState {
-    backend: TmacCpuBackend,
+    backend: Box<dyn TernaryHadamardBackend>,
     model: TransformerModel,
     tokenizer: Option<SimpleTokenizer>,
 }
@@ -114,7 +116,7 @@ fn build_server_state(server_cfg: &ServerConfig) -> Result<ServerState, String> 
         let model = TransformerModel::load_from_dir(model_dir)?;
         let tokenizer = SimpleTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
         return Ok(ServerState {
-            backend: TmacCpuBackend::new(),
+            backend: select_backend(server_cfg.use_gpu),
             model,
             tokenizer: Some(tokenizer),
         });
@@ -158,7 +160,7 @@ fn build_server_state(server_cfg: &ServerConfig) -> Result<ServerState, String> 
     };
 
     Ok(ServerState {
-        backend: TmacCpuBackend::new(),
+        backend: select_backend(server_cfg.use_gpu),
         model: demo_model,
         tokenizer: None,
     })
@@ -459,7 +461,7 @@ fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<Inferen
         req.max_tokens,
         eos_id,
         req.sampling,
-        &state.backend,
+        &*state.backend,
     )?;
 
     let full_text = if let Some(ref tok) = state.tokenizer {
@@ -533,7 +535,7 @@ fn stream_openai_sse(
         req.max_tokens,
         eos_id,
         req.sampling,
-        &state.backend,
+        &*state.backend,
         |tok| {
             let chunk = if let Some(ref mut dec) = decoder {
                 dec.push(tok)
@@ -609,7 +611,7 @@ fn stream_ollama_ndjson(
         req.max_tokens,
         eos_id,
         req.sampling,
-        &state.backend,
+        &*state.backend,
         |tok| {
             let chunk = if let Some(ref mut dec) = decoder {
                 dec.push(tok)
@@ -683,6 +685,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 0,
             model_dir: None,
+            use_gpu: false,
         })
         .expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local addr");

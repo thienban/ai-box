@@ -2,11 +2,14 @@
 //! pour l'inférence ternaire 2-bit (`{-1, 0, +1}`) par groupes de 128 poids.
 
 pub mod fwht;
+pub mod gpu;
 pub mod scalar;
 pub mod tensor;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod avx2;
+
+pub use gpu::GpuBackend;
 
 use std::fmt;
 
@@ -218,4 +221,26 @@ impl TernaryHadamardBackend for TmacCpuBackend {
             use_hadamard,
         )
     }
+}
+
+/// Sélectionne le backend GPU CUDA (`--gpu` ou `AIBOX_GPU=1`) avec bascule automatique sur CPU T-MAC.
+pub fn select_backend(prefer_gpu: bool) -> Box<dyn TernaryHadamardBackend> {
+    let env_gpu = std::env::var("AIBOX_GPU").ok().as_deref() == Some("1");
+    if prefer_gpu || env_gpu {
+        match GpuBackend::try_new() {
+            Ok(gpu) => {
+                println!("Backend actif : GPU CUDA (libaibox_gpu.so)");
+                return Box::new(gpu);
+            }
+            Err(err) => {
+                eprintln!("GPU indisponible ({err}), bascule sur CPU T-MAC.");
+            }
+        }
+    }
+    let cpu = TmacCpuBackend::new();
+    println!(
+        "Backend actif : CPU {}",
+        if cpu.uses_avx2() { "AVX2" } else { "Scalar" }
+    );
+    Box::new(cpu)
 }

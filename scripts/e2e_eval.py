@@ -229,7 +229,7 @@ def has_degenerate_loop(text: str) -> bool:
     return unique_ratio < 0.25
 
 
-def run_e2e(model_dir: Path, max_tokens: int, skip_build: bool) -> int:
+def run_e2e(model_dir: Path, max_tokens: int, skip_build: bool, use_gpu: bool = False) -> int:
     repo_root = Path(__file__).resolve().parent.parent
     if skip_build:
         bin_name = "aibox.exe" if platform.system() == "Windows" else "aibox"
@@ -241,8 +241,11 @@ def run_e2e(model_dir: Path, max_tokens: int, skip_build: bool) -> int:
     base_url = f"http://127.0.0.1:{port}"
     print(f"[2/4] Démarrage `aibox serve` sur {base_url} avec {model_dir}...")
 
+    serve_cmd = [str(bin_path), "serve", "--host", "127.0.0.1", "--port", str(port), "--model", str(model_dir)]
+    if use_gpu:
+        serve_cmd.append("--gpu")
     proc = subprocess.Popen(
-        [str(bin_path), "serve", "--host", "127.0.0.1", "--port", str(port), "--model", str(model_dir)],
+        serve_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -300,8 +303,9 @@ def main() -> None:
     parser.add_argument("--model", type=Path, required=True, help="Dossier du modèle SafeTensors AI Box")
     parser.add_argument("--max-tokens", type=int, default=24, help="Tokens max par prompt")
     parser.add_argument("--skip-build", action="store_true", help="Ne pas recompiler `aibox` en release")
+    parser.add_argument("--gpu", action="store_true", help="Activer le backend GPU CUDA (`--gpu`)")
     args = parser.parse_args()
-    sys.exit(run_e2e(args.model.expanduser(), args.max_tokens, args.skip_build))
+    sys.exit(run_e2e(args.model.expanduser(), args.max_tokens, args.skip_build, args.gpu))
 
 
 if __name__ == "__main__":
