@@ -1,5 +1,6 @@
 //! Backend GPU CUDA chargé dynamiquement (`libaibox_gpu.so`) avec cache VRAM.
 
+use crate::tensor::f32_to_f16;
 use crate::{validate_matmul_inputs, BackendError, TernaryHadamardBackend};
 
 #[cfg(target_os = "linux")]
@@ -33,38 +34,39 @@ type FnMemcpyH2D = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_
 #[cfg(target_os = "linux")]
 type FnMemcpyD2H = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
 #[cfg(target_os = "linux")]
-type FnFwht128 = unsafe extern "C" fn(*mut f32, c_int, c_int) -> c_int;
+type FnArgmaxF32 = unsafe extern "C" fn(*const f32, c_int, *mut u32) -> c_int;
 #[cfg(target_os = "linux")]
-type FnMatmulTernaryDev =
-    unsafe extern "C" fn(*const f32, *const u8, *const u16, *mut f32, c_int, c_int, c_int) -> c_int;
+type FnFwht128F16 = unsafe extern "C" fn(*mut u16, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
-type FnRmsNorm = unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, f32) -> c_int;
+type FnMatmulTernaryF16Dev =
+    unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut u16, c_int, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
-type FnRmsNormHeadsRope =
-    unsafe extern "C" fn(*mut f32, *const f32, c_int, c_int, c_int, f32, f32) -> c_int;
+type FnMatmulTernaryF16ToF32Dev =
+    unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut f32, c_int, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
-type FnKvAppendGqa = unsafe extern "C" fn(
-    *const f32,
-    *const f32,
-    *const f32,
-    *mut f32,
-    *mut f32,
-    *mut f32,
+type FnRmsNormF16 = unsafe extern "C" fn(*const u16, *const f32, *mut u16, c_int, c_int, f32) -> c_int;
+#[cfg(target_os = "linux")]
+type FnRmsNormHeadsRopeF16 =
+    unsafe extern "C" fn(*mut u16, *const f32, c_int, c_int, c_int, f32, f32) -> c_int;
+#[cfg(target_os = "linux")]
+type FnKvAppendGqaF16 = unsafe extern "C" fn(
+    *const u16,
+    *const u16,
+    *const u16,
+    *mut u16,
+    *mut u16,
+    *mut u16,
     c_int,
     c_int,
     c_int,
     c_int,
 ) -> c_int;
 #[cfg(target_os = "linux")]
-type FnSwigluInplace = unsafe extern "C" fn(*mut f32, *const f32, c_int) -> c_int;
+type FnSwigluInplaceF16 = unsafe extern "C" fn(*mut u16, *const u16, c_int) -> c_int;
 #[cfg(target_os = "linux")]
-type FnAddInplace = unsafe extern "C" fn(*mut f32, *const f32, c_int) -> c_int;
+type FnLmHeadF16ActF16 = unsafe extern "C" fn(*const u16, *const u16, *mut f32, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
-type FnLmHeadF16 = unsafe extern "C" fn(*const f32, *const u16, *mut f32, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
-type FnLmHeadF32 = unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
-type FnArgmaxF32 = unsafe extern "C" fn(*const f32, c_int, *mut u32) -> c_int;
+type FnLmHeadF32ActF16 = unsafe extern "C" fn(*const u16, *const f32, *mut f32, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
 type FnMatmulTernary = unsafe extern "C" fn(
     *const f32,
@@ -103,19 +105,19 @@ struct CudaSymbols {
     free: FnFree,
     memcpy_h2d: FnMemcpyH2D,
     memcpy_d2h: FnMemcpyD2H,
-    fwht128: FnFwht128,
-    matmul_ternary_dev: FnMatmulTernaryDev,
-    matmul_ternary_add_dev: FnMatmulTernaryDev,
-    rms_norm: FnRmsNorm,
-    rms_norm_fwht128: FnRmsNorm,
-    rms_norm_heads_rope: FnRmsNormHeadsRope,
-    kv_append_gqa: FnKvAppendGqa,
-    swiglu_inplace: FnSwigluInplace,
-    swiglu_fwht128_inplace: FnSwigluInplace,
-    add_inplace: FnAddInplace,
-    lm_head_f16: FnLmHeadF16,
-    lm_head_f32: FnLmHeadF32,
     argmax_f32: FnArgmaxF32,
+    fwht128_f16: FnFwht128F16,
+    matmul_ternary_f16_dev: FnMatmulTernaryF16Dev,
+    matmul_ternary_f16_add_dev: FnMatmulTernaryF16Dev,
+    matmul_ternary_f16_to_f32_dev: FnMatmulTernaryF16ToF32Dev,
+    rms_norm_f16: FnRmsNormF16,
+    rms_norm_fwht128_f16: FnRmsNormF16,
+    rms_norm_heads_rope_f16: FnRmsNormHeadsRopeF16,
+    kv_append_gqa_f16: FnKvAppendGqaF16,
+    swiglu_inplace_f16: FnSwigluInplaceF16,
+    swiglu_fwht128_inplace_f16: FnSwigluInplaceF16,
+    lm_head_f16_act_f16: FnLmHeadF16ActF16,
+    lm_head_f32_act_f16: FnLmHeadF32ActF16,
     matmul_ternary: FnMatmulTernary,
 }
 
@@ -127,19 +129,19 @@ unsafe impl Sync for CudaSymbols {}
 #[cfg(target_os = "linux")]
 type WeightCacheKey = (usize, usize, usize, usize);
 
-/// Tampon f32 alloué en VRAM avec libération automatique (RAII).
-pub struct GpuBuffer<'a> {
+/// Tampon typé alloué en VRAM avec libération automatique (RAII).
+pub struct GpuBuffer<'a, T = f32> {
     #[cfg(target_os = "linux")]
     gpu: &'a GpuBackend,
     #[cfg(target_os = "linux")]
-    ptr: *mut f32,
+    ptr: *mut T,
     #[cfg(not(target_os = "linux"))]
-    _phantom: std::marker::PhantomData<&'a ()>,
+    _phantom: std::marker::PhantomData<&'a T>,
     len: usize,
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for GpuBuffer<'_> {
+impl<T> Drop for GpuBuffer<'_, T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe { (self.gpu.symbols.free)(self.ptr as *mut c_void) };
@@ -147,7 +149,7 @@ impl Drop for GpuBuffer<'_> {
     }
 }
 
-impl<'a> GpuBuffer<'a> {
+impl<'a, T> GpuBuffer<'a, T> {
     pub fn len(&self) -> usize {
         self.len
     }
@@ -158,33 +160,18 @@ impl<'a> GpuBuffer<'a> {
 }
 
 #[cfg(target_os = "linux")]
-impl<'a> GpuBuffer<'a> {
-    pub fn as_ptr(&self) -> *const f32 {
+impl<'a, T> GpuBuffer<'a, T> {
+    pub fn as_ptr(&self) -> *const T {
         self.ptr
     }
 
-    pub fn as_mut_ptr(&mut self) -> *mut f32 {
+    pub fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr
     }
+}
 
-    pub fn upload(&mut self, data: &[f32]) -> Result<(), BackendError> {
-        if data.len() > self.len {
-            return Err(BackendError::BufferLengthMismatch(format!(
-                "upload {} > GpuBuffer len {}",
-                data.len(),
-                self.len
-            )));
-        }
-        let status = unsafe {
-            (self.gpu.symbols.memcpy_h2d)(
-                self.ptr as *mut c_void,
-                data.as_ptr() as *const c_void,
-                std::mem::size_of_val(data),
-            )
-        };
-        check_cuda_status("cudaMemcpy H2D", status)
-    }
-
+#[cfg(target_os = "linux")]
+impl<'a> GpuBuffer<'a, f32> {
     pub fn download(&self, out: &mut [f32]) -> Result<(), BackendError> {
         if out.len() > self.len {
             return Err(BackendError::BufferLengthMismatch(format!(
@@ -204,13 +191,39 @@ impl<'a> GpuBuffer<'a> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl<'a> GpuBuffer<'a, u16> {
+    pub fn upload_f32_as_f16(&mut self, data: &[f32]) -> Result<(), BackendError> {
+        if data.len() > self.len {
+            return Err(BackendError::BufferLengthMismatch(format!(
+                "upload {} > GpuBuffer len {}",
+                data.len(),
+                self.len
+            )));
+        }
+        let halfs: Vec<u16> = data.iter().map(|&v| f32_to_f16(v)).collect();
+        let status = unsafe {
+            (self.gpu.symbols.memcpy_h2d)(
+                self.ptr as *mut c_void,
+                halfs.as_ptr() as *const c_void,
+                std::mem::size_of_val(halfs.as_slice()),
+            )
+        };
+        check_cuda_status("cudaMemcpy H2D (f16)", status)
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
-impl<'a> GpuBuffer<'a> {
-    pub fn upload(&mut self, _data: &[f32]) -> Result<(), BackendError> {
+impl<'a> GpuBuffer<'a, f32> {
+    pub fn download(&self, _out: &mut [f32]) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
+}
 
-    pub fn download(&self, _out: &mut [f32]) -> Result<(), BackendError> {
+#[cfg(not(target_os = "linux"))]
+impl<'a> GpuBuffer<'a, u16> {
+    pub fn upload_f32_as_f16(&mut self, data: &[f32]) -> Result<(), BackendError> {
+        let _ = f32_to_f16(data.first().copied().unwrap_or(0.0));
         Err(linux_only_err())
     }
 }
@@ -302,19 +315,19 @@ impl GpuBackend {
                 free: load_symbol(handle, "aibox_gpu_free")?,
                 memcpy_h2d: load_symbol(handle, "aibox_gpu_memcpy_h2d")?,
                 memcpy_d2h: load_symbol(handle, "aibox_gpu_memcpy_d2h")?,
-                fwht128: load_symbol(handle, "aibox_gpu_fwht128")?,
-                matmul_ternary_dev: load_symbol(handle, "aibox_gpu_matmul_ternary_dev")?,
-                matmul_ternary_add_dev: load_symbol(handle, "aibox_gpu_matmul_ternary_add_dev")?,
-                rms_norm: load_symbol(handle, "aibox_gpu_rms_norm")?,
-                rms_norm_fwht128: load_symbol(handle, "aibox_gpu_rms_norm_fwht128")?,
-                rms_norm_heads_rope: load_symbol(handle, "aibox_gpu_rms_norm_heads_rope")?,
-                kv_append_gqa: load_symbol(handle, "aibox_gpu_kv_append_gqa")?,
-                swiglu_inplace: load_symbol(handle, "aibox_gpu_swiglu_inplace")?,
-                swiglu_fwht128_inplace: load_symbol(handle, "aibox_gpu_swiglu_fwht128_inplace")?,
-                add_inplace: load_symbol(handle, "aibox_gpu_add_inplace")?,
-                lm_head_f16: load_symbol(handle, "aibox_gpu_lm_head_f16")?,
-                lm_head_f32: load_symbol(handle, "aibox_gpu_lm_head_f32")?,
                 argmax_f32: load_symbol(handle, "aibox_gpu_argmax_f32")?,
+                fwht128_f16: load_symbol(handle, "aibox_gpu_fwht128_f16")?,
+                matmul_ternary_f16_dev: load_symbol(handle, "aibox_gpu_matmul_ternary_f16_dev")?,
+                matmul_ternary_f16_add_dev: load_symbol(handle, "aibox_gpu_matmul_ternary_f16_add_dev")?,
+                matmul_ternary_f16_to_f32_dev: load_symbol(handle, "aibox_gpu_matmul_ternary_f16_to_f32_dev")?,
+                rms_norm_f16: load_symbol(handle, "aibox_gpu_rms_norm_f16")?,
+                rms_norm_fwht128_f16: load_symbol(handle, "aibox_gpu_rms_norm_fwht128_f16")?,
+                rms_norm_heads_rope_f16: load_symbol(handle, "aibox_gpu_rms_norm_heads_rope_f16")?,
+                kv_append_gqa_f16: load_symbol(handle, "aibox_gpu_kv_append_gqa_f16")?,
+                swiglu_inplace_f16: load_symbol(handle, "aibox_gpu_swiglu_inplace_f16")?,
+                swiglu_fwht128_inplace_f16: load_symbol(handle, "aibox_gpu_swiglu_fwht128_inplace_f16")?,
+                lm_head_f16_act_f16: load_symbol(handle, "aibox_gpu_lm_head_f16_act_f16")?,
+                lm_head_f32_act_f16: load_symbol(handle, "aibox_gpu_lm_head_f32_act_f16")?,
                 matmul_ternary: load_symbol(handle, "aibox_gpu_matmul_ternary")?,
             })
         })();
@@ -332,41 +345,119 @@ impl GpuBackend {
         }
     }
 
-    pub fn alloc_f32(&self, len: usize) -> Result<GpuBuffer<'_>, BackendError> {
-        let bytes = len.max(1) * std::mem::size_of::<f32>();
-        let ptr = unsafe { (self.symbols.alloc)(bytes) };
+    fn alloc_typed<T>(&self, len: usize) -> Result<GpuBuffer<'_, T>, BackendError> {
+        let bytes = len.max(1) * std::mem::size_of::<T>();
+        let ptr = unsafe { (self.symbols.alloc)(bytes) } as *mut T;
         if ptr.is_null() {
-            return Err(BackendError::UnsupportedFeature(
-                "cudaMalloc failed for GpuBuffer".to_string(),
-            ));
+            return Err(BackendError::UnsupportedFeature(format!(
+                "cudaMalloc failed for {len} elements"
+            )));
         }
-        Ok(GpuBuffer {
-            gpu: self,
-            ptr: ptr as *mut f32,
-            len,
-        })
+        Ok(GpuBuffer { gpu: self, ptr, len })
     }
 
-    pub fn fwht128_inplace(&self, buf: &mut GpuBuffer<'_>, m: usize, k: usize) -> Result<(), BackendError> {
-        let status = unsafe { (self.symbols.fwht128)(buf.as_mut_ptr(), m as c_int, k as c_int) };
-        check_cuda_status("aibox_gpu_fwht128", status)
+    pub fn alloc_f32(&self, len: usize) -> Result<GpuBuffer<'_, f32>, BackendError> {
+        self.alloc_typed(len)
     }
 
-    fn run_matmul_ternary_dev(
+    pub fn alloc_f16(&self, len: usize) -> Result<GpuBuffer<'_, u16>, BackendError> {
+        self.alloc_typed(len)
+    }
+
+    pub fn argmax_f32(&self, logits_dev: &GpuBuffer<'_, f32>, len: usize) -> Result<usize, BackendError> {
+        let mut best_idx: u32 = 0;
+        let status = unsafe { (self.symbols.argmax_f32)(logits_dev.as_ptr(), len as c_int, &mut best_idx) };
+        check_cuda_status("aibox_gpu_argmax_f32", status)?;
+        Ok(best_idx as usize)
+    }
+
+    pub fn fwht128_inplace_f16(&self, buf: &mut GpuBuffer<'_, u16>, m: usize, k: usize) -> Result<(), BackendError> {
+        let status = unsafe { (self.symbols.fwht128_f16)(buf.as_mut_ptr(), m as c_int, k as c_int) };
+        check_cuda_status("aibox_gpu_fwht128_f16", status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_matmul_ternary_f16_dev(
         &self,
         op_name: &str,
-        func: FnMatmulTernaryDev,
-        x: &GpuBuffer<'_>,
+        func: FnMatmulTernaryF16Dev,
+        x: &GpuBuffer<'_, u16>,
         packed_weights: &[u8],
         scales_fp16: &[u16],
-        out: &mut GpuBuffer<'_>,
+        out: &mut GpuBuffer<'_, u16>,
         m: usize,
         n: usize,
         k: usize,
     ) -> Result<(), BackendError> {
         let (dev_w, dev_scales) = self.get_or_upload_weights(packed_weights, scales_fp16)?;
         let status = unsafe {
-            func(
+            func(x.as_ptr(), dev_w, dev_scales, out.as_mut_ptr(), m as c_int, n as c_int, k as c_int)
+        };
+        check_cuda_status(op_name, status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_ternary_f16_dev(
+        &self,
+        x: &GpuBuffer<'_, u16>,
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        out: &mut GpuBuffer<'_, u16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        self.run_matmul_ternary_f16_dev(
+            "aibox_gpu_matmul_ternary_f16_dev",
+            self.symbols.matmul_ternary_f16_dev,
+            x,
+            packed_weights,
+            scales_fp16,
+            out,
+            m,
+            n,
+            k,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_ternary_f16_add_dev(
+        &self,
+        x: &GpuBuffer<'_, u16>,
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        out: &mut GpuBuffer<'_, u16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        self.run_matmul_ternary_f16_dev(
+            "aibox_gpu_matmul_ternary_f16_add_dev",
+            self.symbols.matmul_ternary_f16_add_dev,
+            x,
+            packed_weights,
+            scales_fp16,
+            out,
+            m,
+            n,
+            k,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_ternary_f16_to_f32_dev(
+        &self,
+        x: &GpuBuffer<'_, u16>,
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        out: &mut GpuBuffer<'_, f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        let (dev_w, dev_scales) = self.get_or_upload_weights(packed_weights, scales_fp16)?;
+        let status = unsafe {
+            (self.symbols.matmul_ternary_f16_to_f32_dev)(
                 x.as_ptr(),
                 dev_w,
                 dev_scales,
@@ -376,105 +467,45 @@ impl GpuBackend {
                 k as c_int,
             )
         };
-        check_cuda_status(op_name, status)
+        check_cuda_status("aibox_gpu_matmul_ternary_f16_to_f32_dev", status)
     }
 
-    pub fn matmul_ternary_dev(
+    pub fn rms_norm_f16(
         &self,
-        x: &GpuBuffer<'_>,
-        packed_weights: &[u8],
-        scales_fp16: &[u16],
-        out: &mut GpuBuffer<'_>,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<(), BackendError> {
-        self.run_matmul_ternary_dev(
-            "aibox_gpu_matmul_ternary_dev",
-            self.symbols.matmul_ternary_dev,
-            x,
-            packed_weights,
-            scales_fp16,
-            out,
-            m,
-            n,
-            k,
-        )
-    }
-
-    pub fn matmul_ternary_add_dev(
-        &self,
-        x: &GpuBuffer<'_>,
-        packed_weights: &[u8],
-        scales_fp16: &[u16],
-        out: &mut GpuBuffer<'_>,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<(), BackendError> {
-        self.run_matmul_ternary_dev(
-            "aibox_gpu_matmul_ternary_add_dev",
-            self.symbols.matmul_ternary_add_dev,
-            x,
-            packed_weights,
-            scales_fp16,
-            out,
-            m,
-            n,
-            k,
-        )
-    }
-
-    pub fn rms_norm(
-        &self,
-        x: &GpuBuffer<'_>,
+        x: &GpuBuffer<'_, u16>,
         weight: &[f32],
-        out: &mut GpuBuffer<'_>,
+        out: &mut GpuBuffer<'_, u16>,
         m: usize,
         dim: usize,
         eps: f32,
     ) -> Result<(), BackendError> {
         let dev_w = self.get_or_upload_raw_f32(weight)?;
         let status = unsafe {
-            (self.symbols.rms_norm)(
-                x.as_ptr(),
-                dev_w,
-                out.as_mut_ptr(),
-                m as c_int,
-                dim as c_int,
-                eps,
-            )
+            (self.symbols.rms_norm_f16)(x.as_ptr(), dev_w, out.as_mut_ptr(), m as c_int, dim as c_int, eps)
         };
-        check_cuda_status("aibox_gpu_rms_norm", status)
+        check_cuda_status("aibox_gpu_rms_norm_f16", status)
     }
 
-    pub fn rms_norm_fwht128(
+    pub fn rms_norm_fwht128_f16(
         &self,
-        x: &GpuBuffer<'_>,
+        x: &GpuBuffer<'_, u16>,
         weight: &[f32],
-        out: &mut GpuBuffer<'_>,
+        out: &mut GpuBuffer<'_, u16>,
         m: usize,
         dim: usize,
         eps: f32,
     ) -> Result<(), BackendError> {
         let dev_w = self.get_or_upload_raw_f32(weight)?;
         let status = unsafe {
-            (self.symbols.rms_norm_fwht128)(
-                x.as_ptr(),
-                dev_w,
-                out.as_mut_ptr(),
-                m as c_int,
-                dim as c_int,
-                eps,
-            )
+            (self.symbols.rms_norm_fwht128_f16)(x.as_ptr(), dev_w, out.as_mut_ptr(), m as c_int, dim as c_int, eps)
         };
-        check_cuda_status("aibox_gpu_rms_norm_fwht128", status)
+        check_cuda_status("aibox_gpu_rms_norm_fwht128_f16", status)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn rms_norm_heads_rope(
+    pub fn rms_norm_heads_rope_f16(
         &self,
-        vec: &mut GpuBuffer<'_>,
+        vec: &mut GpuBuffer<'_, u16>,
         norm_w: Option<&[f32]>,
         num_heads: usize,
         head_dim: usize,
@@ -487,7 +518,7 @@ impl GpuBackend {
             None => std::ptr::null(),
         };
         let status = unsafe {
-            (self.symbols.rms_norm_heads_rope)(
+            (self.symbols.rms_norm_heads_rope_f16)(
                 vec.as_mut_ptr(),
                 dev_norm,
                 num_heads as c_int,
@@ -497,26 +528,26 @@ impl GpuBackend {
                 eps,
             )
         };
-        check_cuda_status("aibox_gpu_rms_norm_heads_rope", status)
+        check_cuda_status("aibox_gpu_rms_norm_heads_rope_f16", status)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn kv_append_gqa_layer(
+    pub fn kv_append_gqa_layer_f16(
         &self,
-        q: &GpuBuffer<'_>,
-        k: &GpuBuffer<'_>,
-        v: &GpuBuffer<'_>,
-        k_cache: &mut GpuBuffer<'_>,
-        v_cache: &mut GpuBuffer<'_>,
+        q: &GpuBuffer<'_, u16>,
+        k: &GpuBuffer<'_, u16>,
+        v: &GpuBuffer<'_, u16>,
+        k_cache: &mut GpuBuffer<'_, u16>,
+        v_cache: &mut GpuBuffer<'_, u16>,
         layer_offset: usize,
-        out: &mut GpuBuffer<'_>,
+        out: &mut GpuBuffer<'_, u16>,
         pos: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
     ) -> Result<(), BackendError> {
         let status = unsafe {
-            (self.symbols.kv_append_gqa)(
+            (self.symbols.kv_append_gqa_f16)(
                 q.as_ptr(),
                 k.as_ptr(),
                 v.as_ptr(),
@@ -529,50 +560,42 @@ impl GpuBackend {
                 head_dim as c_int,
             )
         };
-        check_cuda_status("aibox_gpu_kv_append_gqa", status)
+        check_cuda_status("aibox_gpu_kv_append_gqa_f16", status)
     }
 
-    pub fn swiglu_inplace(
+    pub fn swiglu_inplace_f16(
         &self,
-        gate: &mut GpuBuffer<'_>,
-        up: &GpuBuffer<'_>,
+        gate: &mut GpuBuffer<'_, u16>,
+        up: &GpuBuffer<'_, u16>,
         len: usize,
     ) -> Result<(), BackendError> {
-        let status = unsafe { (self.symbols.swiglu_inplace)(gate.as_mut_ptr(), up.as_ptr(), len as c_int) };
-        check_cuda_status("aibox_gpu_swiglu_inplace", status)
+        let status = unsafe { (self.symbols.swiglu_inplace_f16)(gate.as_mut_ptr(), up.as_ptr(), len as c_int) };
+        check_cuda_status("aibox_gpu_swiglu_inplace_f16", status)
     }
 
-    pub fn swiglu_fwht128_inplace(
+    pub fn swiglu_fwht128_inplace_f16(
         &self,
-        gate: &mut GpuBuffer<'_>,
-        up: &GpuBuffer<'_>,
+        gate: &mut GpuBuffer<'_, u16>,
+        up: &GpuBuffer<'_, u16>,
         len: usize,
     ) -> Result<(), BackendError> {
-        let status = unsafe { (self.symbols.swiglu_fwht128_inplace)(gate.as_mut_ptr(), up.as_ptr(), len as c_int) };
-        check_cuda_status("aibox_gpu_swiglu_fwht128_inplace", status)
+        let status = unsafe {
+            (self.symbols.swiglu_fwht128_inplace_f16)(gate.as_mut_ptr(), up.as_ptr(), len as c_int)
+        };
+        check_cuda_status("aibox_gpu_swiglu_fwht128_inplace_f16", status)
     }
 
-    pub fn add_inplace(
+    pub fn lm_head_f16_act_f16(
         &self,
-        target: &mut GpuBuffer<'_>,
-        delta: &GpuBuffer<'_>,
-        len: usize,
-    ) -> Result<(), BackendError> {
-        let status = unsafe { (self.symbols.add_inplace)(target.as_mut_ptr(), delta.as_ptr(), len as c_int) };
-        check_cuda_status("aibox_gpu_add_inplace", status)
-    }
-
-    pub fn lm_head_f16(
-        &self,
-        hidden: &GpuBuffer<'_>,
+        hidden: &GpuBuffer<'_, u16>,
         emb_f16: &[u16],
-        logits_dev: &mut GpuBuffer<'_>,
+        logits_dev: &mut GpuBuffer<'_, f32>,
         vocab_size: usize,
         hidden_size: usize,
     ) -> Result<(), BackendError> {
         let dev_emb = self.get_or_upload_raw_u16(emb_f16)?;
         let status = unsafe {
-            (self.symbols.lm_head_f16)(
+            (self.symbols.lm_head_f16_act_f16)(
                 hidden.as_ptr(),
                 dev_emb,
                 logits_dev.as_mut_ptr(),
@@ -580,20 +603,20 @@ impl GpuBackend {
                 hidden_size as c_int,
             )
         };
-        check_cuda_status("aibox_gpu_lm_head_f16", status)
+        check_cuda_status("aibox_gpu_lm_head_f16_act_f16", status)
     }
 
-    pub fn lm_head_f32(
+    pub fn lm_head_f32_act_f16(
         &self,
-        hidden: &GpuBuffer<'_>,
+        hidden: &GpuBuffer<'_, u16>,
         emb_f32: &[f32],
-        logits_dev: &mut GpuBuffer<'_>,
+        logits_dev: &mut GpuBuffer<'_, f32>,
         vocab_size: usize,
         hidden_size: usize,
     ) -> Result<(), BackendError> {
         let dev_emb = self.get_or_upload_raw_f32(emb_f32)?;
         let status = unsafe {
-            (self.symbols.lm_head_f32)(
+            (self.symbols.lm_head_f32_act_f16)(
                 hidden.as_ptr(),
                 dev_emb,
                 logits_dev.as_mut_ptr(),
@@ -601,14 +624,7 @@ impl GpuBackend {
                 hidden_size as c_int,
             )
         };
-        check_cuda_status("aibox_gpu_lm_head_f32", status)
-    }
-
-    pub fn argmax_f32(&self, logits_dev: &GpuBuffer<'_>, len: usize) -> Result<usize, BackendError> {
-        let mut best_idx: u32 = 0;
-        let status = unsafe { (self.symbols.argmax_f32)(logits_dev.as_ptr(), len as c_int, &mut best_idx) };
-        check_cuda_status("aibox_gpu_argmax_f32", status)?;
-        Ok(best_idx as usize)
+        check_cuda_status("aibox_gpu_lm_head_f32_act_f16", status)
     }
 
     fn get_or_upload_raw_bytes(&self, host_ptr: *const c_void, byte_len: usize) -> Result<*mut c_void, BackendError> {
@@ -692,104 +708,54 @@ impl GpuBackend {
     pub fn try_new() -> Result<Self, BackendError> {
         Err(linux_only_err())
     }
-    pub fn alloc_f32(&self, _len: usize) -> Result<GpuBuffer<'_>, BackendError> {
+    pub fn alloc_f32(&self, _len: usize) -> Result<GpuBuffer<'_, f32>, BackendError> {
         Err(linux_only_err())
     }
-    pub fn fwht128_inplace(&self, _buf: &mut GpuBuffer<'_>, _m: usize, _k: usize) -> Result<(), BackendError> {
+    pub fn argmax_f32(&self, _logits_dev: &GpuBuffer<'_, f32>, _len: usize) -> Result<usize, BackendError> {
         Err(linux_only_err())
     }
-    pub fn matmul_ternary_dev(
-        &self,
-        _x: &GpuBuffer<'_>,
-        _packed_weights: &[u8],
-        _scales_fp16: &[u16],
-        _out: &mut GpuBuffer<'_>,
-        _m: usize,
-        _n: usize,
-        _k: usize,
-    ) -> Result<(), BackendError> {
+    pub fn alloc_f16(&self, _len: usize) -> Result<GpuBuffer<'_, u16>, BackendError> {
         Err(linux_only_err())
     }
-    pub fn matmul_ternary_add_dev(
-        &self,
-        _x: &GpuBuffer<'_>,
-        _packed_weights: &[u8],
-        _scales_fp16: &[u16],
-        _out: &mut GpuBuffer<'_>,
-        _m: usize,
-        _n: usize,
-        _k: usize,
-    ) -> Result<(), BackendError> {
-        Err(linux_only_err())
-    }
-    pub fn rms_norm(
-        &self,
-        _x: &GpuBuffer<'_>,
-        _weight: &[f32],
-        _out: &mut GpuBuffer<'_>,
-        _m: usize,
-        _dim: usize,
-        _eps: f32,
-    ) -> Result<(), BackendError> {
-        Err(linux_only_err())
-    }
-    pub fn rms_norm_fwht128(
-        &self,
-        _x: &GpuBuffer<'_>,
-        _weight: &[f32],
-        _out: &mut GpuBuffer<'_>,
-        _m: usize,
-        _dim: usize,
-        _eps: f32,
-    ) -> Result<(), BackendError> {
+    pub fn fwht128_inplace_f16(&self, _buf: &mut GpuBuffer<'_, u16>, _m: usize, _k: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn rms_norm_heads_rope(
-        &self,
-        _vec: &mut GpuBuffer<'_>,
-        _norm_w: Option<&[f32]>,
-        _num_heads: usize,
-        _head_dim: usize,
-        _pos: usize,
-        _theta: f32,
-        _eps: f32,
-    ) -> Result<(), BackendError> {
+    pub fn matmul_ternary_f16_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn kv_append_gqa_layer(
-        &self,
-        _q: &GpuBuffer<'_>,
-        _k: &GpuBuffer<'_>,
-        _v: &GpuBuffer<'_>,
-        _k_cache: &mut GpuBuffer<'_>,
-        _v_cache: &mut GpuBuffer<'_>,
-        _layer_offset: usize,
-        _out: &mut GpuBuffer<'_>,
-        _pos: usize,
-        _num_q_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-    ) -> Result<(), BackendError> {
+    pub fn matmul_ternary_f16_add_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
-    pub fn swiglu_inplace(&self, _gate: &mut GpuBuffer<'_>, _up: &GpuBuffer<'_>, _len: usize) -> Result<(), BackendError> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_ternary_f16_to_f32_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _out: &mut GpuBuffer<'_, f32>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
-    pub fn swiglu_fwht128_inplace(&self, _gate: &mut GpuBuffer<'_>, _up: &GpuBuffer<'_>, _len: usize) -> Result<(), BackendError> {
+    pub fn rms_norm_f16(&self, _x: &GpuBuffer<'_, u16>, _w: &[f32], _out: &mut GpuBuffer<'_, u16>, _m: usize, _dim: usize, _eps: f32) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
-    pub fn add_inplace(&self, _target: &mut GpuBuffer<'_>, _delta: &GpuBuffer<'_>, _len: usize) -> Result<(), BackendError> {
+    pub fn rms_norm_fwht128_f16(&self, _x: &GpuBuffer<'_, u16>, _w: &[f32], _out: &mut GpuBuffer<'_, u16>, _m: usize, _dim: usize, _eps: f32) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
-    pub fn lm_head_f16(&self, _hidden: &GpuBuffer<'_>, _emb_f16: &[u16], _logits_dev: &mut GpuBuffer<'_>, _v: usize, _h: usize) -> Result<(), BackendError> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_heads_rope_f16(&self, _vec: &mut GpuBuffer<'_, u16>, _nw: Option<&[f32]>, _nh: usize, _hd: usize, _pos: usize, _theta: f32, _eps: f32) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
-    pub fn lm_head_f32(&self, _hidden: &GpuBuffer<'_>, _emb_f32: &[f32], _logits_dev: &mut GpuBuffer<'_>, _v: usize, _h: usize) -> Result<(), BackendError> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_append_gqa_layer_f16(&self, _q: &GpuBuffer<'_, u16>, _k: &GpuBuffer<'_, u16>, _v: &GpuBuffer<'_, u16>, _kc: &mut GpuBuffer<'_, u16>, _vc: &mut GpuBuffer<'_, u16>, _off: usize, _out: &mut GpuBuffer<'_, u16>, _pos: usize, _nq: usize, _nkv: usize, _hd: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
-    pub fn argmax_f32(&self, _logits_dev: &GpuBuffer<'_>, _len: usize) -> Result<usize, BackendError> {
+    pub fn swiglu_inplace_f16(&self, _gate: &mut GpuBuffer<'_, u16>, _up: &GpuBuffer<'_, u16>, _len: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn swiglu_fwht128_inplace_f16(&self, _gate: &mut GpuBuffer<'_, u16>, _up: &GpuBuffer<'_, u16>, _len: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn lm_head_f16_act_f16(&self, _hidden: &GpuBuffer<'_, u16>, _emb: &[u16], _logits: &mut GpuBuffer<'_, f32>, _v: usize, _h: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn lm_head_f32_act_f16(&self, _hidden: &GpuBuffer<'_, u16>, _emb: &[f32], _logits: &mut GpuBuffer<'_, f32>, _v: usize, _h: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
 }
