@@ -43,6 +43,13 @@ static __device__ __forceinline__ float decode_2bit_weight(uint8_t code) {
     return (code == 1) ? 1.0f : ((code == 3) ? -1.0f : 0.0f);
 }
 
+static __device__ __forceinline__ float dot_packed_byte_f4(uint8_t packed, float4 xv) {
+    return decode_2bit_weight(packed & 0x03) * xv.x
+         + decode_2bit_weight((packed >> 2) & 0x03) * xv.y
+         + decode_2bit_weight((packed >> 4) & 0x03) * xv.z
+         + decode_2bit_weight((packed >> 6) & 0x03) * xv.w;
+}
+
 static __device__ __forceinline__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         val += __shfl_down_sync(0xFFFFFFFF, val, offset);
@@ -55,6 +62,50 @@ static __device__ __forceinline__ float warp_reduce_max(float val) {
         val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
     }
     return val;
+}
+
+static __device__ __forceinline__ float block_reduce_sum(float val) {
+    __shared__ float s_warp[8];
+    __shared__ float s_total;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    val = warp_reduce_sum(val);
+    if (lane == 0) {
+        s_warp[warp_id] = val;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float acc = 0.0f;
+        int num_warps = blockDim.x / WARP_SIZE;
+        for (int w = 0; w < num_warps; ++w) {
+            acc += s_warp[w];
+        }
+        s_total = acc;
+    }
+    __syncthreads();
+    return s_total;
+}
+
+static __device__ __forceinline__ float block_reduce_max(float val) {
+    __shared__ float s_warp[8];
+    __shared__ float s_max;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    val = warp_reduce_max(val);
+    if (lane == 0) {
+        s_warp[warp_id] = val;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = -1e30f;
+        int num_warps = blockDim.x / WARP_SIZE;
+        for (int w = 0; w < num_warps; ++w) {
+            m = fmaxf(m, s_warp[w]);
+        }
+        s_max = m;
+    }
+    __syncthreads();
+    return s_max;
 }
 
 __global__ void fwht128_rows_kernel(float* __restrict__ x, int total_groups) {
@@ -71,10 +122,11 @@ __global__ void fwht128_rows_kernel(float* __restrict__ x, int total_groups) {
     float* warp_buf = s_fwht[warp_in_block];
 
     int base = lane * 4;
-    warp_buf[base + 0] = x_group[base + 0];
-    warp_buf[base + 1] = x_group[base + 1];
-    warp_buf[base + 2] = x_group[base + 2];
-    warp_buf[base + 3] = x_group[base + 3];
+    float4 xv = *reinterpret_cast<const float4*>(&x_group[base]);
+    warp_buf[base + 0] = xv.x;
+    warp_buf[base + 1] = xv.y;
+    warp_buf[base + 2] = xv.z;
+    warp_buf[base + 3] = xv.w;
     __syncwarp();
 
     for (int step = 1; step < GROUP_SIZE; step <<= 1) {
@@ -92,10 +144,13 @@ __global__ void fwht128_rows_kernel(float* __restrict__ x, int total_groups) {
     }
 
     const float inv_sqrt_128 = 0.08838834764831845f;
-    x_group[base + 0] = warp_buf[base + 0] * inv_sqrt_128;
-    x_group[base + 1] = warp_buf[base + 1] * inv_sqrt_128;
-    x_group[base + 2] = warp_buf[base + 2] * inv_sqrt_128;
-    x_group[base + 3] = warp_buf[base + 3] * inv_sqrt_128;
+    float4 outv = make_float4(
+        warp_buf[base + 0] * inv_sqrt_128,
+        warp_buf[base + 1] * inv_sqrt_128,
+        warp_buf[base + 2] * inv_sqrt_128,
+        warp_buf[base + 3] * inv_sqrt_128
+    );
+    *reinterpret_cast<float4*>(&x_group[base]) = outv;
 }
 
 __global__ void ternary_gemv_kernel(
@@ -118,23 +173,45 @@ __global__ void ternary_gemv_kernel(
     const float* x_row = x + (size_t)row_m * k;
     const uint8_t* w_row = w_packed + (size_t)row_n * groups_per_row * PACKED_BYTES_PER_GROUP;
     const uint16_t* s_row = scales + (size_t)row_n * groups_per_row;
+    const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_row);
 
     float total = 0.0f;
-    for (int g = 0; g < groups_per_row; ++g) {
-        int base = g * GROUP_SIZE + lane * 4;
-        uint8_t packed = w_row[g * PACKED_BYTES_PER_GROUP + lane];
-        float partial = decode_2bit_weight(packed & 0x03) * x_row[base + 0]
-                      + decode_2bit_weight((packed >> 2) & 0x03) * x_row[base + 1]
-                      + decode_2bit_weight((packed >> 4) & 0x03) * x_row[base + 2]
-                      + decode_2bit_weight((packed >> 6) & 0x03) * x_row[base + 3];
+    int sub_g = lane >> 3;
+    int sub_lane = lane & 7;
 
-        partial = warp_reduce_sum(partial);
+    int g = 0;
+    for (; g + 4 <= groups_per_row; g += 4) {
+        int cur_g = g + sub_g;
+        uint32_t packed4 = w_u32[cur_g * 8 + sub_lane];
+        const float4* x4 = reinterpret_cast<const float4*>(&x_row[cur_g * GROUP_SIZE + sub_lane * 16]);
+
+        float partial = dot_packed_byte_f4(packed4 & 0xFF, x4[0])
+                      + dot_packed_byte_f4((packed4 >> 8) & 0xFF, x4[1])
+                      + dot_packed_byte_f4((packed4 >> 16) & 0xFF, x4[2])
+                      + dot_packed_byte_f4((packed4 >> 24) & 0xFF, x4[3]);
+
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, 4);
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, 2);
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, 1);
+
+        if (sub_lane == 0) {
+            __half h_scale = *reinterpret_cast<const __half*>(&s_row[cur_g]);
+            total += partial * __half2float(h_scale);
+        }
+    }
+
+    for (; g < groups_per_row; ++g) {
+        float4 xv = *reinterpret_cast<const float4*>(&x_row[g * GROUP_SIZE + lane * 4]);
+        uint8_t packed = w_row[g * PACKED_BYTES_PER_GROUP + lane];
+        float partial = warp_reduce_sum(dot_packed_byte_f4(packed, xv));
         if (lane == 0) {
             __half h_scale = *reinterpret_cast<const __half*>(&s_row[g]);
             total += partial * __half2float(h_scale);
         }
     }
 
+    total += __shfl_down_sync(0xFFFFFFFF, total, 16);
+    total += __shfl_down_sync(0xFFFFFFFF, total, 8);
     if (lane == 0) {
         out[(size_t)row_m * n + row_n] = total;
     }
@@ -152,34 +229,40 @@ __global__ void rms_norm_kernel(
     float* out_row = out + (size_t)row * dim;
 
     float local_sum = 0.0f;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        float v = x_row[i];
-        local_sum += v * v;
-    }
-
-    local_sum = warp_reduce_sum(local_sum);
-    __shared__ float s_warp_sums[8];
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int lane = threadIdx.x & (WARP_SIZE - 1);
-    if (lane == 0) {
-        s_warp_sums[warp_id] = local_sum;
-    }
-    __syncthreads();
-
-    __shared__ float s_inv_rms;
-    if (threadIdx.x == 0) {
-        float total_sq = 0.0f;
-        int num_warps = blockDim.x / WARP_SIZE;
-        for (int w = 0; w < num_warps; ++w) {
-            total_sq += s_warp_sums[w];
+    if ((dim & 3) == 0) {
+        int dim4 = dim >> 2;
+        const float4* x4 = reinterpret_cast<const float4*>(x_row);
+        for (int i = threadIdx.x; i < dim4; i += blockDim.x) {
+            float4 v = x4[i];
+            local_sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
         }
-        s_inv_rms = rsqrtf(total_sq / (float)dim + eps);
+    } else {
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            float v = x_row[i];
+            local_sum += v * v;
+        }
     }
-    __syncthreads();
 
-    float inv_rms = s_inv_rms;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        out_row[i] = x_row[i] * inv_rms * weight[i];
+    float inv_rms = rsqrtf(block_reduce_sum(local_sum) / (float)dim + eps);
+    if ((dim & 3) == 0) {
+        int dim4 = dim >> 2;
+        const float4* x4 = reinterpret_cast<const float4*>(x_row);
+        const float4* w4 = reinterpret_cast<const float4*>(weight);
+        float4* o4 = reinterpret_cast<float4*>(out_row);
+        for (int i = threadIdx.x; i < dim4; i += blockDim.x) {
+            float4 xv = x4[i];
+            float4 wv = w4[i];
+            o4[i] = make_float4(
+                xv.x * inv_rms * wv.x,
+                xv.y * inv_rms * wv.y,
+                xv.z * inv_rms * wv.z,
+                xv.w * inv_rms * wv.w
+            );
+        }
+    } else {
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            out_row[i] = x_row[i] * inv_rms * weight[i];
+        }
     }
 }
 
@@ -200,27 +283,7 @@ __global__ void rms_norm_heads_rope_kernel(
             float v = h_vec[i];
             local_sq += v * v;
         }
-        local_sq = warp_reduce_sum(local_sq);
-        __shared__ float s_warp[8];
-        int warp_id = threadIdx.x / WARP_SIZE;
-        int lane = threadIdx.x & (WARP_SIZE - 1);
-        if (lane == 0) {
-            s_warp[warp_id] = local_sq;
-        }
-        __syncthreads();
-
-        __shared__ float s_inv_rms;
-        if (threadIdx.x == 0) {
-            float total_sq = 0.0f;
-            int num_warps = blockDim.x / WARP_SIZE;
-            for (int w = 0; w < num_warps; ++w) {
-                total_sq += s_warp[w];
-            }
-            s_inv_rms = rsqrtf(total_sq / (float)head_dim + eps);
-        }
-        __syncthreads();
-
-        float inv_rms = s_inv_rms;
+        float inv_rms = rsqrtf(block_reduce_sum(local_sq) / (float)head_dim + eps);
         for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
             h_vec[i] = h_vec[i] * inv_rms * norm_w[i];
         }
@@ -285,27 +348,7 @@ __global__ void gqa_attention_kernel(
         local_max = fmaxf(local_max, score);
     }
 
-    local_max = warp_reduce_max(local_max);
-    __shared__ float s_reduce[8];
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int lane = threadIdx.x & (WARP_SIZE - 1);
-    if (lane == 0) {
-        s_reduce[warp_id] = local_max;
-    }
-    __syncthreads();
-
-    __shared__ float s_max_score;
-    if (threadIdx.x == 0) {
-        float m = -1e30f;
-        int num_warps = blockDim.x / WARP_SIZE;
-        for (int w = 0; w < num_warps; ++w) {
-            m = fmaxf(m, s_reduce[w]);
-        }
-        s_max_score = m;
-    }
-    __syncthreads();
-
-    float max_score = s_max_score;
+    float max_score = block_reduce_max(local_max);
     float local_sum = 0.0f;
     for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
         float w = expf(s_scores[t] - max_score);
@@ -313,24 +356,8 @@ __global__ void gqa_attention_kernel(
         local_sum += w;
     }
 
-    local_sum = warp_reduce_sum(local_sum);
-    if (lane == 0) {
-        s_reduce[warp_id] = local_sum;
-    }
-    __syncthreads();
-
-    __shared__ float s_inv_sum;
-    if (threadIdx.x == 0) {
-        float total = 0.0f;
-        int num_warps = blockDim.x / WARP_SIZE;
-        for (int w = 0; w < num_warps; ++w) {
-            total += s_reduce[w];
-        }
-        s_inv_sum = (total > 0.0f) ? (1.0f / total) : 0.0f;
-    }
-    __syncthreads();
-
-    float inv_sum = s_inv_sum;
+    float total = block_reduce_sum(local_sum);
+    float inv_sum = (total > 0.0f) ? (1.0f / total) : 0.0f;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int t = 0; t < seq_len; ++t) {
@@ -370,9 +397,30 @@ __global__ void lm_head_f16_kernel(
 
     const uint16_t* row = emb_f16 + (size_t)v * hidden_size;
     float partial = 0.0f;
-    for (int i = lane; i < hidden_size; i += WARP_SIZE) {
-        __half h = *reinterpret_cast<const __half*>(&row[i]);
-        partial += __half2float(h) * hidden[i];
+
+    if ((hidden_size & 7) == 0 && ((reinterpret_cast<uintptr_t>(row) & 15) == 0)) {
+        int chunks = hidden_size >> 3;
+        const uint4* row_u4 = reinterpret_cast<const uint4*>(row);
+        const float4* hid_f4 = reinterpret_cast<const float4*>(hidden);
+        for (int i = lane; i < chunks; i += WARP_SIZE) {
+            uint4 packed8 = row_u4[i];
+            const __half2* h2 = reinterpret_cast<const __half2*>(&packed8);
+            float4 x0 = hid_f4[i * 2 + 0];
+            float4 x1 = hid_f4[i * 2 + 1];
+
+            float2 f0 = __half22float2(h2[0]);
+            float2 f1 = __half22float2(h2[1]);
+            float2 f2 = __half22float2(h2[2]);
+            float2 f3 = __half22float2(h2[3]);
+
+            partial += f0.x * x0.x + f0.y * x0.y + f1.x * x0.z + f1.y * x0.w;
+            partial += f2.x * x1.x + f2.y * x1.y + f3.x * x1.z + f3.y * x1.w;
+        }
+    } else {
+        for (int i = lane; i < hidden_size; i += WARP_SIZE) {
+            __half h = *reinterpret_cast<const __half*>(&row[i]);
+            partial += __half2float(h) * hidden[i];
+        }
     }
 
     partial = warp_reduce_sum(partial);
@@ -396,8 +444,20 @@ __global__ void lm_head_f32_kernel(
 
     const float* row = emb_f32 + (size_t)v * hidden_size;
     float partial = 0.0f;
-    for (int i = lane; i < hidden_size; i += WARP_SIZE) {
-        partial += row[i] * hidden[i];
+
+    if ((hidden_size & 3) == 0 && ((reinterpret_cast<uintptr_t>(row) & 15) == 0)) {
+        int chunks = hidden_size >> 2;
+        const float4* row4 = reinterpret_cast<const float4*>(row);
+        const float4* hid4 = reinterpret_cast<const float4*>(hidden);
+        for (int i = lane; i < chunks; i += WARP_SIZE) {
+            float4 r = row4[i];
+            float4 x = hid4[i];
+            partial += r.x * x.x + r.y * x.y + r.z * x.z + r.w * x.w;
+        }
+    } else {
+        for (int i = lane; i < hidden_size; i += WARP_SIZE) {
+            partial += row[i] * hidden[i];
+        }
     }
 
     partial = warp_reduce_sum(partial);
