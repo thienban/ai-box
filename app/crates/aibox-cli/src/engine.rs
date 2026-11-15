@@ -157,7 +157,16 @@ impl EmbeddingTable {
 
 pub enum LmHead {
     Ternary(TernaryTensor),
+    Dense(EmbeddingTable),
     TiedEmbedding,
+}
+
+fn load_dense_table(st: &mut SafeTensorsFile, name: &str) -> Result<EmbeddingTable, String> {
+    if st.tensors().get(name).map(|m| m.dtype.as_str()) == Some("F16") {
+        Ok(EmbeddingTable::F16(st.load_f16_raw(name)?))
+    } else {
+        Ok(EmbeddingTable::F32(st.load_f32_vector(name)?))
+    }
 }
 
 pub struct TernaryLayerWeights {
@@ -408,14 +417,12 @@ impl TransformerModel {
             });
         }
 
-        let token_embeddings = if st.tensors().get("token_embd.weight").map(|m| m.dtype.as_str()) == Some("F16") {
-            EmbeddingTable::F16(st.load_f16_raw("token_embd.weight")?)
-        } else {
-            EmbeddingTable::F32(st.load_f32_vector("token_embd.weight")?)
-        };
+        let token_embeddings = load_dense_table(&mut st, "token_embd.weight")?;
         let final_norm = st.load_f32_vector("output_norm.weight")?;
         let lm_head = if st.has_tensor("output.weight") && st.has_tensor("output.scales") {
             LmHead::Ternary(st.load_ternary_layer("output.weight", "output.scales")?)
+        } else if st.has_tensor("output.weight") {
+            LmHead::Dense(load_dense_table(&mut st, "output.weight")?)
         } else {
             LmHead::TiedEmbedding
         };
@@ -535,6 +542,11 @@ impl TransformerModel {
             LmHead::Ternary(tensor) => {
                 project_ternary(backend, &final_hidden, tensor, self.config.use_hadamard)
             }
+            LmHead::Dense(table) => Ok(table.dot_all_rows(
+                &final_hidden,
+                self.config.vocab_size,
+                hidden_size,
+            )),
             LmHead::TiedEmbedding => Ok(self.token_embeddings.dot_all_rows(
                 &final_hidden,
                 self.config.vocab_size,
@@ -623,6 +635,11 @@ impl TransformerModel {
         let final_hidden = rms_norm(last_hidden, &self.final_norm, eps);
         match &self.lm_head {
             LmHead::Ternary(tensor) => project_ternary(backend, &final_hidden, tensor, use_hadamard),
+            LmHead::Dense(table) => Ok(table.dot_all_rows(
+                &final_hidden,
+                self.config.vocab_size,
+                hidden_size,
+            )),
             LmHead::TiedEmbedding => Ok(self.token_embeddings.dot_all_rows(
                 &final_hidden,
                 self.config.vocab_size,
@@ -866,6 +883,10 @@ impl TransformerModel {
                 }
                 gpu.matmul_ternary_dev(&s.normed, &tensor.packed_weights, &tensor.scales_fp16, &mut s.logits, 1, cfg.vocab_size, h).map_err(|e| e.to_string())?;
             }
+            LmHead::Dense(table) => match table {
+                EmbeddingTable::F16(data) => gpu.lm_head_f16(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,
+                EmbeddingTable::F32(data) => gpu.lm_head_f32(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,
+            },
             LmHead::TiedEmbedding => match &self.token_embeddings {
                 EmbeddingTable::F16(data) => gpu.lm_head_f16(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,
                 EmbeddingTable::F32(data) => gpu.lm_head_f32(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,

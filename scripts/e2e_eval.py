@@ -141,10 +141,11 @@ def call_openai_chat(
     prompt: str,
     max_tokens: int,
     stream: bool,
+    model_name: str = "bonsai-aibox",
 ) -> tuple[str, float, float, int]:
     payload = json.dumps(
         {
-            "model": "bonsai-aibox",
+            "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0.0,
@@ -191,10 +192,15 @@ def call_openai_chat(
     return "".join(chunks), ttft_ms, total_s, len(chunks)
 
 
-def call_ollama_chat_ndjson(base_url: str, prompt: str, max_tokens: int) -> tuple[str, int]:
+def call_ollama_chat_ndjson(
+    base_url: str,
+    prompt: str,
+    max_tokens: int,
+    model_name: str = "bonsai-aibox",
+) -> tuple[str, int]:
     payload = json.dumps(
         {
-            "model": "bonsai-aibox",
+            "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
             "options": {"num_predict": max_tokens, "temperature": 0.0},
             "stream": True,
@@ -229,7 +235,70 @@ def has_degenerate_loop(text: str) -> bool:
     return unique_ratio < 0.25
 
 
-def run_e2e(model_dir: Path, max_tokens: int, skip_build: bool, use_gpu: bool = False) -> int:
+def evaluate_server(
+    base_url: str,
+    model_label: str,
+    model_name: str,
+    max_tokens: int,
+    load_s: float = 0.0,
+    rss_mb: float | None = None,
+    proc: subprocess.Popen[str] | None = None,
+) -> int:
+    models_openai = http_get_json(f"{base_url}/v1/models")
+    tags_ollama = http_get_json(f"{base_url}/api/tags")
+    assert models_openai.get("object") == "list"
+    assert "models" in tags_ollama
+
+    print(f"\n[3/4] Exécution de {len(PROMPT_SUITE)} requêtes OpenAI (/v1/chat/completions)...")
+    results = []
+    for case in PROMPT_SUITE:
+        text, ttft_ms, total_s, n_tok = call_openai_chat(
+            base_url, case.prompt, max_tokens, case.stream, model_name=model_name
+        )
+        tok_s = (n_tok / total_s) if total_s > 0 else 0.0
+        keyword_ok = not case.expected_any or any(kw in text for kw in case.expected_any)
+        no_loop = not has_degenerate_loop(text)
+        status = "PASS" if (text.strip() and keyword_ok and no_loop) else "WARN"
+        results.append((case.name, case.stream, n_tok, ttft_ms, total_s, tok_s, status, text))
+        preview = text.strip().replace("\n", " ")[:72]
+        print(f"  [{status}] {case.name:12s} | {n_tok:2d} tok | {tok_s:4.2f} tok/s | TTFT {ttft_ms:6.0f} ms | {preview}")
+
+    ollama_txt, ollama_tok = call_ollama_chat_ndjson(
+        base_url, "Dis bonjour en un mot.", min(8, max_tokens), model_name=model_name
+    )
+    print(f"  [PASS] ollama_ndjson | {ollama_tok:2d} tok | {ollama_txt.strip()!r}")
+
+    peak_mb = (get_process_rss_mb(proc.pid) if proc else None) or rss_mb
+    avg_tok_s = sum(r[5] for r in results) / len(results)
+    pass_count = sum(1 for r in results if r[6] == "PASS")
+
+    print("\n[4/4] Résumé E2E")
+    print("-" * 64)
+    print(f"  Machine       : {platform.system()} ({os.cpu_count()} threads CPU)")
+    print(f"  Modèle        : {model_label}")
+    print(f"  Chargement    : {load_s:.2f} s | RAM Pic : {f'{peak_mb:.0f} Mo' if peak_mb else 'n/a'}")
+    print(f"  Débit moyen   : {avg_tok_s:.2f} tok/s")
+    print(f"  Qualité       : {pass_count}/{len(results)} PASS + /v1/models + /api/tags + /api/chat OK")
+    print("-" * 64)
+    return 0 if pass_count == len(results) else 1
+
+
+def run_e2e(
+    model_dir: Path | None,
+    max_tokens: int,
+    skip_build: bool,
+    use_gpu: bool = False,
+    target_url: str | None = None,
+    model_name: str = "bonsai-aibox",
+) -> int:
+    if target_url:
+        base_url = target_url.rstrip("/")
+        print(f"[1/4] Cible externe : {base_url} (modèle: {model_name})")
+        return evaluate_server(base_url, f"{model_name} @ {base_url}", model_name, max_tokens)
+
+    if model_dir is None:
+        raise ValueError("--model est requis si --target-url n'est pas fourni")
+
     repo_root = Path(__file__).resolve().parent.parent
     if skip_build:
         bin_name = "aibox.exe" if platform.system() == "Windows" else "aibox"
@@ -256,40 +325,7 @@ def run_e2e(model_dir: Path, max_tokens: int, skip_build: bool, use_gpu: bool = 
         rss_mb = get_process_rss_mb(proc.pid)
         rss_str = f"{rss_mb:.0f} Mo" if rss_mb is not None else "n/a"
         print(f"      Serveur prêt en {load_s:.2f}s (RAM RSS: {rss_str})")
-
-        models_openai = http_get_json(f"{base_url}/v1/models")
-        tags_ollama = http_get_json(f"{base_url}/api/tags")
-        assert models_openai.get("object") == "list"
-        assert "models" in tags_ollama
-
-        print(f"\n[3/4] Exécution de {len(PROMPT_SUITE)} requêtes OpenAI (/v1/chat/completions)...")
-        results = []
-        for case in PROMPT_SUITE:
-            text, ttft_ms, total_s, n_tok = call_openai_chat(base_url, case.prompt, max_tokens, case.stream)
-            tok_s = (n_tok / total_s) if total_s > 0 else 0.0
-            keyword_ok = not case.expected_any or any(kw in text for kw in case.expected_any)
-            no_loop = not has_degenerate_loop(text)
-            status = "PASS" if (text.strip() and keyword_ok and no_loop) else "WARN"
-            results.append((case.name, case.stream, n_tok, ttft_ms, total_s, tok_s, status, text))
-            preview = text.strip().replace("\n", " ")[:72]
-            print(f"  [{status}] {case.name:12s} | {n_tok:2d} tok | {tok_s:4.2f} tok/s | TTFT {ttft_ms:6.0f} ms | {preview}")
-
-        ollama_txt, ollama_tok = call_ollama_chat_ndjson(base_url, "Dis bonjour en un mot.", min(8, max_tokens))
-        print(f"  [PASS] ollama_ndjson | {ollama_tok:2d} tok | {ollama_txt.strip()!r}")
-
-        peak_mb = get_process_rss_mb(proc.pid) or rss_mb
-        avg_tok_s = sum(r[5] for r in results) / len(results)
-        pass_count = sum(1 for r in results if r[6] == "PASS")
-
-        print("\n[4/4] Résumé E2E")
-        print("-" * 64)
-        print(f"  Machine       : {platform.system()} ({os.cpu_count()} threads CPU)")
-        print(f"  Modèle        : {model_dir}")
-        print(f"  Chargement    : {load_s:.2f} s | RAM Pic : {f'{peak_mb:.0f} Mo' if peak_mb else 'n/a'}")
-        print(f"  Débit moyen   : {avg_tok_s:.2f} tok/s")
-        print(f"  Qualité       : {pass_count}/{len(results)} PASS + /v1/models + /api/tags + /api/chat OK")
-        print("-" * 64)
-        return 0 if pass_count == len(results) else 1
+        return evaluate_server(base_url, str(model_dir), model_name, max_tokens, load_s, rss_mb, proc)
     finally:
         proc.terminate()
         try:
@@ -300,12 +336,15 @@ def run_e2e(model_dir: Path, max_tokens: int, skip_build: bool, use_gpu: bool = 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Test E2E reproductible pour AI Box (serve + inférence)")
-    parser.add_argument("--model", type=Path, required=True, help="Dossier du modèle SafeTensors AI Box")
+    parser.add_argument("--model", type=Path, default=None, help="Dossier du modèle SafeTensors AI Box")
+    parser.add_argument("--target-url", type=str, default=None, help="URL d'un serveur déjà lancé (ex: http://127.0.0.1:11434 pour Ollama)")
+    parser.add_argument("--model-name", type=str, default="bonsai-aibox", help="Nom du modèle envoyé à l'API (ex: qwen3:4b)")
     parser.add_argument("--max-tokens", type=int, default=24, help="Tokens max par prompt")
     parser.add_argument("--skip-build", action="store_true", help="Ne pas recompiler `aibox` en release")
     parser.add_argument("--gpu", action="store_true", help="Activer le backend GPU CUDA (`--gpu`)")
     args = parser.parse_args()
-    sys.exit(run_e2e(args.model.expanduser(), args.max_tokens, args.skip_build, args.gpu))
+    model_dir = args.model.expanduser() if args.model else None
+    sys.exit(run_e2e(model_dir, args.max_tokens, args.skip_build, args.gpu, args.target_url, args.model_name))
 
 
 if __name__ == "__main__":
