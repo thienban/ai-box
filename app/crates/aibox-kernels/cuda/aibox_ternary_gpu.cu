@@ -793,6 +793,7 @@ __global__ void rms_norm_heads_rope_f16_kernel(
     __half* __restrict__ vec,
     const float* __restrict__ norm_w,
     int head_dim,
+    int rope_dim,
     int start_pos,
     const int* __restrict__ dev_pos,
     float theta,
@@ -817,9 +818,10 @@ __global__ void rms_norm_heads_rope_f16_kernel(
         __syncthreads();
     }
 
-    int half = head_dim / 2;
+    int rot_dim = (rope_dim > 0 && rope_dim <= head_dim) ? rope_dim : head_dim;
+    int half = rot_dim / 2;
     for (int pair_idx = threadIdx.x; pair_idx < half; pair_idx += blockDim.x) {
-        float freq = 1.0f / powf(theta, (float)(2 * pair_idx) / (float)head_dim);
+        float freq = 1.0f / powf(theta, (float)(2 * pair_idx) / (float)rot_dim);
         float sin_a, cos_a;
         sincosf((float)pos * freq, &sin_a, &cos_a);
         float first = __half2float(h_vec[pair_idx]);
@@ -1437,6 +1439,7 @@ int aibox_gpu_rms_norm_heads_rope_f16(
     int m,
     int num_heads,
     int head_dim,
+    int rope_dim,
     int start_pos,
     float theta,
     float eps
@@ -1447,6 +1450,7 @@ int aibox_gpu_rms_norm_heads_rope_f16(
         reinterpret_cast<__half*>(dev_vec),
         dev_norm_w,
         head_dim,
+        rope_dim,
         start_pos,
         dev_pos,
         theta,
@@ -1690,6 +1694,302 @@ int aibox_gpu_graph_launch(
         return -5;
     }
     return (cudaStreamSynchronize(g_graph_stream) == cudaSuccess) ? 0 : -6;
+}
+
+__global__ void deinterleave_q_gate_f16_kernel(
+    const __half* __restrict__ q_full,
+    __half* __restrict__ q_out,
+    __half* __restrict__ gate_out,
+    int total_heads,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = total_heads * head_dim;
+    if (idx >= total) return;
+    int h = idx / head_dim;
+    int d = idx % head_dim;
+    q_out[idx] = __float2half(__half2float(q_full[h * 2 * head_dim + d]));
+    gate_out[idx] = __float2half(__half2float(q_full[h * 2 * head_dim + head_dim + d]));
+}
+
+__global__ void mul_sigmoid_inplace_f16_kernel(
+    __half* __restrict__ out,
+    const __half* __restrict__ gate,
+    int len
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    float o = __half2float(out[idx]);
+    float g = __half2float(gate[idx]);
+    float sig = 1.0f / (1.0f + expf(-g));
+    out[idx] = __float2half(o * sig);
+}
+
+__global__ void gdn_conv_silu_f16_kernel(
+    const __half* __restrict__ qkv_in,
+    const float* __restrict__ conv_w,
+    float* __restrict__ conv_state,
+    __half* __restrict__ qkv_out,
+    int conv_channels,
+    int kernel
+) {
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= conv_channels) return;
+    int hist = kernel - 1;
+    const float* w = conv_w + ch * kernel;
+    float* st = conv_state + ch * hist;
+    float acc = 0.0f;
+    for (int k = 0; k < hist; ++k) {
+        acc += st[k] * w[k];
+    }
+    float x = __half2float(qkv_in[ch]);
+    acc += x * w[hist];
+    for (int k = 0; k + 1 < hist; ++k) {
+        st[k] = st[k + 1];
+    }
+    if (hist > 0) {
+        st[hist - 1] = x;
+    }
+    float silu_acc = acc / (1.0f + expf(-acc));
+    qkv_out[ch] = __float2half(silu_acc);
+}
+
+__global__ void gdn_step_f16_kernel(
+    const __half* __restrict__ qkv,
+    const __half* __restrict__ alpha,
+    const __half* __restrict__ beta_raw,
+    const float* __restrict__ ssm_a,
+    const float* __restrict__ ssm_dt_bias,
+    const float* __restrict__ ssm_norm,
+    const __half* __restrict__ z,
+    __half* ssm_state,
+    __half* __restrict__ out,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    float eps
+) {
+    int hv = blockIdx.x;
+    int j = threadIdx.x;
+    if (j >= head_dim) return;
+
+    int hk = hv / (num_v_heads / num_k_heads);
+    const __half* q_ptr = qkv + hk * head_dim;
+    const __half* k_ptr = qkv + num_k_heads * head_dim + hk * head_dim;
+    const __half* v_ptr = qkv + 2 * num_k_heads * head_dim + hv * head_dim;
+
+    float q_j = __half2float(q_ptr[j]);
+    float k_j = __half2float(k_ptr[j]);
+    float q_sq = q_j * q_j;
+    float k_sq = k_j * k_j;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        q_sq += __shfl_down_sync(0xFFFFFFFF, q_sq, offset);
+        k_sq += __shfl_down_sync(0xFFFFFFFF, k_sq, offset);
+    }
+
+    __shared__ float s_q[128];
+    __shared__ float s_k[128];
+    __shared__ float s_red_q[4];
+    __shared__ float s_red_k[4];
+    __shared__ float s_inv_q;
+    __shared__ float s_inv_k;
+    __shared__ float s_decay;
+    __shared__ float s_beta;
+    __shared__ float s_inv_rms;
+
+    int warp_id = j >> 5;
+    int lane = j & 31;
+    if (lane == 0) {
+        s_red_q[warp_id] = q_sq;
+        s_red_k[warp_id] = k_sq;
+    }
+    __syncthreads();
+
+    if (j == 0) {
+        float tot_q = s_red_q[0] + s_red_q[1] + s_red_q[2] + s_red_q[3];
+        float tot_k = s_red_k[0] + s_red_k[1] + s_red_k[2] + s_red_k[3];
+        s_inv_q = rsqrtf(tot_q + eps) * rsqrtf((float)head_dim);
+        s_inv_k = rsqrtf(tot_k + eps);
+
+        float a_val = __half2float(alpha[hv]) + ssm_dt_bias[hv];
+        float sp = (a_val > 20.0f) ? a_val : log1pf(expf(a_val));
+        s_decay = expf(ssm_a[hv] * sp);
+        s_beta = 1.0f / (1.0f + expf(-__half2float(beta_raw[hv])));
+    }
+    __syncthreads();
+
+    s_q[j] = q_j * s_inv_q;
+    s_k[j] = k_j * s_inv_k;
+    __syncthreads();
+
+    __half* state_h = ssm_state + (size_t)hv * head_dim * head_dim;
+    float decay = s_decay;
+    float beta = s_beta;
+    float kv_mem = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        float s_ij = __half2float(state_h[i * head_dim + j]) * decay;
+        kv_mem += s_ij * s_k[i];
+    }
+    float v_j = __half2float(v_ptr[j]);
+    float delta = (v_j - kv_mem) * beta;
+    float o_j = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        float s_ij = __half2float(state_h[i * head_dim + j]) * decay + s_k[i] * delta;
+        state_h[i * head_dim + j] = __float2half(s_ij);
+        o_j += s_ij * s_q[i];
+    }
+
+    float o_sq = o_j * o_j;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        o_sq += __shfl_down_sync(0xFFFFFFFF, o_sq, offset);
+    }
+    if (lane == 0) {
+        s_red_q[warp_id] = o_sq;
+    }
+    __syncthreads();
+    if (j == 0) {
+        float tot_o = s_red_q[0] + s_red_q[1] + s_red_q[2] + s_red_q[3];
+        s_inv_rms = rsqrtf(tot_o / (float)head_dim + eps);
+    }
+    __syncthreads();
+
+    float z_j = __half2float(z[hv * head_dim + j]);
+    float silu_z = z_j / (1.0f + expf(-z_j));
+    out[hv * head_dim + j] = __float2half(o_j * s_inv_rms * ssm_norm[j] * silu_z);
+}
+
+int aibox_gpu_deinterleave_q_gate_f16(
+    const uint16_t* dev_q_full,
+    uint16_t* dev_q_out,
+    uint16_t* dev_gate_out,
+    int m,
+    int num_heads,
+    int head_dim
+) {
+    int total = m * num_heads * head_dim;
+    int blocks = (total + 255) / 256;
+    deinterleave_q_gate_f16_kernel<<<blocks, 256, 0, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_q_full),
+        reinterpret_cast<__half*>(dev_q_out),
+        reinterpret_cast<__half*>(dev_gate_out),
+        m * num_heads,
+        head_dim
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_mul_sigmoid_inplace_f16(
+    uint16_t* dev_out,
+    const uint16_t* dev_gate,
+    int len
+) {
+    int blocks = (len + 255) / 256;
+    mul_sigmoid_inplace_f16_kernel<<<blocks, 256, 0, g_active_stream>>>(
+        reinterpret_cast<__half*>(dev_out),
+        reinterpret_cast<const __half*>(dev_gate),
+        len
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_gdn_conv_silu_f16(
+    const uint16_t* dev_qkv_in,
+    const float* dev_conv_w,
+    float* dev_conv_state,
+    uint16_t* dev_qkv_out,
+    int conv_channels,
+    int kernel
+) {
+    int blocks = (conv_channels + 255) / 256;
+    gdn_conv_silu_f16_kernel<<<blocks, 256, 0, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_qkv_in),
+        dev_conv_w,
+        dev_conv_state,
+        reinterpret_cast<__half*>(dev_qkv_out),
+        conv_channels,
+        kernel
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_gdn_step_f16(
+    const uint16_t* dev_qkv,
+    const uint16_t* dev_alpha,
+    const uint16_t* dev_beta,
+    const float* dev_ssm_a,
+    const float* dev_ssm_dt_bias,
+    const float* dev_ssm_norm,
+    const uint16_t* dev_z,
+    uint16_t* dev_ssm_state,
+    uint16_t* dev_out,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    float eps
+) {
+    if (head_dim > 128) {
+        return -1;
+    }
+    gdn_step_f16_kernel<<<num_v_heads, 128, 0, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_qkv),
+        reinterpret_cast<const __half*>(dev_alpha),
+        reinterpret_cast<const __half*>(dev_beta),
+        dev_ssm_a,
+        dev_ssm_dt_bias,
+        dev_ssm_norm,
+        reinterpret_cast<const __half*>(dev_z),
+        reinterpret_cast<__half*>(dev_ssm_state),
+        reinterpret_cast<__half*>(dev_out),
+        num_k_heads,
+        num_v_heads,
+        head_dim,
+        eps
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+__global__ void matmul_dense_f16_dev_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ w,
+    __half* __restrict__ out,
+    int n,
+    int k
+) {
+    int warp_global = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    int token = blockIdx.y;
+    if (warp_global >= n) return;
+    int lane = threadIdx.x & 31;
+    const __half* x_row = x + token * k;
+    const __half* w_row = w + warp_global * k;
+    float sum = 0.0f;
+    for (int col = lane; col < k; col += 32) {
+        sum += __half2float(x_row[col]) * __half2float(w_row[col]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+    if (lane == 0) {
+        out[token * n + warp_global] = __float2half(sum);
+    }
+}
+
+int aibox_gpu_matmul_dense_f16_dev(
+    const uint16_t* dev_x,
+    const uint16_t* dev_w,
+    uint16_t* dev_out,
+    int m,
+    int n,
+    int k
+) {
+    dim3 grid((n + 3) / 4, m);
+    matmul_dense_f16_dev_kernel<<<grid, 128, 0, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_x),
+        reinterpret_cast<const __half*>(dev_w),
+        reinterpret_cast<__half*>(dev_out),
+        n,
+        k
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
 }

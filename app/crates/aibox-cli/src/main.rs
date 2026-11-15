@@ -78,18 +78,22 @@ fn run_bench_forward() -> Result<(), String> {
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
         use_hadamard: true,
+        ..ModelConfig::default()
     };
     let kv_dim = config.num_key_value_heads * config.head_dim();
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for layer_idx in 0..config.num_hidden_layers {
         layers.push(TernaryLayerWeights {
             attn_norm: vec![1.0; config.hidden_size],
-            attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 1)?,
-            attn_k: build_synthetic_tensor(kv_dim, config.hidden_size, layer_idx + 2)?,
-            attn_v: build_synthetic_tensor(kv_dim, config.hidden_size, layer_idx + 3)?,
-            attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 4)?,
-            attn_q_norm: None,
-            attn_k_norm: None,
+            block: engine::LayerBlock::Attention(engine::AttentionBlockWeights {
+                attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 1)?,
+                attn_k: build_synthetic_tensor(kv_dim, config.hidden_size, layer_idx + 2)?,
+                attn_v: build_synthetic_tensor(kv_dim, config.hidden_size, layer_idx + 3)?,
+                attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 4)?,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                has_q_gate: false,
+            }),
             ffn_norm: vec![1.0; config.hidden_size],
             ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 5)?,
             ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 6)?,
@@ -141,6 +145,7 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
         .ok_or_else(|| "Usage: aibox run <model|dir> <prompt> [--max-tokens N]".to_string())?;
     let mut max_tokens = 32usize;
     let mut use_gpu = false;
+    let mut temperature = 0.0f32;
     let mut idx = 2usize;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -152,6 +157,15 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
                 max_tokens = val
                     .parse::<usize>()
                     .map_err(|_| format!("max-tokens invalide: '{val}'"))?;
+            }
+            "--temp" => {
+                idx += 1;
+                let val = args
+                    .get(idx)
+                    .ok_or_else(|| "Valeur manquante pour --temp".to_string())?;
+                temperature = val
+                    .parse::<f32>()
+                    .map_err(|_| format!("temp invalide: '{val}'"))?;
             }
             "--gpu" => {
                 use_gpu = true;
@@ -169,9 +183,9 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
 
     let backend = select_backend(use_gpu);
     let params = SamplingParams {
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
+        temperature,
+        top_k: if temperature > 0.0 { 20 } else { 1 },
+        top_p: if temperature > 0.0 { 0.95 } else { 1.0 },
         seed: 42,
     };
     let stats = model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &*backend)?;

@@ -134,18 +134,22 @@ fn build_server_state(server_cfg: &ServerConfig) -> Result<ServerState, String> 
         rms_norm_eps: 1e-6,
         rope_theta: 10_000.0,
         use_hadamard: true,
+        ..ModelConfig::default()
     };
     let kv_dim = config.num_key_value_heads * config.head_dim();
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for idx in 0..config.num_hidden_layers {
         layers.push(TernaryLayerWeights {
             attn_norm: vec![1.0; config.hidden_size],
-            attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, idx + 1)?,
-            attn_k: build_synthetic_tensor(kv_dim, config.hidden_size, idx + 2)?,
-            attn_v: build_synthetic_tensor(kv_dim, config.hidden_size, idx + 3)?,
-            attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, idx + 4)?,
-            attn_q_norm: None,
-            attn_k_norm: None,
+            block: crate::engine::LayerBlock::Attention(crate::engine::AttentionBlockWeights {
+                attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, idx + 1)?,
+                attn_k: build_synthetic_tensor(kv_dim, config.hidden_size, idx + 2)?,
+                attn_v: build_synthetic_tensor(kv_dim, config.hidden_size, idx + 3)?,
+                attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, idx + 4)?,
+                attn_q_norm: None,
+                attn_k_norm: None,
+                has_q_gate: false,
+            }),
             ffn_norm: vec![1.0; config.hidden_size],
             ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, idx + 5)?,
             ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, idx + 6)?,

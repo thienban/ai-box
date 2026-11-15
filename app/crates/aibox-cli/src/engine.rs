@@ -13,7 +13,7 @@ use crate::json::{parse_json, JsonValue};
 use crate::safetensors::SafeTensorsFile;
 use crate::sampling::{sample_token, softmax_inplace, SamplingParams, XorShift64};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -21,6 +21,12 @@ pub struct ModelConfig {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
+    pub rope_dim: usize,
+    pub ssm_conv_kernel: usize,
+    pub ssm_group_count: usize,
+    pub ssm_inner_size: usize,
+    pub ssm_state_size: usize,
+    pub ssm_time_step_rank: usize,
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
@@ -36,6 +42,15 @@ impl ModelConfig {
         }
     }
 
+    pub fn rope_dim(&self) -> usize {
+        let hd = self.head_dim();
+        if self.rope_dim > 0 && self.rope_dim <= hd {
+            self.rope_dim
+        } else {
+            hd
+        }
+    }
+
     pub fn from_json(val: &JsonValue) -> Result<Self, String> {
         let obj = val
             .as_object()
@@ -46,18 +61,16 @@ impl ModelConfig {
                 .map(|num| num as usize)
                 .ok_or_else(|| format!("Missing or invalid '{key}' in config.json"))
         };
+        let get_opt_usize = |key: &str, default: usize| -> usize {
+            obj.get(key)
+                .and_then(JsonValue::as_u64)
+                .map(|num| num as usize)
+                .unwrap_or(default)
+        };
         let hidden_size = get_usize("hidden_size")?;
         let num_attention_heads = get_usize("num_attention_heads")?;
-        let num_key_value_heads = obj
-            .get("num_key_value_heads")
-            .and_then(JsonValue::as_u64)
-            .map(|num| num as usize)
-            .unwrap_or(num_attention_heads);
-        let head_dim = obj
-            .get("head_dim")
-            .and_then(JsonValue::as_u64)
-            .map(|num| num as usize)
-            .unwrap_or(hidden_size / num_attention_heads);
+        let num_key_value_heads = get_opt_usize("num_key_value_heads", num_attention_heads);
+        let head_dim = get_opt_usize("head_dim", hidden_size / num_attention_heads);
 
         Ok(Self {
             hidden_size,
@@ -66,6 +79,12 @@ impl ModelConfig {
             num_attention_heads,
             num_key_value_heads,
             head_dim,
+            rope_dim: get_opt_usize("rope_dim", 0),
+            ssm_conv_kernel: get_opt_usize("ssm_conv_kernel", 0),
+            ssm_group_count: get_opt_usize("ssm_group_count", 0),
+            ssm_inner_size: get_opt_usize("ssm_inner_size", 0),
+            ssm_state_size: get_opt_usize("ssm_state_size", 0),
+            ssm_time_step_rank: get_opt_usize("ssm_time_step_rank", 0),
             vocab_size: get_usize("vocab_size")?,
             rms_norm_eps: match obj.get("rms_norm_eps") {
                 Some(JsonValue::Number(num)) => *num as f32,
@@ -169,14 +188,45 @@ fn load_dense_table(st: &mut SafeTensorsFile, name: &str) -> Result<EmbeddingTab
     }
 }
 
-pub struct TernaryLayerWeights {
-    pub attn_norm: Vec<f32>,
+pub struct AttentionBlockWeights {
     pub attn_q: TernaryTensor,
     pub attn_k: TernaryTensor,
     pub attn_v: TernaryTensor,
     pub attn_o: TernaryTensor,
     pub attn_q_norm: Option<Vec<f32>>,
     pub attn_k_norm: Option<Vec<f32>>,
+    pub has_q_gate: bool,
+}
+
+pub enum LinearWeight {
+    Ternary(TernaryTensor),
+    DenseF16 {
+        data: Vec<u16>,
+        n_rows: usize,
+        k_cols: usize,
+    },
+}
+
+pub struct GatedDeltaNetWeights {
+    pub attn_qkv: TernaryTensor,
+    pub attn_gate: TernaryTensor,
+    pub ssm_conv1d: Vec<f32>,
+    pub ssm_alpha: LinearWeight,
+    pub ssm_beta: LinearWeight,
+    pub ssm_a: Vec<f32>,
+    pub ssm_dt_bias: Vec<f32>,
+    pub ssm_norm: Vec<f32>,
+    pub ssm_out: TernaryTensor,
+}
+
+pub enum LayerBlock {
+    Attention(AttentionBlockWeights),
+    GatedDeltaNet(GatedDeltaNetWeights),
+}
+
+pub struct TernaryLayerWeights {
+    pub attn_norm: Vec<f32>,
+    pub block: LayerBlock,
     pub ffn_norm: Vec<f32>,
     pub ffn_gate: TernaryTensor,
     pub ffn_up: TernaryTensor,
@@ -194,6 +244,8 @@ pub struct TransformerModel {
 pub struct KvCache {
     keys: Vec<Vec<f32>>,
     values: Vec<Vec<f32>>,
+    conv_states: Vec<Vec<f32>>,
+    ssm_states: Vec<Vec<f32>>,
 }
 
 impl KvCache {
@@ -201,6 +253,8 @@ impl KvCache {
         Self {
             keys: vec![Vec::new(); num_layers],
             values: vec![Vec::new(); num_layers],
+            conv_states: vec![Vec::new(); num_layers],
+            ssm_states: vec![Vec::new(); num_layers],
         }
     }
 }
@@ -247,14 +301,16 @@ pub fn apply_rope_inplace(
     vec: &mut [f32],
     num_heads: usize,
     head_dim: usize,
+    rope_dim: usize,
     pos: usize,
     theta: f32,
 ) {
-    let half = head_dim / 2;
+    let rot_dim = if rope_dim > 0 && rope_dim <= head_dim { rope_dim } else { head_dim };
+    let half = rot_dim / 2;
     for head in 0..num_heads {
         let base = head * head_dim;
         for pair_idx in 0..half {
-            let freq = 1.0 / theta.powf((2 * pair_idx) as f32 / (head_dim as f32));
+            let freq = 1.0 / theta.powf((2 * pair_idx) as f32 / (rot_dim as f32));
             let (sin_a, cos_a) = ((pos as f32) * freq).sin_cos();
             let first = vec[base + pair_idx];
             let second = vec[base + pair_idx + half];
@@ -262,6 +318,182 @@ pub fn apply_rope_inplace(
             vec[base + pair_idx + half] = first * sin_a + second * cos_a;
         }
     }
+}
+
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+#[inline]
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+}
+
+fn l2_norm_heads_inplace(vec: &mut [f32], num_heads: usize, head_dim: usize, eps: f32) {
+    for head in 0..num_heads {
+        let slice = &mut vec[head * head_dim..(head + 1) * head_dim];
+        let sum_sq: f32 = slice.iter().map(|&v| v * v).sum();
+        let inv_norm = 1.0 / (sum_sq + eps).sqrt();
+        for v in slice.iter_mut() {
+            *v *= inv_norm;
+        }
+    }
+}
+
+fn split_q_gate_interleaved(q_full: &[f32], num_heads: usize, head_dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut query = Vec::with_capacity(num_heads * head_dim);
+    let mut gate = Vec::with_capacity(num_heads * head_dim);
+    for head in 0..num_heads {
+        let base = head * 2 * head_dim;
+        query.extend_from_slice(&q_full[base..base + head_dim]);
+        gate.extend_from_slice(&q_full[base + head_dim..base + 2 * head_dim]);
+    }
+    (query, gate)
+}
+
+fn apply_causal_conv1d_silu(
+    qkv: &[f32],
+    conv_weight: &[f32],
+    conv_state: &mut [f32],
+    conv_channels: usize,
+    kernel: usize,
+) -> Vec<f32> {
+    let hist = kernel.saturating_sub(1);
+    let mut out = vec![0.0f32; conv_channels];
+    for ch in 0..conv_channels {
+        let w = &conv_weight[ch * kernel..(ch + 1) * kernel];
+        let st = &mut conv_state[ch * hist..(ch + 1) * hist];
+        let mut acc = 0.0f32;
+        for k in 0..hist {
+            acc += st[k] * w[k];
+        }
+        acc += qkv[ch] * w[hist];
+        for k in 0..hist.saturating_sub(1) {
+            st[k] = st[k + 1];
+        }
+        if hist > 0 {
+            st[hist - 1] = qkv[ch];
+        }
+        out[ch] = silu(acc);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_gdn_recurrence(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    alpha: &[f32],
+    beta_raw: &[f32],
+    ssm_a: &[f32],
+    ssm_dt_bias: &[f32],
+    ssm_state: &mut [f32],
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let heads_per_group = num_v_heads / num_k_heads;
+    let q_scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0.0f32; num_v_heads * head_dim];
+
+    for hv in 0..num_v_heads {
+        let hk = hv / heads_per_group;
+        let q_h = &q[hk * head_dim..(hk + 1) * head_dim];
+        let k_h = &k[hk * head_dim..(hk + 1) * head_dim];
+        let v_h = &v[hv * head_dim..(hv + 1) * head_dim];
+        let state_h = &mut ssm_state[hv * head_dim * head_dim..(hv + 1) * head_dim * head_dim];
+
+        let decay = (ssm_a[hv] * softplus(alpha[hv] + ssm_dt_bias[hv])).exp();
+        let beta = sigmoid(beta_raw[hv]);
+
+        for val in state_h.iter_mut() {
+            *val *= decay;
+        }
+        for j in 0..head_dim {
+            let mut kv_mem = 0.0f32;
+            for i in 0..head_dim {
+                kv_mem += state_h[i * head_dim + j] * k_h[i];
+            }
+            let delta = (v_h[j] - kv_mem) * beta;
+            let mut o_j = 0.0f32;
+            for i in 0..head_dim {
+                let updated = state_h[i * head_dim + j] + k_h[i] * delta;
+                state_h[i * head_dim + j] = updated;
+                o_j += updated * q_h[i] * q_scale;
+            }
+            out[hv * head_dim + j] = o_j;
+        }
+    }
+    out
+}
+
+fn apply_gated_rms_norm(
+    out: &[f32],
+    z: &[f32],
+    norm_weight: &[f32],
+    num_v_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let mut result = vec![0.0f32; num_v_heads * head_dim];
+    for hv in 0..num_v_heads {
+        let base = hv * head_dim;
+        let o_h = &out[base..base + head_dim];
+        let z_h = &z[base..base + head_dim];
+        let mean_sq = o_h.iter().map(|&val| val * val).sum::<f32>() / (head_dim as f32);
+        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+        for j in 0..head_dim {
+            result[base + j] = o_h[j] * inv_rms * norm_weight[j] * silu(z_h[j]);
+        }
+    }
+    result
+}
+
+fn project_linear_batch(
+    backend: &dyn TernaryHadamardBackend,
+    input: &[f32],
+    weight: &LinearWeight,
+    m: usize,
+    use_hadamard: bool,
+) -> Result<Vec<f32>, String> {
+    match weight {
+        LinearWeight::Ternary(t) => project_ternary_batch(backend, input, t, m, use_hadamard),
+        LinearWeight::DenseF16 { data, n_rows, k_cols } => {
+            let lut = f16_lut();
+            let mut out = vec![0.0f32; m * n_rows];
+            for t in 0..m {
+                let x = &input[t * k_cols..(t + 1) * k_cols];
+                for r in 0..*n_rows {
+                    let row = &data[r * k_cols..(r + 1) * k_cols];
+                    out[t * n_rows + r] = row
+                        .iter()
+                        .zip(x.iter())
+                        .map(|(&w_u16, &xv)| lut[w_u16 as usize] * xv)
+                        .sum();
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn load_linear_weight(
+    st: &mut SafeTensorsFile,
+    weight_name: &str,
+    scales_name: &str,
+    n_rows: usize,
+    k_cols: usize,
+) -> Result<LinearWeight, String> {
+    if st.has_tensor(scales_name) {
+        return Ok(LinearWeight::Ternary(st.load_ternary_layer(weight_name, scales_name)?));
+    }
+    let data = match load_dense_table(st, weight_name)? {
+        EmbeddingTable::F16(v) => v,
+        EmbeddingTable::F32(v) => v.into_iter().map(f32_to_f16).collect(),
+    };
+    Ok(LinearWeight::DenseF16 { data, n_rows, k_cols })
 }
 
 fn project_ternary(
@@ -434,29 +666,69 @@ impl TransformerModel {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for idx in 0..config.num_hidden_layers {
             let p = format!("blk.{idx}");
-            let attn_q = st.load_ternary_layer(&format!("{p}.attn_q.weight"), &format!("{p}.attn_q.scales"))?;
-            if idx == 0 {
-                config.head_dim = attn_q.n_rows / config.num_attention_heads;
-            }
-            let attn_q_norm = if st.has_tensor(&format!("{p}.attn_q_norm.weight")) {
-                Some(st.load_f32_vector(&format!("{p}.attn_q_norm.weight"))?)
+            let attn_norm = st.load_f32_vector(&format!("{p}.attn_norm.weight"))?;
+            let ffn_norm = if st.has_tensor(&format!("{p}.post_attention_norm.weight")) {
+                st.load_f32_vector(&format!("{p}.post_attention_norm.weight"))?
             } else {
-                None
+                st.load_f32_vector(&format!("{p}.ffn_norm.weight"))?
             };
-            let attn_k_norm = if st.has_tensor(&format!("{p}.attn_k_norm.weight")) {
-                Some(st.load_f32_vector(&format!("{p}.attn_k_norm.weight"))?)
+
+            let block = if st.has_tensor(&format!("{p}.attn_qkv.weight")) {
+                LayerBlock::GatedDeltaNet(GatedDeltaNetWeights {
+                    attn_qkv: st.load_ternary_layer(&format!("{p}.attn_qkv.weight"), &format!("{p}.attn_qkv.scales"))?,
+                    attn_gate: st.load_ternary_layer(&format!("{p}.attn_gate.weight"), &format!("{p}.attn_gate.scales"))?,
+                    ssm_conv1d: st.load_f32_vector(&format!("{p}.ssm_conv1d.weight"))?,
+                    ssm_alpha: load_linear_weight(
+                        &mut st,
+                        &format!("{p}.ssm_alpha.weight"),
+                        &format!("{p}.ssm_alpha.scales"),
+                        config.ssm_time_step_rank,
+                        config.hidden_size,
+                    )?,
+                    ssm_beta: load_linear_weight(
+                        &mut st,
+                        &format!("{p}.ssm_beta.weight"),
+                        &format!("{p}.ssm_beta.scales"),
+                        config.ssm_time_step_rank,
+                        config.hidden_size,
+                    )?,
+                    ssm_a: st.load_f32_vector(&format!("{p}.ssm_a"))?,
+                    ssm_dt_bias: st.load_f32_vector(&format!("{p}.ssm_dt.bias"))?,
+                    ssm_norm: st.load_f32_vector(&format!("{p}.ssm_norm.weight"))?,
+                    ssm_out: st.load_ternary_layer(&format!("{p}.ssm_out.weight"), &format!("{p}.ssm_out.scales"))?,
+                })
             } else {
-                None
+                let attn_q = st.load_ternary_layer(&format!("{p}.attn_q.weight"), &format!("{p}.attn_q.scales"))?;
+                let expected_q_rows = config.num_attention_heads * config.head_dim();
+                let has_q_gate = attn_q.n_rows == expected_q_rows * 2;
+                if !has_q_gate && config.head_dim == config.hidden_size / config.num_attention_heads {
+                    config.head_dim = attn_q.n_rows / config.num_attention_heads;
+                }
+                let attn_q_norm = if st.has_tensor(&format!("{p}.attn_q_norm.weight")) {
+                    Some(st.load_f32_vector(&format!("{p}.attn_q_norm.weight"))?)
+                } else {
+                    None
+                };
+                let attn_k_norm = if st.has_tensor(&format!("{p}.attn_k_norm.weight")) {
+                    Some(st.load_f32_vector(&format!("{p}.attn_k_norm.weight"))?)
+                } else {
+                    None
+                };
+                LayerBlock::Attention(AttentionBlockWeights {
+                    attn_q,
+                    attn_k: st.load_ternary_layer(&format!("{p}.attn_k.weight"), &format!("{p}.attn_k.scales"))?,
+                    attn_v: st.load_ternary_layer(&format!("{p}.attn_v.weight"), &format!("{p}.attn_v.scales"))?,
+                    attn_o: st.load_ternary_layer(&format!("{p}.attn_o.weight"), &format!("{p}.attn_o.scales"))?,
+                    attn_q_norm,
+                    attn_k_norm,
+                    has_q_gate,
+                })
             };
+
             layers.push(TernaryLayerWeights {
-                attn_norm: st.load_f32_vector(&format!("{p}.attn_norm.weight"))?,
-                attn_q,
-                attn_k: st.load_ternary_layer(&format!("{p}.attn_k.weight"), &format!("{p}.attn_k.scales"))?,
-                attn_v: st.load_ternary_layer(&format!("{p}.attn_v.weight"), &format!("{p}.attn_v.scales"))?,
-                attn_o: st.load_ternary_layer(&format!("{p}.attn_o.weight"), &format!("{p}.attn_o.scales"))?,
-                attn_q_norm,
-                attn_k_norm,
-                ffn_norm: st.load_f32_vector(&format!("{p}.ffn_norm.weight"))?,
+                attn_norm,
+                block,
+                ffn_norm,
                 ffn_gate: st.load_ternary_layer(&format!("{p}.ffn_gate.weight"), &format!("{p}.ffn_gate.scales"))?,
                 ffn_up: st.load_ternary_layer(&format!("{p}.ffn_up.weight"), &format!("{p}.ffn_up.scales"))?,
                 ffn_down: st.load_ternary_layer(&format!("{p}.ffn_down.weight"), &format!("{p}.ffn_down.scales"))?,
@@ -491,14 +763,47 @@ impl TransformerModel {
         kv_cache: &mut KvCache,
         backend: &dyn TernaryHadamardBackend,
     ) -> Result<(), String> {
-        let head_dim = self.config.head_dim();
-        let use_hadamard = self.config.use_hadamard;
-        let normed = rms_norm(hidden, &layer.attn_norm, self.config.rms_norm_eps);
-        let mut query = project_ternary(backend, &normed, &layer.attn_q, use_hadamard)?;
-        let mut key = project_ternary(backend, &normed, &layer.attn_k, use_hadamard)?;
-        let value = project_ternary(backend, &normed, &layer.attn_v, use_hadamard)?;
+        match &layer.block {
+            LayerBlock::Attention(attn) => self.forward_full_attention_block(
+                hidden,
+                &layer.attn_norm,
+                attn,
+                layer_idx,
+                pos,
+                kv_cache,
+                backend,
+            ),
+            LayerBlock::GatedDeltaNet(gdn) => {
+                self.forward_gdn_block(hidden, &layer.attn_norm, gdn, layer_idx, kv_cache, backend)
+            }
+        }
+    }
 
-        if let Some(ref q_norm) = layer.attn_q_norm {
+    fn forward_full_attention_block(
+        &self,
+        hidden: &mut [f32],
+        attn_norm: &[f32],
+        attn: &AttentionBlockWeights,
+        layer_idx: usize,
+        pos: usize,
+        kv_cache: &mut KvCache,
+        backend: &dyn TernaryHadamardBackend,
+    ) -> Result<(), String> {
+        let head_dim = self.config.head_dim();
+        let rope_dim = self.config.rope_dim();
+        let use_hadamard = self.config.use_hadamard;
+        let normed = rms_norm(hidden, attn_norm, self.config.rms_norm_eps);
+        let q_raw = project_ternary(backend, &normed, &attn.attn_q, use_hadamard)?;
+        let (mut query, q_gate) = if attn.has_q_gate {
+            let (q, g) = split_q_gate_interleaved(&q_raw, self.config.num_attention_heads, head_dim);
+            (q, Some(g))
+        } else {
+            (q_raw, None)
+        };
+        let mut key = project_ternary(backend, &normed, &attn.attn_k, use_hadamard)?;
+        let value = project_ternary(backend, &normed, &attn.attn_v, use_hadamard)?;
+
+        if let Some(ref q_norm) = attn.attn_q_norm {
             rms_norm_heads_inplace(
                 &mut query,
                 self.config.num_attention_heads,
@@ -507,7 +812,7 @@ impl TransformerModel {
                 self.config.rms_norm_eps,
             );
         }
-        if let Some(ref k_norm) = layer.attn_k_norm {
+        if let Some(ref k_norm) = attn.attn_k_norm {
             rms_norm_heads_inplace(
                 &mut key,
                 self.config.num_key_value_heads,
@@ -517,16 +822,125 @@ impl TransformerModel {
             );
         }
 
-        apply_rope_inplace(&mut query, self.config.num_attention_heads, head_dim, pos, self.config.rope_theta);
-        apply_rope_inplace(&mut key, self.config.num_key_value_heads, head_dim, pos, self.config.rope_theta);
+        apply_rope_inplace(
+            &mut query,
+            self.config.num_attention_heads,
+            head_dim,
+            rope_dim,
+            pos,
+            self.config.rope_theta,
+        );
+        apply_rope_inplace(
+            &mut key,
+            self.config.num_key_value_heads,
+            head_dim,
+            rope_dim,
+            pos,
+            self.config.rope_theta,
+        );
 
         kv_cache.keys[layer_idx].extend_from_slice(&key);
         kv_cache.values[layer_idx].extend_from_slice(&value);
 
-        let attn_ctx = attention_gqa(&query, &kv_cache.keys[layer_idx], &kv_cache.values[layer_idx], &self.config);
-        let attn_proj = project_ternary(backend, &attn_ctx, &layer.attn_o, use_hadamard)?;
+        let mut attn_ctx = attention_gqa(&query, &kv_cache.keys[layer_idx], &kv_cache.values[layer_idx], &self.config);
+        if let Some(gate) = q_gate {
+            for (val, &g) in attn_ctx.iter_mut().zip(gate.iter()) {
+                *val *= sigmoid(g);
+            }
+        }
+        let attn_proj = project_ternary(backend, &attn_ctx, &attn.attn_o, use_hadamard)?;
         add_residual(hidden, &attn_proj);
         Ok(())
+    }
+
+    fn forward_gdn_block(
+        &self,
+        hidden: &mut [f32],
+        attn_norm: &[f32],
+        gdn: &GatedDeltaNetWeights,
+        layer_idx: usize,
+        kv_cache: &mut KvCache,
+        backend: &dyn TernaryHadamardBackend,
+    ) -> Result<(), String> {
+        let normed = rms_norm(hidden, attn_norm, self.config.rms_norm_eps);
+        let ssm_proj = self.run_gdn_sequence_cpu(&normed, gdn, layer_idx, 1, kv_cache, backend)?;
+        add_residual(hidden, &ssm_proj);
+        Ok(())
+    }
+
+    fn run_gdn_sequence_cpu(
+        &self,
+        normed: &[f32],
+        gdn: &GatedDeltaNetWeights,
+        layer_idx: usize,
+        m: usize,
+        kv_cache: &mut KvCache,
+        backend: &dyn TernaryHadamardBackend,
+    ) -> Result<Vec<f32>, String> {
+        let cfg = &self.config;
+        let head_dim = cfg.ssm_state_size;
+        let num_k_heads = cfg.ssm_group_count;
+        let num_v_heads = cfg.ssm_time_step_rank;
+        let kernel = cfg.ssm_conv_kernel;
+        let conv_channels = 2 * num_k_heads * head_dim + num_v_heads * head_dim;
+        let d_inner = num_v_heads * head_dim;
+        let qk_dim = num_k_heads * head_dim;
+        let use_hadamard = cfg.use_hadamard;
+        let eps = cfg.rms_norm_eps;
+
+        let qkv_batch = project_ternary_batch(backend, normed, &gdn.attn_qkv, m, use_hadamard)?;
+        let z_batch = project_ternary_batch(backend, normed, &gdn.attn_gate, m, use_hadamard)?;
+        let alpha_batch = project_linear_batch(backend, normed, &gdn.ssm_alpha, m, use_hadamard)?;
+        let beta_batch = project_linear_batch(backend, normed, &gdn.ssm_beta, m, use_hadamard)?;
+
+        let conv_state = &mut kv_cache.conv_states[layer_idx];
+        let conv_hist = kernel.saturating_sub(1);
+        if conv_state.is_empty() && conv_hist > 0 {
+            conv_state.resize(conv_channels * conv_hist, 0.0);
+        }
+        let ssm_state = &mut kv_cache.ssm_states[layer_idx];
+        if ssm_state.is_empty() {
+            ssm_state.resize(num_v_heads * head_dim * head_dim, 0.0);
+        }
+
+        let mut gated_batch = Vec::with_capacity(m * d_inner);
+        for t in 0..m {
+            let mut conv_silu = apply_causal_conv1d_silu(
+                &qkv_batch[t * conv_channels..(t + 1) * conv_channels],
+                &gdn.ssm_conv1d,
+                conv_state,
+                conv_channels,
+                kernel,
+            );
+            let (q_slice, rest) = conv_silu.split_at_mut(qk_dim);
+            let (k_slice, v_slice) = rest.split_at_mut(qk_dim);
+            l2_norm_heads_inplace(q_slice, num_k_heads, head_dim, eps);
+            l2_norm_heads_inplace(k_slice, num_k_heads, head_dim, eps);
+
+            let rec_out = step_gdn_recurrence(
+                q_slice,
+                k_slice,
+                v_slice,
+                &alpha_batch[t * num_v_heads..(t + 1) * num_v_heads],
+                &beta_batch[t * num_v_heads..(t + 1) * num_v_heads],
+                &gdn.ssm_a,
+                &gdn.ssm_dt_bias,
+                ssm_state,
+                num_k_heads,
+                num_v_heads,
+                head_dim,
+            );
+            gated_batch.extend_from_slice(&apply_gated_rms_norm(
+                &rec_out,
+                &z_batch[t * d_inner..(t + 1) * d_inner],
+                &gdn.ssm_norm,
+                num_v_heads,
+                head_dim,
+                eps,
+            ));
+        }
+
+        project_ternary_batch(backend, &gated_batch, &gdn.ssm_out, m, use_hadamard)
     }
 
     fn forward_ffn_block(
@@ -626,6 +1040,7 @@ impl TransformerModel {
 
         let hidden_size = self.config.hidden_size;
         let head_dim = self.config.head_dim();
+        let rope_dim = self.config.rope_dim();
         let q_dim = self.config.num_attention_heads * head_dim;
         let kv_dim = self.config.num_key_value_heads * head_dim;
         let use_hadamard = self.config.use_hadamard;
@@ -641,41 +1056,73 @@ impl TransformerModel {
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let normed = rms_norm_batch(&hidden, &layer.attn_norm, m, hidden_size, eps);
-            let mut queries = project_ternary_batch(backend, &normed, &layer.attn_q, m, use_hadamard)?;
-            let mut keys = project_ternary_batch(backend, &normed, &layer.attn_k, m, use_hadamard)?;
-            let values = project_ternary_batch(backend, &normed, &layer.attn_v, m, use_hadamard)?;
+            match &layer.block {
+                LayerBlock::Attention(attn) => {
+                    let q_raw = project_ternary_batch(backend, &normed, &attn.attn_q, m, use_hadamard)?;
+                    let mut keys = project_ternary_batch(backend, &normed, &attn.attn_k, m, use_hadamard)?;
+                    let values = project_ternary_batch(backend, &normed, &attn.attn_v, m, use_hadamard)?;
 
-            for t in 0..m {
-                let q_slice = &mut queries[t * q_dim..(t + 1) * q_dim];
-                let k_slice = &mut keys[t * kv_dim..(t + 1) * kv_dim];
-                if let Some(ref q_norm) = layer.attn_q_norm {
-                    rms_norm_heads_inplace(q_slice, self.config.num_attention_heads, head_dim, q_norm, eps);
+                    let mut queries = vec![0.0f32; m * q_dim];
+                    let mut q_gates = if attn.has_q_gate {
+                        vec![0.0f32; m * q_dim]
+                    } else {
+                        Vec::new()
+                    };
+
+                    for t in 0..m {
+                        let q_slice = &mut queries[t * q_dim..(t + 1) * q_dim];
+                        if attn.has_q_gate {
+                            let (q_t, g_t) = split_q_gate_interleaved(
+                                &q_raw[t * q_dim * 2..(t + 1) * q_dim * 2],
+                                self.config.num_attention_heads,
+                                head_dim,
+                            );
+                            q_slice.copy_from_slice(&q_t);
+                            q_gates[t * q_dim..(t + 1) * q_dim].copy_from_slice(&g_t);
+                        } else {
+                            q_slice.copy_from_slice(&q_raw[t * q_dim..(t + 1) * q_dim]);
+                        }
+                        let k_slice = &mut keys[t * kv_dim..(t + 1) * kv_dim];
+                        if let Some(ref q_norm) = attn.attn_q_norm {
+                            rms_norm_heads_inplace(q_slice, self.config.num_attention_heads, head_dim, q_norm, eps);
+                        }
+                        if let Some(ref k_norm) = attn.attn_k_norm {
+                            rms_norm_heads_inplace(k_slice, self.config.num_key_value_heads, head_dim, k_norm, eps);
+                        }
+                        apply_rope_inplace(q_slice, self.config.num_attention_heads, head_dim, rope_dim, t, self.config.rope_theta);
+                        apply_rope_inplace(k_slice, self.config.num_key_value_heads, head_dim, rope_dim, t, self.config.rope_theta);
+                    }
+
+                    kv_cache.keys[layer_idx].extend_from_slice(&keys);
+                    kv_cache.values[layer_idx].extend_from_slice(&values);
+
+                    let mut attn_ctx_batch = Vec::with_capacity(m * q_dim);
+                    for t in 0..m {
+                        let q_slice = &queries[t * q_dim..(t + 1) * q_dim];
+                        let end_kv = (t + 1) * kv_dim;
+                        let mut ctx = attention_gqa(
+                            q_slice,
+                            &kv_cache.keys[layer_idx][..end_kv],
+                            &kv_cache.values[layer_idx][..end_kv],
+                            &self.config,
+                        );
+                        if attn.has_q_gate {
+                            let g_slice = &q_gates[t * q_dim..(t + 1) * q_dim];
+                            for (val, &g) in ctx.iter_mut().zip(g_slice.iter()) {
+                                *val *= sigmoid(g);
+                            }
+                        }
+                        attn_ctx_batch.extend_from_slice(&ctx);
+                    }
+
+                    let attn_proj = project_ternary_batch(backend, &attn_ctx_batch, &attn.attn_o, m, use_hadamard)?;
+                    add_residual(&mut hidden, &attn_proj);
                 }
-                if let Some(ref k_norm) = layer.attn_k_norm {
-                    rms_norm_heads_inplace(k_slice, self.config.num_key_value_heads, head_dim, k_norm, eps);
+                LayerBlock::GatedDeltaNet(gdn) => {
+                    let ssm_proj = self.run_gdn_sequence_cpu(&normed, gdn, layer_idx, m, kv_cache, backend)?;
+                    add_residual(&mut hidden, &ssm_proj);
                 }
-                apply_rope_inplace(q_slice, self.config.num_attention_heads, head_dim, t, self.config.rope_theta);
-                apply_rope_inplace(k_slice, self.config.num_key_value_heads, head_dim, t, self.config.rope_theta);
             }
-
-            kv_cache.keys[layer_idx].extend_from_slice(&keys);
-            kv_cache.values[layer_idx].extend_from_slice(&values);
-
-            let mut attn_ctx_batch = Vec::with_capacity(m * q_dim);
-            for t in 0..m {
-                let q_slice = &queries[t * q_dim..(t + 1) * q_dim];
-                let end_kv = (t + 1) * kv_dim;
-                let ctx = attention_gqa(
-                    q_slice,
-                    &kv_cache.keys[layer_idx][..end_kv],
-                    &kv_cache.values[layer_idx][..end_kv],
-                    &self.config,
-                );
-                attn_ctx_batch.extend_from_slice(&ctx);
-            }
-
-            let attn_proj = project_ternary_batch(backend, &attn_ctx_batch, &layer.attn_o, m, use_hadamard)?;
-            add_residual(&mut hidden, &attn_proj);
 
             let normed_ffn = rms_norm_batch(&hidden, &layer.ffn_norm, m, hidden_size, eps);
             let gate = project_ternary_batch(backend, &normed_ffn, &layer.ffn_gate, m, use_hadamard)?;
@@ -779,7 +1226,7 @@ impl TransformerModel {
         F: FnMut(usize) -> Result<(), String>,
     {
         let max_seq = prompt_tokens.len() + max_new_tokens;
-        let mut session = GpuSession::new(gpu, &self.config, self.layers.len(), max_seq, prompt_tokens.len())?;
+        let mut session = GpuSession::new(gpu, &self.config, &self.layers, max_seq, prompt_tokens.len())?;
         let mut rng = XorShift64::new(params.seed);
 
         let prefill_start = Instant::now();
@@ -906,9 +1353,6 @@ impl TransformerModel {
     ) -> Result<(), String> {
         let cfg = &self.config;
         let h = cfg.hidden_size;
-        let head_dim = cfg.head_dim();
-        let q_dim = cfg.num_attention_heads * head_dim;
-        let kv_dim = cfg.num_key_value_heads * head_dim;
         let eps = cfg.rms_norm_eps;
         let use_hadamard = cfg.use_hadamard;
 
@@ -917,20 +1361,52 @@ impl TransformerModel {
         } else {
             gpu.rms_norm_f16(&s.hidden, &layer.attn_norm, &mut s.normed, m, h, eps).map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_q.packed_weights, &layer.attn_q.scales_fp16, &mut s.q, m, q_dim, h, layer.attn_q.bits).map_err(|e| e.to_string())?;
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_k.packed_weights, &layer.attn_k.scales_fp16, &mut s.k, m, kv_dim, h, layer.attn_k.bits).map_err(|e| e.to_string())?;
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_v.packed_weights, &layer.attn_v.scales_fp16, &mut s.v, m, kv_dim, h, layer.attn_v.bits).map_err(|e| e.to_string())?;
 
-        gpu.rms_norm_heads_rope_f16(&mut s.q, layer.attn_q_norm.as_deref(), m, cfg.num_attention_heads, head_dim, start_pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
-        gpu.rms_norm_heads_rope_f16(&mut s.k, layer.attn_k_norm.as_deref(), m, cfg.num_key_value_heads, head_dim, start_pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
+        match &layer.block {
+            LayerBlock::Attention(attn) => {
+                self.forward_full_attention_gpu(gpu, s, attn, layer_idx, start_pos, m)
+            }
+            LayerBlock::GatedDeltaNet(gdn) => self.forward_gdn_gpu(gpu, s, gdn, layer_idx, m),
+        }
+    }
 
+    fn forward_full_attention_gpu<'a>(
+        &self,
+        gpu: &'a GpuBackend,
+        s: &mut GpuSession<'a>,
+        attn: &AttentionBlockWeights,
+        layer_idx: usize,
+        start_pos: usize,
+        m: usize,
+    ) -> Result<(), String> {
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let head_dim = cfg.head_dim();
+        let rope_dim = cfg.rope_dim();
+        let q_dim = cfg.num_attention_heads * head_dim;
+        let kv_dim = cfg.num_key_value_heads * head_dim;
+        let eps = cfg.rms_norm_eps;
+
+        if attn.has_q_gate {
+            gpu.matmul_ternary_f16_dev(&s.normed, &attn.attn_q.packed_weights, &attn.attn_q.scales_fp16, &mut s.gate, m, q_dim * 2, h, attn.attn_q.bits).map_err(|e| e.to_string())?;
+            gpu.deinterleave_q_gate_f16(&s.gate, &mut s.q, &mut s.up, m, cfg.num_attention_heads, head_dim).map_err(|e| e.to_string())?;
+        } else {
+            gpu.matmul_ternary_f16_dev(&s.normed, &attn.attn_q.packed_weights, &attn.attn_q.scales_fp16, &mut s.q, m, q_dim, h, attn.attn_q.bits).map_err(|e| e.to_string())?;
+        }
+        gpu.matmul_ternary_f16_dev(&s.normed, &attn.attn_k.packed_weights, &attn.attn_k.scales_fp16, &mut s.k, m, kv_dim, h, attn.attn_k.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &attn.attn_v.packed_weights, &attn.attn_v.scales_fp16, &mut s.v, m, kv_dim, h, attn.attn_v.bits).map_err(|e| e.to_string())?;
+
+        gpu.rms_norm_heads_rope_f16(&mut s.q, attn.attn_q_norm.as_deref(), m, cfg.num_attention_heads, head_dim, rope_dim, start_pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
+        gpu.rms_norm_heads_rope_f16(&mut s.k, attn.attn_k_norm.as_deref(), m, cfg.num_key_value_heads, head_dim, rope_dim, start_pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
+
+        let kv_offset = s.kv_layer_indices[layer_idx] * s.layer_kv_stride;
         gpu.kv_append_gqa_layer_f16(
             &s.q,
             &s.k,
             &s.v,
             &mut s.k_cache,
             &mut s.v_cache,
-            layer_idx * s.layer_kv_stride,
+            kv_offset,
             &mut s.attn_ctx,
             start_pos,
             m,
@@ -939,10 +1415,82 @@ impl TransformerModel {
             head_dim,
         ).map_err(|e| e.to_string())?;
 
-        if use_hadamard {
+        if attn.has_q_gate {
+            gpu.mul_sigmoid_inplace_f16(&mut s.attn_ctx, &s.up, m * q_dim).map_err(|e| e.to_string())?;
+        }
+        if cfg.use_hadamard {
             gpu.fwht128_inplace_f16(&mut s.attn_ctx, m, q_dim).map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_add_dev(&s.attn_ctx, &layer.attn_o.packed_weights, &layer.attn_o.scales_fp16, &mut s.hidden, m, h, q_dim, layer.attn_o.bits)
+        gpu.matmul_ternary_f16_add_dev(&s.attn_ctx, &attn.attn_o.packed_weights, &attn.attn_o.scales_fp16, &mut s.hidden, m, h, q_dim, attn.attn_o.bits)
+            .map_err(|e| e.to_string())
+    }
+
+    fn forward_gdn_gpu<'a>(
+        &self,
+        gpu: &'a GpuBackend,
+        s: &mut GpuSession<'a>,
+        gdn: &GatedDeltaNetWeights,
+        layer_idx: usize,
+        m: usize,
+    ) -> Result<(), String> {
+        let cfg = &self.config;
+        let h = cfg.hidden_size;
+        let ssm_head_dim = cfg.ssm_state_size;
+        let num_k_heads = cfg.ssm_group_count;
+        let num_v_heads = cfg.ssm_time_step_rank;
+        let kernel = cfg.ssm_conv_kernel;
+        let conv_channels = 2 * num_k_heads * ssm_head_dim + num_v_heads * ssm_head_dim;
+        let d_inner = num_v_heads * ssm_head_dim;
+        let gdn_idx = s.gdn_layer_indices[layer_idx];
+
+        gpu.matmul_ternary_f16_dev(&s.normed, &gdn.attn_qkv.packed_weights, &gdn.attn_qkv.scales_fp16, &mut s.gate, m, conv_channels, h, gdn.attn_qkv.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &gdn.attn_gate.packed_weights, &gdn.attn_gate.scales_fp16, &mut s.up, m, d_inner, h, gdn.attn_gate.bits).map_err(|e| e.to_string())?;
+        match &gdn.ssm_alpha {
+            LinearWeight::Ternary(t) => gpu.matmul_ternary_f16_dev(&s.normed, &t.packed_weights, &t.scales_fp16, &mut s.k, m, num_v_heads, h, t.bits).map_err(|e| e.to_string())?,
+            LinearWeight::DenseF16 { data, n_rows, k_cols } => gpu.matmul_dense_f16_dev(&s.normed, data, &mut s.k, m, *n_rows, *k_cols).map_err(|e| e.to_string())?,
+        }
+        match &gdn.ssm_beta {
+            LinearWeight::Ternary(t) => gpu.matmul_ternary_f16_dev(&s.normed, &t.packed_weights, &t.scales_fp16, &mut s.v, m, num_v_heads, h, t.bits).map_err(|e| e.to_string())?,
+            LinearWeight::DenseF16 { data, n_rows, k_cols } => gpu.matmul_dense_f16_dev(&s.normed, data, &mut s.v, m, *n_rows, *k_cols).map_err(|e| e.to_string())?,
+        }
+
+        for t in 0..m {
+            gpu.gdn_conv_silu_f16(
+                &s.gate,
+                t * conv_channels,
+                &gdn.ssm_conv1d,
+                &mut s.conv_state,
+                gdn_idx * s.conv_state_stride,
+                &mut s.q,
+                conv_channels,
+                kernel,
+            ).map_err(|e| e.to_string())?;
+            gpu.gdn_step_f16(
+                &s.q,
+                &s.k,
+                t * num_v_heads,
+                &s.v,
+                t * num_v_heads,
+                &gdn.ssm_a,
+                &gdn.ssm_dt_bias,
+                &gdn.ssm_norm,
+                &s.up,
+                t * d_inner,
+                &mut s.ssm_state,
+                gdn_idx * s.ssm_state_stride,
+                &mut s.attn_ctx,
+                t * d_inner,
+                num_k_heads,
+                num_v_heads,
+                ssm_head_dim,
+                cfg.rms_norm_eps,
+            ).map_err(|e| e.to_string())?;
+        }
+
+        if cfg.use_hadamard {
+            gpu.fwht128_inplace_f16(&mut s.attn_ctx, m, d_inner).map_err(|e| e.to_string())?;
+        }
+        gpu.matmul_ternary_f16_add_dev(&s.attn_ctx, &gdn.ssm_out.packed_weights, &gdn.ssm_out.scales_fp16, &mut s.hidden, m, h, d_inner, gdn.ssm_out.bits)
             .map_err(|e| e.to_string())
     }
 
@@ -1051,13 +1599,19 @@ struct GpuSession<'a> {
     k_cache: GpuBuffer<'a, u16>,
     v_cache: GpuBuffer<'a, u16>,
     layer_kv_stride: usize,
+    kv_layer_indices: Vec<usize>,
+    conv_state: GpuBuffer<'a, f32>,
+    ssm_state: GpuBuffer<'a, u16>,
+    conv_state_stride: usize,
+    ssm_state_stride: usize,
+    gdn_layer_indices: Vec<usize>,
 }
 
 impl<'a> GpuSession<'a> {
     fn new(
         gpu: &'a GpuBackend,
         cfg: &ModelConfig,
-        num_layers: usize,
+        layers: &[TernaryLayerWeights],
         max_seq: usize,
         max_batch: usize,
     ) -> Result<Self, String> {
@@ -1067,22 +1621,60 @@ impl<'a> GpuSession<'a> {
         let q_dim = cfg.num_attention_heads * head_dim;
         let kv_dim = cfg.num_key_value_heads * head_dim;
         let inter = cfg.intermediate_size;
+
+        let mut kv_layer_indices = vec![0usize; layers.len()];
+        let mut gdn_layer_indices = vec![0usize; layers.len()];
+        let mut num_attn_layers = 0usize;
+        let mut num_gdn_layers = 0usize;
+        for (idx, layer) in layers.iter().enumerate() {
+            match layer.block {
+                LayerBlock::Attention(_) => {
+                    kv_layer_indices[idx] = num_attn_layers;
+                    num_attn_layers += 1;
+                }
+                LayerBlock::GatedDeltaNet(_) => {
+                    gdn_layer_indices[idx] = num_gdn_layers;
+                    num_gdn_layers += 1;
+                }
+            }
+        }
+
         let layer_kv_stride = max_seq.max(1) * kv_dim;
-        let total_kv = num_layers.max(1) * layer_kv_stride;
+        let total_kv = num_attn_layers.max(1) * layer_kv_stride;
+
+        let conv_channels = 2 * cfg.ssm_group_count * cfg.ssm_state_size + cfg.ssm_inner_size;
+        let conv_hist = cfg.ssm_conv_kernel.saturating_sub(1);
+        let conv_state_stride = conv_channels * conv_hist;
+        let ssm_state_stride = cfg.ssm_time_step_rank * cfg.ssm_state_size * cfg.ssm_state_size;
+        let total_conv = (num_gdn_layers * conv_state_stride).max(1);
+        let total_ssm = (num_gdn_layers * ssm_state_stride).max(1);
+
+        let mut conv_state = gpu.alloc_f32(total_conv).map_err(|e| e.to_string())?;
+        let mut ssm_state = gpu.alloc_f16(total_ssm).map_err(|e| e.to_string())?;
+        if num_gdn_layers > 0 {
+            conv_state.upload_f32(&vec![0.0f32; total_conv]).map_err(|e| e.to_string())?;
+            ssm_state.upload_f32_as_f16(&vec![0.0f32; total_ssm]).map_err(|e| e.to_string())?;
+        }
 
         Ok(Self {
             hidden: gpu.alloc_f16(m * h).map_err(|e| e.to_string())?,
             normed: gpu.alloc_f16(m * h).map_err(|e| e.to_string())?,
-            q: gpu.alloc_f16(m * q_dim).map_err(|e| e.to_string())?,
-            k: gpu.alloc_f16(m * kv_dim).map_err(|e| e.to_string())?,
-            v: gpu.alloc_f16(m * kv_dim).map_err(|e| e.to_string())?,
-            attn_ctx: gpu.alloc_f16(m * q_dim).map_err(|e| e.to_string())?,
-            gate: gpu.alloc_f16(m * inter).map_err(|e| e.to_string())?,
-            up: gpu.alloc_f16(m * inter).map_err(|e| e.to_string())?,
+            q: gpu.alloc_f16(m * q_dim.max(conv_channels)).map_err(|e| e.to_string())?,
+            k: gpu.alloc_f16(m * kv_dim.max(cfg.ssm_time_step_rank)).map_err(|e| e.to_string())?,
+            v: gpu.alloc_f16(m * kv_dim.max(cfg.ssm_time_step_rank)).map_err(|e| e.to_string())?,
+            attn_ctx: gpu.alloc_f16(m * q_dim.max(cfg.ssm_inner_size)).map_err(|e| e.to_string())?,
+            gate: gpu.alloc_f16(m * inter.max(q_dim * 2).max(conv_channels)).map_err(|e| e.to_string())?,
+            up: gpu.alloc_f16(m * inter.max(q_dim).max(cfg.ssm_inner_size)).map_err(|e| e.to_string())?,
             logits: gpu.alloc_f32(cfg.vocab_size).map_err(|e| e.to_string())?,
             k_cache: gpu.alloc_f16(total_kv).map_err(|e| e.to_string())?,
             v_cache: gpu.alloc_f16(total_kv).map_err(|e| e.to_string())?,
             layer_kv_stride,
+            kv_layer_indices,
+            conv_state,
+            ssm_state,
+            conv_state_stride,
+            ssm_state_stride,
+            gdn_layer_indices,
         })
     }
 }
@@ -1105,17 +1697,21 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
             use_hadamard: true,
+            ..ModelConfig::default()
         };
 
         let layers = (0..config.num_hidden_layers)
             .map(|layer_idx| TernaryLayerWeights {
                 attn_norm: vec![1.0; config.hidden_size],
-                attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 1).unwrap(),
-                attn_k: build_synthetic_tensor(64, config.hidden_size, layer_idx + 2).unwrap(),
-                attn_v: build_synthetic_tensor(64, config.hidden_size, layer_idx + 3).unwrap(),
-                attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 4).unwrap(),
-                attn_q_norm: None,
-                attn_k_norm: None,
+                block: LayerBlock::Attention(AttentionBlockWeights {
+                    attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 1).unwrap(),
+                    attn_k: build_synthetic_tensor(64, config.hidden_size, layer_idx + 2).unwrap(),
+                    attn_v: build_synthetic_tensor(64, config.hidden_size, layer_idx + 3).unwrap(),
+                    attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 4).unwrap(),
+                    attn_q_norm: None,
+                    attn_k_norm: None,
+                    has_q_gate: false,
+                }),
                 ffn_norm: vec![1.0; config.hidden_size],
                 ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 5).unwrap(),
                 ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 6).unwrap(),
@@ -1157,16 +1753,20 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 10_000.0,
             use_hadamard: false,
+            ..ModelConfig::default()
         };
         let layers = (0..config.num_hidden_layers)
             .map(|layer_idx| TernaryLayerWeights {
                 attn_norm: vec![1.0; config.hidden_size],
-                attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 1).unwrap(),
-                attn_k: build_synthetic_tensor(64, config.hidden_size, layer_idx + 2).unwrap(),
-                attn_v: build_synthetic_tensor(64, config.hidden_size, layer_idx + 3).unwrap(),
-                attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 4).unwrap(),
-                attn_q_norm: Some(vec![1.0; 32]),
-                attn_k_norm: Some(vec![1.0; 32]),
+                block: LayerBlock::Attention(AttentionBlockWeights {
+                    attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 1).unwrap(),
+                    attn_k: build_synthetic_tensor(64, config.hidden_size, layer_idx + 2).unwrap(),
+                    attn_v: build_synthetic_tensor(64, config.hidden_size, layer_idx + 3).unwrap(),
+                    attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 4).unwrap(),
+                    attn_q_norm: Some(vec![1.0; 32]),
+                    attn_k_norm: Some(vec![1.0; 32]),
+                    has_q_gate: false,
+                }),
                 ffn_norm: vec![1.0; config.hidden_size],
                 ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 5).unwrap(),
                 ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 6).unwrap(),
@@ -1253,5 +1853,93 @@ mod tests {
             }
             assert!((q4_out[r] - expected).abs() < 1e-3, "q4 row {r}: {} vs {expected}", q4_out[r]);
         }
+    }
+
+    #[test]
+    fn qwen35_hybrid_batched_prefill_matches_sequential() {
+        let config = ModelConfig {
+            hidden_size: 128,
+            intermediate_size: 256,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 32,
+            rope_dim: 16,
+            ssm_conv_kernel: 4,
+            ssm_group_count: 2,
+            ssm_inner_size: 128,
+            ssm_state_size: 32,
+            ssm_time_step_rank: 4,
+            vocab_size: 256,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            use_hadamard: false,
+        };
+        let conv_channels = 2 * config.ssm_group_count * config.ssm_state_size + config.ssm_inner_size;
+        let gdn_layer = TernaryLayerWeights {
+            attn_norm: vec![1.0; config.hidden_size],
+            block: LayerBlock::GatedDeltaNet(GatedDeltaNetWeights {
+                attn_qkv: build_synthetic_tensor(conv_channels, config.hidden_size, 11).unwrap(),
+                attn_gate: build_synthetic_tensor(config.ssm_inner_size, config.hidden_size, 12).unwrap(),
+                ssm_conv1d: vec![0.25; conv_channels * config.ssm_conv_kernel],
+                ssm_alpha: LinearWeight::Ternary(build_synthetic_tensor(config.ssm_time_step_rank, config.hidden_size, 13).unwrap()),
+                ssm_beta: LinearWeight::Ternary(build_synthetic_tensor(config.ssm_time_step_rank, config.hidden_size, 14).unwrap()),
+                ssm_a: vec![-0.3; config.ssm_time_step_rank],
+                ssm_dt_bias: vec![0.1; config.ssm_time_step_rank],
+                ssm_norm: vec![1.0; config.ssm_state_size],
+                ssm_out: build_synthetic_tensor(config.hidden_size, config.ssm_inner_size, 15).unwrap(),
+            }),
+            ffn_norm: vec![1.0; config.hidden_size],
+            ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, 16).unwrap(),
+            ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, 17).unwrap(),
+            ffn_down: build_synthetic_tensor(config.hidden_size, config.intermediate_size, 18).unwrap(),
+        };
+        let attn_layer = TernaryLayerWeights {
+            attn_norm: vec![1.0; config.hidden_size],
+            block: LayerBlock::Attention(AttentionBlockWeights {
+                attn_q: build_synthetic_tensor(config.hidden_size * 2, config.hidden_size, 21).unwrap(),
+                attn_k: build_synthetic_tensor(64, config.hidden_size, 22).unwrap(),
+                attn_v: build_synthetic_tensor(64, config.hidden_size, 23).unwrap(),
+                attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, 24).unwrap(),
+                attn_q_norm: Some(vec![1.0; 32]),
+                attn_k_norm: Some(vec![1.0; 32]),
+                has_q_gate: true,
+            }),
+            ffn_norm: vec![1.0; config.hidden_size],
+            ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, 25).unwrap(),
+            ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, 26).unwrap(),
+            ffn_down: build_synthetic_tensor(config.hidden_size, config.intermediate_size, 27).unwrap(),
+        };
+        let model = TransformerModel {
+            token_embeddings: EmbeddingTable::F32(
+                (0..(config.vocab_size * config.hidden_size))
+                    .map(|idx| ((idx as f32) * 0.01).sin())
+                    .collect(),
+            ),
+            layers: vec![gdn_layer, attn_layer],
+            final_norm: vec![1.0; config.hidden_size],
+            lm_head: LmHead::TiedEmbedding,
+            config,
+        };
+
+        let backend = TmacCpuBackend::new();
+        let prompt = [2usize, 7, 19, 31];
+        let mut kv_batch = KvCache::new(model.layers.len());
+        let logits_batch = model.prefill_prompt(&prompt, &mut kv_batch, &backend).unwrap();
+
+        let mut kv_seq = KvCache::new(model.layers.len());
+        let mut logits_seq = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            logits_seq = model
+                .forward_token_internal(tok, pos, &mut kv_seq, &backend, pos + 1 == prompt.len())
+                .unwrap();
+        }
+
+        let max_diff = logits_batch
+            .iter()
+            .zip(logits_seq.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "max_diff={max_diff} >= 1e-4");
     }
 }

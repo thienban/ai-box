@@ -47,7 +47,7 @@ type FnMatmulTernaryF16ToF32Dev =
 type FnRmsNormF16 = unsafe extern "C" fn(*const u16, *const f32, *mut u16, c_int, c_int, f32) -> c_int;
 #[cfg(target_os = "linux")]
 type FnRmsNormHeadsRopeF16 =
-    unsafe extern "C" fn(*mut u16, *const f32, c_int, c_int, c_int, c_int, f32, f32) -> c_int;
+    unsafe extern "C" fn(*mut u16, *const f32, c_int, c_int, c_int, c_int, c_int, f32, f32) -> c_int;
 #[cfg(target_os = "linux")]
 type FnKvAppendGqaF16 = unsafe extern "C" fn(
     *const u16,
@@ -108,6 +108,33 @@ type FnMatmulTernary = unsafe extern "C" fn(
     c_int,
     c_int,
 ) -> c_int;
+#[cfg(target_os = "linux")]
+type FnDeinterleaveQGateF16 =
+    unsafe extern "C" fn(*const u16, *mut u16, *mut u16, c_int, c_int, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnMulSigmoidInplaceF16 = unsafe extern "C" fn(*mut u16, *const u16, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnGdnConvSiluF16 =
+    unsafe extern "C" fn(*const u16, *const f32, *mut f32, *mut u16, c_int, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnGdnStepF16 = unsafe extern "C" fn(
+    *const u16,
+    *const u16,
+    *const u16,
+    *const f32,
+    *const f32,
+    *const f32,
+    *const u16,
+    *mut u16,
+    *mut u16,
+    c_int,
+    c_int,
+    c_int,
+    f32,
+) -> c_int;
+#[cfg(target_os = "linux")]
+type FnMatmulDenseF16Dev =
+    unsafe extern "C" fn(*const u16, *const u16, *mut u16, c_int, c_int, c_int) -> c_int;
 
 #[cfg(target_os = "linux")]
 struct GpuWeightPair {
@@ -155,6 +182,11 @@ struct CudaSymbols {
     graph_end_capture: FnGraphCapture,
     graph_launch: FnGraphLaunch,
     matmul_ternary: FnMatmulTernary,
+    deinterleave_q_gate_f16: FnDeinterleaveQGateF16,
+    mul_sigmoid_inplace_f16: FnMulSigmoidInplaceF16,
+    gdn_conv_silu_f16: FnGdnConvSiluF16,
+    gdn_step_f16: FnGdnStepF16,
+    matmul_dense_f16_dev: FnMatmulDenseF16Dev,
 }
 
 #[cfg(target_os = "linux")]
@@ -225,6 +257,24 @@ impl<'a> GpuBuffer<'a, f32> {
         };
         check_cuda_status("cudaMemcpy D2H", status)
     }
+
+    pub fn upload_f32(&mut self, data: &[f32]) -> Result<(), BackendError> {
+        if data.len() > self.len {
+            return Err(BackendError::BufferLengthMismatch(format!(
+                "upload {} > GpuBuffer len {}",
+                data.len(),
+                self.len
+            )));
+        }
+        let status = unsafe {
+            (self.gpu.symbols.memcpy_h2d)(
+                self.ptr as *mut c_void,
+                data.as_ptr() as *const c_void,
+                std::mem::size_of_val(data),
+            )
+        };
+        check_cuda_status("cudaMemcpy H2D", status)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -284,6 +334,10 @@ impl<'a> GpuBuffer<'a, u16> {
 #[cfg(not(target_os = "linux"))]
 impl<'a> GpuBuffer<'a, f32> {
     pub fn download(&self, _out: &mut [f32]) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+
+    pub fn upload_f32(&mut self, _data: &[f32]) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
 }
@@ -407,6 +461,11 @@ impl GpuBackend {
                 graph_end_capture: load_symbol(handle, "aibox_gpu_graph_end_capture")?,
                 graph_launch: load_symbol(handle, "aibox_gpu_graph_launch")?,
                 matmul_ternary: load_symbol(handle, "aibox_gpu_matmul_ternary")?,
+                deinterleave_q_gate_f16: load_symbol(handle, "aibox_gpu_deinterleave_q_gate_f16")?,
+                mul_sigmoid_inplace_f16: load_symbol(handle, "aibox_gpu_mul_sigmoid_inplace_f16")?,
+                gdn_conv_silu_f16: load_symbol(handle, "aibox_gpu_gdn_conv_silu_f16")?,
+                gdn_step_f16: load_symbol(handle, "aibox_gpu_gdn_step_f16")?,
+                matmul_dense_f16_dev: load_symbol(handle, "aibox_gpu_matmul_dense_f16_dev")?,
             })
         })();
 
@@ -595,6 +654,7 @@ impl GpuBackend {
         m: usize,
         num_heads: usize,
         head_dim: usize,
+        rope_dim: usize,
         start_pos: usize,
         theta: f32,
         eps: f32,
@@ -610,12 +670,140 @@ impl GpuBackend {
                 m as c_int,
                 num_heads as c_int,
                 head_dim as c_int,
+                rope_dim as c_int,
                 start_pos as c_int,
                 theta,
                 eps,
             )
         };
         check_cuda_status("aibox_gpu_rms_norm_heads_rope_f16", status)
+    }
+
+    pub fn deinterleave_q_gate_f16(
+        &self,
+        q_full: &GpuBuffer<'_, u16>,
+        q_out: &mut GpuBuffer<'_, u16>,
+        gate_out: &mut GpuBuffer<'_, u16>,
+        m: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.deinterleave_q_gate_f16)(
+                q_full.as_ptr(),
+                q_out.as_mut_ptr(),
+                gate_out.as_mut_ptr(),
+                m as c_int,
+                num_heads as c_int,
+                head_dim as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_deinterleave_q_gate_f16", status)
+    }
+
+    pub fn mul_sigmoid_inplace_f16(
+        &self,
+        out: &mut GpuBuffer<'_, u16>,
+        gate: &GpuBuffer<'_, u16>,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe { (self.symbols.mul_sigmoid_inplace_f16)(out.as_mut_ptr(), gate.as_ptr(), len as c_int) };
+        check_cuda_status("aibox_gpu_mul_sigmoid_inplace_f16", status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv_silu_f16(
+        &self,
+        qkv_in: &GpuBuffer<'_, u16>,
+        qkv_in_offset: usize,
+        conv_w: &[f32],
+        conv_state: &mut GpuBuffer<'_, f32>,
+        conv_state_offset: usize,
+        qkv_out: &mut GpuBuffer<'_, u16>,
+        conv_channels: usize,
+        kernel: usize,
+    ) -> Result<(), BackendError> {
+        let dev_conv_w = self.get_or_upload_raw_f32(conv_w)?;
+        let status = unsafe {
+            (self.symbols.gdn_conv_silu_f16)(
+                qkv_in.as_ptr().add(qkv_in_offset),
+                dev_conv_w,
+                conv_state.as_mut_ptr().add(conv_state_offset),
+                qkv_out.as_mut_ptr(),
+                conv_channels as c_int,
+                kernel as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_gdn_conv_silu_f16", status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_step_f16(
+        &self,
+        qkv: &GpuBuffer<'_, u16>,
+        alpha: &GpuBuffer<'_, u16>,
+        alpha_offset: usize,
+        beta: &GpuBuffer<'_, u16>,
+        beta_offset: usize,
+        ssm_a: &[f32],
+        ssm_dt_bias: &[f32],
+        ssm_norm: &[f32],
+        z: &GpuBuffer<'_, u16>,
+        z_offset: usize,
+        ssm_state: &mut GpuBuffer<'_, u16>,
+        ssm_state_offset: usize,
+        out: &mut GpuBuffer<'_, u16>,
+        out_offset: usize,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        let dev_a = self.get_or_upload_raw_f32(ssm_a)?;
+        let dev_dt = self.get_or_upload_raw_f32(ssm_dt_bias)?;
+        let dev_norm = self.get_or_upload_raw_f32(ssm_norm)?;
+        let status = unsafe {
+            (self.symbols.gdn_step_f16)(
+                qkv.as_ptr(),
+                alpha.as_ptr().add(alpha_offset),
+                beta.as_ptr().add(beta_offset),
+                dev_a,
+                dev_dt,
+                dev_norm,
+                z.as_ptr().add(z_offset),
+                ssm_state.as_mut_ptr().add(ssm_state_offset),
+                out.as_mut_ptr().add(out_offset),
+                num_k_heads as c_int,
+                num_v_heads as c_int,
+                head_dim as c_int,
+                eps,
+            )
+        };
+        check_cuda_status("aibox_gpu_gdn_step_f16", status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_dense_f16_dev(
+        &self,
+        x: &GpuBuffer<'_, u16>,
+        w_f16: &[u16],
+        out: &mut GpuBuffer<'_, u16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        let dev_w = self.get_or_upload_raw_u16(w_f16)?;
+        let status = unsafe {
+            (self.symbols.matmul_dense_f16_dev)(
+                x.as_ptr(),
+                dev_w,
+                out.as_mut_ptr(),
+                m as c_int,
+                n as c_int,
+                k as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_matmul_dense_f16_dev", status)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -952,7 +1140,25 @@ impl GpuBackend {
         Err(linux_only_err())
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn rms_norm_heads_rope_f16(&self, _vec: &mut GpuBuffer<'_, u16>, _nw: Option<&[f32]>, _m: usize, _nh: usize, _hd: usize, _pos: usize, _theta: f32, _eps: f32) -> Result<(), BackendError> {
+    pub fn rms_norm_heads_rope_f16(&self, _vec: &mut GpuBuffer<'_, u16>, _nw: Option<&[f32]>, _m: usize, _nh: usize, _hd: usize, _rd: usize, _pos: usize, _theta: f32, _eps: f32) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn deinterleave_q_gate_f16(&self, _qf: &GpuBuffer<'_, u16>, _qo: &mut GpuBuffer<'_, u16>, _go: &mut GpuBuffer<'_, u16>, _m: usize, _nh: usize, _hd: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn mul_sigmoid_inplace_f16(&self, _out: &mut GpuBuffer<'_, u16>, _gate: &GpuBuffer<'_, u16>, _len: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv_silu_f16(&self, _qi: &GpuBuffer<'_, u16>, _qio: usize, _cw: &[f32], _cs: &mut GpuBuffer<'_, f32>, _cso: usize, _qo: &mut GpuBuffer<'_, u16>, _cc: usize, _k: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_step_f16(&self, _qkv: &GpuBuffer<'_, u16>, _a: &GpuBuffer<'_, u16>, _ao: usize, _b: &GpuBuffer<'_, u16>, _bo: usize, _sa: &[f32], _sdt: &[f32], _sn: &[f32], _z: &GpuBuffer<'_, u16>, _zo: usize, _ss: &mut GpuBuffer<'_, u16>, _sso: usize, _out: &mut GpuBuffer<'_, u16>, _oo: usize, _nkh: usize, _nvh: usize, _hd: usize, _eps: f32) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_dense_f16_dev(&self, _x: &GpuBuffer<'_, u16>, _w: &[u16], _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
     #[allow(clippy::too_many_arguments)]

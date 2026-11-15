@@ -142,13 +142,16 @@ def extract_model_config(reader: Any, max_layers: int | None) -> dict[str, Any]:
     intermediate_size = int(get_gguf_scalar(reader, [f"{arch}.feed_forward_length"], 17408))
     num_heads = int(get_gguf_scalar(reader, [f"{arch}.attention.head_count"], 40))
     num_kv_heads = int(get_gguf_scalar(reader, [f"{arch}.attention.head_count_kv"], num_heads))
+    head_dim = get_gguf_scalar(reader, [f"{arch}.attention.key_length"], None)
+    rope_dim = get_gguf_scalar(reader, [f"{arch}.rope.dimension_count"], None)
+    full_attn_interval = get_gguf_scalar(reader, [f"{arch}.full_attention_interval"], None)
     eps = float(get_gguf_scalar(reader, [f"{arch}.attention.layer_norm_rms_epsilon"], 1e-6))
     rope_theta = float(get_gguf_scalar(reader, [f"{arch}.rope.freq_base"], 10000.0))
 
     tokens_field = reader.fields.get("tokenizer.ggml.tokens")
     vocab_size = len(tokens_field.data) if tokens_field is not None else 151936
 
-    return {
+    cfg: dict[str, Any] = {
         "architecture": arch,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
@@ -159,6 +162,26 @@ def extract_model_config(reader: Any, max_layers: int | None) -> dict[str, Any]:
         "rms_norm_eps": eps,
         "rope_theta": rope_theta,
     }
+    if head_dim is not None:
+        cfg["head_dim"] = int(head_dim)
+    if rope_dim is not None:
+        cfg["rope_dim"] = int(rope_dim)
+    if full_attn_interval is not None:
+        cfg["full_attention_interval"] = int(full_attn_interval)
+
+    ssm_fields = {
+        "ssm_conv_kernel": f"{arch}.ssm.conv_kernel",
+        "ssm_group_count": f"{arch}.ssm.group_count",
+        "ssm_inner_size": f"{arch}.ssm.inner_size",
+        "ssm_state_size": f"{arch}.ssm.state_size",
+        "ssm_time_step_rank": f"{arch}.ssm.time_step_rank",
+    }
+    for out_key, gguf_key in ssm_fields.items():
+        val = get_gguf_scalar(reader, [gguf_key], None)
+        if val is not None:
+            cfg[out_key] = int(val)
+
+    return cfg
 
 
 def extract_minimal_tokenizer(reader: Any) -> dict[str, Any]:

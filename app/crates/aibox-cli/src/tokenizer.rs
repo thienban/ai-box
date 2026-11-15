@@ -81,18 +81,9 @@ impl SimpleTokenizer {
         self.eos_id
     }
 
-    /// Encode un texte par longest-match glouton (gère `Ġ` espace et `Ċ` retour ligne).
+    /// Encode un texte par longest-match glouton avec mapping GPT-2 byte-level UTF-8.
     pub fn encode(&self, text: &str) -> Vec<usize> {
-        let normalized: String = text
-            .chars()
-            .map(|ch| match ch {
-                ' ' => '\u{0120}',
-                '\n' => '\u{010A}',
-                other => other,
-            })
-            .collect();
-
-        let chars: Vec<char> = normalized.chars().collect();
+        let chars: Vec<char> = text.as_bytes().iter().copied().map(byte_to_gpt2_char).collect();
         let mut ids = Vec::new();
         let mut idx = 0usize;
 
@@ -299,4 +290,28 @@ mod tests {
 
         assert_eq!(tok.decode(&[0, 1, 2, 3]), "Bonjour ! 😊");
     }
+}
+
+const GPT2_BYTE_LUT: [char; 256] = {
+    let mut lut = ['\0'; 256];
+    let mut extra = 0u32;
+    let mut byte = 0usize;
+    while byte < 256 {
+        let is_direct = (byte >= 33 && byte <= 126)
+            || (byte >= 161 && byte <= 172)
+            || (byte >= 174 && byte <= 255);
+        if is_direct {
+            lut[byte] = char::from_u32(byte as u32).unwrap();
+        } else {
+            lut[byte] = char::from_u32(256 + extra).unwrap();
+            extra += 1;
+        }
+        byte += 1;
+    }
+    lut
+};
+
+#[inline]
+fn byte_to_gpt2_char(b: u8) -> char {
+    GPT2_BYTE_LUT[b as usize]
 }
