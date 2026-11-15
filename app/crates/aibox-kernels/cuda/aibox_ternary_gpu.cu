@@ -9,6 +9,8 @@
 #define PACKED_BYTES_PER_GROUP 32
 #define WARP_SIZE 32
 #define MAX_ATTN_SEQ 4096
+#define MAX_FUSED_RMS_DIM 8192
+#define ARGMAX_BLOCKS 128
 
 namespace {
 
@@ -20,6 +22,9 @@ struct ScratchBuffer {
 std::mutex g_scratch_mutex;
 ScratchBuffer g_dev_x;
 ScratchBuffer g_dev_out;
+ScratchBuffer g_dev_argmax_vals;
+ScratchBuffer g_dev_argmax_idxs;
+ScratchBuffer g_dev_argmax_out;
 
 bool ensure_scratch_capacity(ScratchBuffer& buf, size_t required_bytes) {
     if (required_bytes <= buf.capacity) {
@@ -108,6 +113,28 @@ static __device__ __forceinline__ float block_reduce_max(float val) {
     return s_max;
 }
 
+static __device__ __forceinline__ void fwht128_warp_inplace(float* warp_buf, int lane) {
+    for (int step = 1; step < GROUP_SIZE; step <<= 1) {
+        int mask = step - 1;
+        for (int pair = lane; pair < GROUP_SIZE / 2; pair += WARP_SIZE) {
+            int block_idx = (pair & ~mask) << 1;
+            int i0 = block_idx + (pair & mask);
+            int i1 = i0 + step;
+            float a = warp_buf[i0];
+            float b = warp_buf[i1];
+            warp_buf[i0] = a + b;
+            warp_buf[i1] = a - b;
+        }
+        __syncwarp();
+    }
+    const float inv_sqrt_128 = 0.08838834764831845f;
+    int base = lane * 4;
+    warp_buf[base + 0] *= inv_sqrt_128;
+    warp_buf[base + 1] *= inv_sqrt_128;
+    warp_buf[base + 2] *= inv_sqrt_128;
+    warp_buf[base + 3] *= inv_sqrt_128;
+}
+
 __global__ void fwht128_rows_kernel(float* __restrict__ x, int total_groups) {
     int group_idx = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
     if (group_idx >= total_groups) {
@@ -129,30 +156,17 @@ __global__ void fwht128_rows_kernel(float* __restrict__ x, int total_groups) {
     warp_buf[base + 3] = xv.w;
     __syncwarp();
 
-    for (int step = 1; step < GROUP_SIZE; step <<= 1) {
-        int mask = step - 1;
-        for (int pair = lane; pair < GROUP_SIZE / 2; pair += WARP_SIZE) {
-            int block_idx = (pair & ~mask) << 1;
-            int i0 = block_idx + (pair & mask);
-            int i1 = i0 + step;
-            float a = warp_buf[i0];
-            float b = warp_buf[i1];
-            warp_buf[i0] = a + b;
-            warp_buf[i1] = a - b;
-        }
-        __syncwarp();
-    }
+    fwht128_warp_inplace(warp_buf, lane);
 
-    const float inv_sqrt_128 = 0.08838834764831845f;
-    float4 outv = make_float4(
-        warp_buf[base + 0] * inv_sqrt_128,
-        warp_buf[base + 1] * inv_sqrt_128,
-        warp_buf[base + 2] * inv_sqrt_128,
-        warp_buf[base + 3] * inv_sqrt_128
+    *reinterpret_cast<float4*>(&x_group[base]) = make_float4(
+        warp_buf[base + 0],
+        warp_buf[base + 1],
+        warp_buf[base + 2],
+        warp_buf[base + 3]
     );
-    *reinterpret_cast<float4*>(&x_group[base]) = outv;
 }
 
+template <bool AddResidual>
 __global__ void ternary_gemv_kernel(
     const float* __restrict__ x,
     const uint8_t* __restrict__ w_packed,
@@ -213,7 +227,12 @@ __global__ void ternary_gemv_kernel(
     total += __shfl_down_sync(0xFFFFFFFF, total, 16);
     total += __shfl_down_sync(0xFFFFFFFF, total, 8);
     if (lane == 0) {
-        out[(size_t)row_m * n + row_n] = total;
+        size_t out_idx = (size_t)row_m * n + row_n;
+        if (AddResidual) {
+            out[out_idx] += total;
+        } else {
+            out[out_idx] = total;
+        }
     }
 }
 
@@ -375,6 +394,178 @@ __global__ void swiglu_inplace_kernel(float* __restrict__ gate, const float* __r
     }
 }
 
+__global__ void swiglu_fwht128_inplace_kernel(float* __restrict__ gate, const float* __restrict__ up, int total_groups) {
+    int group_idx = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    if (group_idx >= total_groups) {
+        return;
+    }
+
+    int warp_in_block = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    float* g_group = gate + (size_t)group_idx * GROUP_SIZE;
+    const float* u_group = up + (size_t)group_idx * GROUP_SIZE;
+
+    __shared__ float s_fwht[4][GROUP_SIZE];
+    float* warp_buf = s_fwht[warp_in_block];
+
+    int base = lane * 4;
+    float4 gv = *reinterpret_cast<const float4*>(&g_group[base]);
+    float4 uv = *reinterpret_cast<const float4*>(&u_group[base]);
+    warp_buf[base + 0] = (gv.x / (1.0f + expf(-gv.x))) * uv.x;
+    warp_buf[base + 1] = (gv.y / (1.0f + expf(-gv.y))) * uv.y;
+    warp_buf[base + 2] = (gv.z / (1.0f + expf(-gv.z))) * uv.z;
+    warp_buf[base + 3] = (gv.w / (1.0f + expf(-gv.w))) * uv.w;
+    __syncwarp();
+
+    fwht128_warp_inplace(warp_buf, lane);
+
+    *reinterpret_cast<float4*>(&g_group[base]) = make_float4(
+        warp_buf[base + 0],
+        warp_buf[base + 1],
+        warp_buf[base + 2],
+        warp_buf[base + 3]
+    );
+}
+
+__global__ void rms_norm_fwht128_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    int dim,
+    float eps
+) {
+    int row = blockIdx.x;
+    const float* x_row = x + (size_t)row * dim;
+    float* out_row = out + (size_t)row * dim;
+
+    __shared__ float s_row[MAX_FUSED_RMS_DIM];
+    int dim4 = dim >> 2;
+    const float4* x4 = reinterpret_cast<const float4*>(x_row);
+    const float4* w4 = reinterpret_cast<const float4*>(weight);
+    float4* s4 = reinterpret_cast<float4*>(s_row);
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim4; i += blockDim.x) {
+        float4 v = x4[i];
+        s4[i] = v;
+        local_sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+
+    float inv_rms = rsqrtf(block_reduce_sum(local_sum) / (float)dim + eps);
+    for (int i = threadIdx.x; i < dim4; i += blockDim.x) {
+        float4 v = s4[i];
+        float4 wv = w4[i];
+        s4[i] = make_float4(
+            v.x * inv_rms * wv.x,
+            v.y * inv_rms * wv.y,
+            v.z * inv_rms * wv.z,
+            v.w * inv_rms * wv.w
+        );
+    }
+    __syncthreads();
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int num_warps = blockDim.x / WARP_SIZE;
+    int num_groups = dim / GROUP_SIZE;
+    float4* o4 = reinterpret_cast<float4*>(out_row);
+
+    for (int g = warp_id; g < num_groups; g += num_warps) {
+        float* group_buf = &s_row[g * GROUP_SIZE];
+        fwht128_warp_inplace(group_buf, lane);
+        int base4 = (g * GROUP_SIZE) / 4 + lane;
+        o4[base4] = *reinterpret_cast<const float4*>(&group_buf[lane * 4]);
+    }
+}
+
+__global__ void argmax_stage1_kernel(
+    const float* __restrict__ logits,
+    int len,
+    float* __restrict__ block_vals,
+    uint32_t* __restrict__ block_idxs
+) {
+    __shared__ float s_val[8];
+    __shared__ uint32_t s_idx[8];
+
+    float best_v = -3.402823466e+38f;
+    uint32_t best_i = 0;
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < len; i += gridDim.x * blockDim.x) {
+        float v = logits[i];
+        if (v > best_v || (v == best_v && (uint32_t)i < best_i)) {
+            best_v = v;
+            best_i = (uint32_t)i;
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float ov = __shfl_down_sync(0xFFFFFFFF, best_v, offset);
+        uint32_t oi = __shfl_down_sync(0xFFFFFFFF, best_i, offset);
+        if (ov > best_v || (ov == best_v && oi < best_i)) {
+            best_v = ov;
+            best_i = oi;
+        }
+    }
+
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    if (lane == 0) {
+        s_val[warp_id] = best_v;
+        s_idx[warp_id] = best_i;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int num_warps = blockDim.x / WARP_SIZE;
+        float fv = s_val[0];
+        uint32_t fi = s_idx[0];
+        for (int w = 1; w < num_warps; ++w) {
+            if (s_val[w] > fv || (s_val[w] == fv && s_idx[w] < fi)) {
+                fv = s_val[w];
+                fi = s_idx[w];
+            }
+        }
+        block_vals[blockIdx.x] = fv;
+        block_idxs[blockIdx.x] = fi;
+    }
+}
+
+__global__ void argmax_stage2_kernel(
+    const float* __restrict__ block_vals,
+    const uint32_t* __restrict__ block_idxs,
+    int num_blocks,
+    uint32_t* __restrict__ out_idx
+) {
+    __shared__ float s_val[ARGMAX_BLOCKS];
+    __shared__ uint32_t s_idx[ARGMAX_BLOCKS];
+
+    int tid = threadIdx.x;
+    if (tid < num_blocks) {
+        s_val[tid] = block_vals[tid];
+        s_idx[tid] = block_idxs[tid];
+    } else {
+        s_val[tid] = -3.402823466e+38f;
+        s_idx[tid] = 0;
+    }
+    __syncthreads();
+
+    for (int stride = num_blocks / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float ov = s_val[tid + stride];
+            uint32_t oi = s_idx[tid + stride];
+            if (ov > s_val[tid] || (ov == s_val[tid] && oi < s_idx[tid])) {
+                s_val[tid] = ov;
+                s_idx[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *out_idx = s_idx[0];
+    }
+}
+
 __global__ void add_inplace_kernel(float* __restrict__ target, const float* __restrict__ delta, int len) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < len) {
@@ -526,7 +717,22 @@ int aibox_gpu_matmul_ternary_dev(
 ) {
     dim3 block(128);
     dim3 grid((n + 3) / 4, m);
-    ternary_gemv_kernel<<<grid, block>>>(dev_x, dev_w, dev_scales, dev_out, m, n, k);
+    ternary_gemv_kernel<false><<<grid, block>>>(dev_x, dev_w, dev_scales, dev_out, m, n, k);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_matmul_ternary_add_dev(
+    const float* dev_x,
+    const uint8_t* dev_w,
+    const uint16_t* dev_scales,
+    float* dev_out,
+    int m,
+    int n,
+    int k
+) {
+    dim3 block(128);
+    dim3 grid((n + 3) / 4, m);
+    ternary_gemv_kernel<true><<<grid, block>>>(dev_x, dev_w, dev_scales, dev_out, m, n, k);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
@@ -540,6 +746,25 @@ int aibox_gpu_rms_norm(
 ) {
     rms_norm_kernel<<<m, 256>>>(dev_x, dev_w, dev_out, dim, eps);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_rms_norm_fwht128(
+    const float* dev_x,
+    const float* dev_w,
+    float* dev_out,
+    int m,
+    int dim,
+    float eps
+) {
+    if (dim <= MAX_FUSED_RMS_DIM && (dim % GROUP_SIZE) == 0 && (dim & 3) == 0) {
+        rms_norm_fwht128_kernel<<<m, 256>>>(dev_x, dev_w, dev_out, dim, eps);
+        return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+    }
+    rms_norm_kernel<<<m, 256>>>(dev_x, dev_w, dev_out, dim, eps);
+    if (cudaGetLastError() != cudaSuccess) {
+        return -1;
+    }
+    return aibox_gpu_fwht128(dev_out, m, dim);
 }
 
 int aibox_gpu_rms_norm_heads_rope(
@@ -586,6 +811,44 @@ int aibox_gpu_swiglu_inplace(float* dev_gate, const float* dev_up, int len) {
     int blocks = (len + 255) / 256;
     swiglu_inplace_kernel<<<blocks, 256>>>(dev_gate, dev_up, len);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_swiglu_fwht128_inplace(float* dev_gate, const float* dev_up, int len) {
+    if ((len % GROUP_SIZE) == 0) {
+        int total_groups = len / GROUP_SIZE;
+        int blocks = (total_groups + 3) / 4;
+        swiglu_fwht128_inplace_kernel<<<blocks, 128>>>(dev_gate, dev_up, total_groups);
+        return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+    }
+    if (aibox_gpu_swiglu_inplace(dev_gate, dev_up, len) != 0) {
+        return -1;
+    }
+    return aibox_gpu_fwht128(dev_gate, 1, len);
+}
+
+int aibox_gpu_argmax_f32(const float* dev_logits, int len, uint32_t* host_out_idx) {
+    if (len <= 0 || host_out_idx == nullptr) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_scratch_mutex);
+    if (!ensure_scratch_capacity(g_dev_argmax_vals, ARGMAX_BLOCKS * sizeof(float))
+        || !ensure_scratch_capacity(g_dev_argmax_idxs, ARGMAX_BLOCKS * sizeof(uint32_t))
+        || !ensure_scratch_capacity(g_dev_argmax_out, sizeof(uint32_t))) {
+        return -1;
+    }
+    float* dev_vals = static_cast<float*>(g_dev_argmax_vals.ptr);
+    uint32_t* dev_idxs = static_cast<uint32_t*>(g_dev_argmax_idxs.ptr);
+    uint32_t* dev_out = static_cast<uint32_t*>(g_dev_argmax_out.ptr);
+
+    argmax_stage1_kernel<<<ARGMAX_BLOCKS, 256>>>(dev_logits, len, dev_vals, dev_idxs);
+    argmax_stage2_kernel<<<1, ARGMAX_BLOCKS>>>(dev_vals, dev_idxs, ARGMAX_BLOCKS, dev_out);
+    if (cudaGetLastError() != cudaSuccess) {
+        return -2;
+    }
+    if (cudaMemcpy(host_out_idx, dev_out, sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return -3;
+    }
+    return 0;
 }
 
 int aibox_gpu_add_inplace(float* dev_target, const float* dev_delta, int len) {

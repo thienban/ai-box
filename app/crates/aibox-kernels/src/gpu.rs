@@ -64,6 +64,8 @@ type FnLmHeadF16 = unsafe extern "C" fn(*const f32, *const u16, *mut f32, c_int,
 #[cfg(target_os = "linux")]
 type FnLmHeadF32 = unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
+type FnArgmaxF32 = unsafe extern "C" fn(*const f32, c_int, *mut u32) -> c_int;
+#[cfg(target_os = "linux")]
 type FnMatmulTernary = unsafe extern "C" fn(
     *const f32,
     *const u8,
@@ -103,13 +105,17 @@ struct CudaSymbols {
     memcpy_d2h: FnMemcpyD2H,
     fwht128: FnFwht128,
     matmul_ternary_dev: FnMatmulTernaryDev,
+    matmul_ternary_add_dev: FnMatmulTernaryDev,
     rms_norm: FnRmsNorm,
+    rms_norm_fwht128: FnRmsNorm,
     rms_norm_heads_rope: FnRmsNormHeadsRope,
     kv_append_gqa: FnKvAppendGqa,
     swiglu_inplace: FnSwigluInplace,
+    swiglu_fwht128_inplace: FnSwigluInplace,
     add_inplace: FnAddInplace,
     lm_head_f16: FnLmHeadF16,
     lm_head_f32: FnLmHeadF32,
+    argmax_f32: FnArgmaxF32,
     matmul_ternary: FnMatmulTernary,
 }
 
@@ -298,13 +304,17 @@ impl GpuBackend {
                 memcpy_d2h: load_symbol(handle, "aibox_gpu_memcpy_d2h")?,
                 fwht128: load_symbol(handle, "aibox_gpu_fwht128")?,
                 matmul_ternary_dev: load_symbol(handle, "aibox_gpu_matmul_ternary_dev")?,
+                matmul_ternary_add_dev: load_symbol(handle, "aibox_gpu_matmul_ternary_add_dev")?,
                 rms_norm: load_symbol(handle, "aibox_gpu_rms_norm")?,
+                rms_norm_fwht128: load_symbol(handle, "aibox_gpu_rms_norm_fwht128")?,
                 rms_norm_heads_rope: load_symbol(handle, "aibox_gpu_rms_norm_heads_rope")?,
                 kv_append_gqa: load_symbol(handle, "aibox_gpu_kv_append_gqa")?,
                 swiglu_inplace: load_symbol(handle, "aibox_gpu_swiglu_inplace")?,
+                swiglu_fwht128_inplace: load_symbol(handle, "aibox_gpu_swiglu_fwht128_inplace")?,
                 add_inplace: load_symbol(handle, "aibox_gpu_add_inplace")?,
                 lm_head_f16: load_symbol(handle, "aibox_gpu_lm_head_f16")?,
                 lm_head_f32: load_symbol(handle, "aibox_gpu_lm_head_f32")?,
+                argmax_f32: load_symbol(handle, "aibox_gpu_argmax_f32")?,
                 matmul_ternary: load_symbol(handle, "aibox_gpu_matmul_ternary")?,
             })
         })();
@@ -342,8 +352,10 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_fwht128", status)
     }
 
-    pub fn matmul_ternary_dev(
+    fn run_matmul_ternary_dev(
         &self,
+        op_name: &str,
+        func: FnMatmulTernaryDev,
         x: &GpuBuffer<'_>,
         packed_weights: &[u8],
         scales_fp16: &[u16],
@@ -354,7 +366,7 @@ impl GpuBackend {
     ) -> Result<(), BackendError> {
         let (dev_w, dev_scales) = self.get_or_upload_weights(packed_weights, scales_fp16)?;
         let status = unsafe {
-            (self.symbols.matmul_ternary_dev)(
+            func(
                 x.as_ptr(),
                 dev_w,
                 dev_scales,
@@ -364,7 +376,53 @@ impl GpuBackend {
                 k as c_int,
             )
         };
-        check_cuda_status("aibox_gpu_matmul_ternary_dev", status)
+        check_cuda_status(op_name, status)
+    }
+
+    pub fn matmul_ternary_dev(
+        &self,
+        x: &GpuBuffer<'_>,
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        out: &mut GpuBuffer<'_>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        self.run_matmul_ternary_dev(
+            "aibox_gpu_matmul_ternary_dev",
+            self.symbols.matmul_ternary_dev,
+            x,
+            packed_weights,
+            scales_fp16,
+            out,
+            m,
+            n,
+            k,
+        )
+    }
+
+    pub fn matmul_ternary_add_dev(
+        &self,
+        x: &GpuBuffer<'_>,
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        out: &mut GpuBuffer<'_>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        self.run_matmul_ternary_dev(
+            "aibox_gpu_matmul_ternary_add_dev",
+            self.symbols.matmul_ternary_add_dev,
+            x,
+            packed_weights,
+            scales_fp16,
+            out,
+            m,
+            n,
+            k,
+        )
     }
 
     pub fn rms_norm(
@@ -390,6 +448,30 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_rms_norm", status)
     }
 
+    pub fn rms_norm_fwht128(
+        &self,
+        x: &GpuBuffer<'_>,
+        weight: &[f32],
+        out: &mut GpuBuffer<'_>,
+        m: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        let dev_w = self.get_or_upload_raw_f32(weight)?;
+        let status = unsafe {
+            (self.symbols.rms_norm_fwht128)(
+                x.as_ptr(),
+                dev_w,
+                out.as_mut_ptr(),
+                m as c_int,
+                dim as c_int,
+                eps,
+            )
+        };
+        check_cuda_status("aibox_gpu_rms_norm_fwht128", status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn rms_norm_heads_rope(
         &self,
         vec: &mut GpuBuffer<'_>,
@@ -418,6 +500,7 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_rms_norm_heads_rope", status)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_append_gqa_layer(
         &self,
         q: &GpuBuffer<'_>,
@@ -457,6 +540,16 @@ impl GpuBackend {
     ) -> Result<(), BackendError> {
         let status = unsafe { (self.symbols.swiglu_inplace)(gate.as_mut_ptr(), up.as_ptr(), len as c_int) };
         check_cuda_status("aibox_gpu_swiglu_inplace", status)
+    }
+
+    pub fn swiglu_fwht128_inplace(
+        &self,
+        gate: &mut GpuBuffer<'_>,
+        up: &GpuBuffer<'_>,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe { (self.symbols.swiglu_fwht128_inplace)(gate.as_mut_ptr(), up.as_ptr(), len as c_int) };
+        check_cuda_status("aibox_gpu_swiglu_fwht128_inplace", status)
     }
 
     pub fn add_inplace(
@@ -509,6 +602,13 @@ impl GpuBackend {
             )
         };
         check_cuda_status("aibox_gpu_lm_head_f32", status)
+    }
+
+    pub fn argmax_f32(&self, logits_dev: &GpuBuffer<'_>, len: usize) -> Result<usize, BackendError> {
+        let mut best_idx: u32 = 0;
+        let status = unsafe { (self.symbols.argmax_f32)(logits_dev.as_ptr(), len as c_int, &mut best_idx) };
+        check_cuda_status("aibox_gpu_argmax_f32", status)?;
+        Ok(best_idx as usize)
     }
 
     fn get_or_upload_raw_bytes(&self, host_ptr: *const c_void, byte_len: usize) -> Result<*mut c_void, BackendError> {
@@ -610,6 +710,18 @@ impl GpuBackend {
     ) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
+    pub fn matmul_ternary_add_dev(
+        &self,
+        _x: &GpuBuffer<'_>,
+        _packed_weights: &[u8],
+        _scales_fp16: &[u16],
+        _out: &mut GpuBuffer<'_>,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
     pub fn rms_norm(
         &self,
         _x: &GpuBuffer<'_>,
@@ -621,6 +733,18 @@ impl GpuBackend {
     ) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
+    pub fn rms_norm_fwht128(
+        &self,
+        _x: &GpuBuffer<'_>,
+        _weight: &[f32],
+        _out: &mut GpuBuffer<'_>,
+        _m: usize,
+        _dim: usize,
+        _eps: f32,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
     pub fn rms_norm_heads_rope(
         &self,
         _vec: &mut GpuBuffer<'_>,
@@ -653,6 +777,9 @@ impl GpuBackend {
     pub fn swiglu_inplace(&self, _gate: &mut GpuBuffer<'_>, _up: &GpuBuffer<'_>, _len: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
+    pub fn swiglu_fwht128_inplace(&self, _gate: &mut GpuBuffer<'_>, _up: &GpuBuffer<'_>, _len: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
     pub fn add_inplace(&self, _target: &mut GpuBuffer<'_>, _delta: &GpuBuffer<'_>, _len: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
@@ -660,6 +787,9 @@ impl GpuBackend {
         Err(linux_only_err())
     }
     pub fn lm_head_f32(&self, _hidden: &GpuBuffer<'_>, _emb_f32: &[f32], _logits_dev: &mut GpuBuffer<'_>, _v: usize, _h: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn argmax_f32(&self, _logits_dev: &GpuBuffer<'_>, _len: usize) -> Result<usize, BackendError> {
         Err(linux_only_err())
     }
 }
