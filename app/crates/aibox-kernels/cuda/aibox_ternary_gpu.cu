@@ -33,9 +33,26 @@ ScratchBuffer g_dev_cand_count;
 
 cudaStream_t g_active_stream = nullptr;
 cudaStream_t g_graph_stream = nullptr;
+ScratchBuffer g_pinned_hidden;
 int* g_dev_pos = nullptr;
 cudaGraph_t g_decode_graph = nullptr;
 cudaGraphExec_t g_decode_graph_exec = nullptr;
+
+bool ensure_pinned_hidden(size_t required_bytes) {
+    if (required_bytes <= g_pinned_hidden.capacity) {
+        return true;
+    }
+    if (g_pinned_hidden.ptr != nullptr) {
+        cudaFreeHost(g_pinned_hidden.ptr);
+        g_pinned_hidden.ptr = nullptr;
+        g_pinned_hidden.capacity = 0;
+    }
+    if (cudaHostAlloc(&g_pinned_hidden.ptr, required_bytes, cudaHostAllocDefault) != cudaSuccess) {
+        return false;
+    }
+    g_pinned_hidden.capacity = required_bytes;
+    return true;
+}
 
 bool ensure_scratch_capacity(ScratchBuffer& buf, size_t required_bytes) {
     if (required_bytes <= buf.capacity) {
@@ -1678,10 +1695,16 @@ int aibox_gpu_graph_launch(
     if (pos + 1 > MAX_ATTN_SEQ) {
         return -2;
     }
+    size_t hidden_bytes = (size_t)hidden_len * sizeof(uint16_t);
+    const void* src_hidden = host_hidden_f16;
+    if (ensure_pinned_hidden(hidden_bytes)) {
+        memcpy(g_pinned_hidden.ptr, host_hidden_f16, hidden_bytes);
+        src_hidden = g_pinned_hidden.ptr;
+    }
     if (cudaMemcpyAsync(
             dev_hidden,
-            host_hidden_f16,
-            (size_t)hidden_len * sizeof(uint16_t),
+            src_hidden,
+            hidden_bytes,
             cudaMemcpyHostToDevice,
             g_graph_stream
         ) != cudaSuccess) {
