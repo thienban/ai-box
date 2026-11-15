@@ -226,6 +226,14 @@ pub fn rms_norm(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         .collect()
 }
 
+fn rms_norm_batch(input: &[f32], weight: &[f32], m: usize, dim: usize, eps: f32) -> Vec<f32> {
+    let mut out = Vec::with_capacity(m * dim);
+    for t in 0..m {
+        out.extend_from_slice(&rms_norm(&input[t * dim..(t + 1) * dim], weight, eps));
+    }
+    out
+}
+
 pub fn apply_rope_inplace(
     vec: &mut [f32],
     num_heads: usize,
@@ -253,12 +261,22 @@ fn project_ternary(
     tensor: &TernaryTensor,
     use_hadamard: bool,
 ) -> Result<Vec<f32>, String> {
+    project_ternary_batch(backend, input, tensor, 1, use_hadamard)
+}
+
+fn project_ternary_batch(
+    backend: &dyn TernaryHadamardBackend,
+    input: &[f32],
+    tensor: &TernaryTensor,
+    m: usize,
+    use_hadamard: bool,
+) -> Result<Vec<f32>, String> {
     backend
         .matmul_ternary(
             input,
             &tensor.packed_weights,
             &tensor.scales_fp16,
-            1,
+            m,
             tensor.n_rows,
             tensor.k_cols,
             use_hadamard,
@@ -531,13 +549,86 @@ impl TransformerModel {
         kv_cache: &mut KvCache,
         backend: &dyn TernaryHadamardBackend,
     ) -> Result<Vec<f32>, String> {
-        let last_idx = prompt_tokens.len() - 1;
-        let mut last_logits = Vec::new();
-        for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            let need_logits = pos == last_idx;
-            last_logits = self.forward_token_internal(tok, pos, kv_cache, backend, need_logits)?;
+        let m = prompt_tokens.len();
+        if m == 1 {
+            return self.forward_token_internal(prompt_tokens[0], 0, kv_cache, backend, true);
         }
-        Ok(last_logits)
+
+        let hidden_size = self.config.hidden_size;
+        let head_dim = self.config.head_dim();
+        let q_dim = self.config.num_attention_heads * head_dim;
+        let kv_dim = self.config.num_key_value_heads * head_dim;
+        let use_hadamard = self.config.use_hadamard;
+        let eps = self.config.rms_norm_eps;
+
+        let mut hidden = Vec::with_capacity(m * hidden_size);
+        for &tok in prompt_tokens {
+            if tok >= self.config.vocab_size {
+                return Err(format!("token_id {tok} >= vocab_size {}", self.config.vocab_size));
+            }
+            hidden.extend_from_slice(&self.token_embeddings.read_row(tok, hidden_size));
+        }
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let normed = rms_norm_batch(&hidden, &layer.attn_norm, m, hidden_size, eps);
+            let mut queries = project_ternary_batch(backend, &normed, &layer.attn_q, m, use_hadamard)?;
+            let mut keys = project_ternary_batch(backend, &normed, &layer.attn_k, m, use_hadamard)?;
+            let values = project_ternary_batch(backend, &normed, &layer.attn_v, m, use_hadamard)?;
+
+            for t in 0..m {
+                let q_slice = &mut queries[t * q_dim..(t + 1) * q_dim];
+                let k_slice = &mut keys[t * kv_dim..(t + 1) * kv_dim];
+                if let Some(ref q_norm) = layer.attn_q_norm {
+                    rms_norm_heads_inplace(q_slice, self.config.num_attention_heads, head_dim, q_norm, eps);
+                }
+                if let Some(ref k_norm) = layer.attn_k_norm {
+                    rms_norm_heads_inplace(k_slice, self.config.num_key_value_heads, head_dim, k_norm, eps);
+                }
+                apply_rope_inplace(q_slice, self.config.num_attention_heads, head_dim, t, self.config.rope_theta);
+                apply_rope_inplace(k_slice, self.config.num_key_value_heads, head_dim, t, self.config.rope_theta);
+            }
+
+            kv_cache.keys[layer_idx].extend_from_slice(&keys);
+            kv_cache.values[layer_idx].extend_from_slice(&values);
+
+            let mut attn_ctx_batch = Vec::with_capacity(m * q_dim);
+            for t in 0..m {
+                let q_slice = &queries[t * q_dim..(t + 1) * q_dim];
+                let end_kv = (t + 1) * kv_dim;
+                let ctx = attention_gqa(
+                    q_slice,
+                    &kv_cache.keys[layer_idx][..end_kv],
+                    &kv_cache.values[layer_idx][..end_kv],
+                    &self.config,
+                );
+                attn_ctx_batch.extend_from_slice(&ctx);
+            }
+
+            let attn_proj = project_ternary_batch(backend, &attn_ctx_batch, &layer.attn_o, m, use_hadamard)?;
+            add_residual(&mut hidden, &attn_proj);
+
+            let normed_ffn = rms_norm_batch(&hidden, &layer.ffn_norm, m, hidden_size, eps);
+            let gate = project_ternary_batch(backend, &normed_ffn, &layer.ffn_gate, m, use_hadamard)?;
+            let up = project_ternary_batch(backend, &normed_ffn, &layer.ffn_up, m, use_hadamard)?;
+            let swiglu: Vec<f32> = gate
+                .iter()
+                .zip(up.iter())
+                .map(|(&g, &u)| silu(g) * u)
+                .collect();
+            let ffn_out = project_ternary_batch(backend, &swiglu, &layer.ffn_down, m, use_hadamard)?;
+            add_residual(&mut hidden, &ffn_out);
+        }
+
+        let last_hidden = &hidden[(m - 1) * hidden_size..m * hidden_size];
+        let final_hidden = rms_norm(last_hidden, &self.final_norm, eps);
+        match &self.lm_head {
+            LmHead::Ternary(tensor) => project_ternary(backend, &final_hidden, tensor, use_hadamard),
+            LmHead::TiedEmbedding => Ok(self.token_embeddings.dot_all_rows(
+                &final_hidden,
+                self.config.vocab_size,
+                hidden_size,
+            )),
+        }
     }
 
     pub fn generate_tokens(
@@ -658,5 +749,67 @@ mod tests {
 
         assert_eq!(stats.tokens.len(), 4);
         assert!(stats.tokens.iter().all(|&tok| tok < 256));
+    }
+
+    #[test]
+    fn batched_prefill_matches_sequential_prefill() {
+        let config = ModelConfig {
+            hidden_size: 128,
+            intermediate_size: 256,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 32,
+            vocab_size: 256,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            use_hadamard: false,
+        };
+        let layers = (0..config.num_hidden_layers)
+            .map(|layer_idx| TernaryLayerWeights {
+                attn_norm: vec![1.0; config.hidden_size],
+                attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 1).unwrap(),
+                attn_k: build_synthetic_tensor(64, config.hidden_size, layer_idx + 2).unwrap(),
+                attn_v: build_synthetic_tensor(64, config.hidden_size, layer_idx + 3).unwrap(),
+                attn_o: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 4).unwrap(),
+                attn_q_norm: Some(vec![1.0; 32]),
+                attn_k_norm: Some(vec![1.0; 32]),
+                ffn_norm: vec![1.0; config.hidden_size],
+                ffn_gate: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 5).unwrap(),
+                ffn_up: build_synthetic_tensor(config.intermediate_size, config.hidden_size, layer_idx + 6).unwrap(),
+                ffn_down: build_synthetic_tensor(config.hidden_size, config.intermediate_size, layer_idx + 7).unwrap(),
+            })
+            .collect();
+        let model = TransformerModel {
+            token_embeddings: EmbeddingTable::F32(
+                (0..(config.vocab_size * config.hidden_size))
+                    .map(|idx| ((idx as f32) * 0.01).sin())
+                    .collect(),
+            ),
+            layers,
+            final_norm: vec![1.0; config.hidden_size],
+            lm_head: LmHead::TiedEmbedding,
+            config,
+        };
+
+        let backend = TmacCpuBackend::new();
+        let prompt = [3usize, 11, 27, 42];
+        let mut kv_batch = KvCache::new(model.layers.len());
+        let logits_batch = model.prefill_prompt(&prompt, &mut kv_batch, &backend).unwrap();
+
+        let mut kv_seq = KvCache::new(model.layers.len());
+        let mut logits_seq = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            logits_seq = model
+                .forward_token_internal(tok, pos, &mut kv_seq, &backend, pos + 1 == prompt.len())
+                .unwrap();
+        }
+
+        let max_diff = logits_batch
+            .iter()
+            .zip(logits_seq.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "max_diff={max_diff} >= 1e-4");
     }
 }

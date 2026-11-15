@@ -165,36 +165,64 @@ unsafe fn matmul_avx2_dispatch(
         .map(|count| count.get())
         .unwrap_or(1);
 
-    for row_m in 0..m {
-        let x_row = &rotated_x[row_m * k..(row_m + 1) * k];
-        let out_row = &mut output[row_m * n..(row_m + 1) * n];
-        let group_luts: Vec<GroupLuts> = (0..groups_per_row)
-            .map(|group_idx| build_group_luts(&x_row[group_idx * GROUP_SIZE..(group_idx + 1) * GROUP_SIZE]))
-            .collect();
+    let all_luts: Vec<Vec<GroupLuts>> = (0..m)
+        .map(|row_m| {
+            let x_row = &rotated_x[row_m * k..(row_m + 1) * k];
+            (0..groups_per_row)
+                .map(|g| build_group_luts(&x_row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE]))
+                .collect()
+        })
+        .collect();
 
-        if n < TILE_N * 2 || num_threads <= 1 {
-            process_row_chunk_avx2(x_row, &group_luts, packed_weights, scales_fp16, out_row, 0);
-            continue;
+    if n < TILE_N * 2 || num_threads <= 1 {
+        for row_m in 0..m {
+            let x_row = &rotated_x[row_m * k..(row_m + 1) * k];
+            let out_row = &mut output[row_m * n..(row_m + 1) * n];
+            process_row_chunk_avx2(x_row, &all_luts[row_m], packed_weights, scales_fp16, out_row, 0);
         }
+        return;
+    }
 
-        let chunk_rows = n.div_ceil(TILE_N).div_ceil(num_threads) * TILE_N;
-        let luts_ref = &group_luts;
+    let chunk_rows = n.div_ceil(TILE_N).div_ceil(num_threads) * TILE_N;
+    let num_chunks = n.div_ceil(chunk_rows);
+    let mut thread_outputs: Vec<Vec<f32>> = (0..num_chunks)
+        .map(|chunk_idx| {
+            let start = chunk_idx * chunk_rows;
+            let len = (n - start).min(chunk_rows);
+            vec![0.0f32; m * len]
+        })
+        .collect();
 
-        std::thread::scope(|scope| {
-            for (chunk_idx, out_chunk) in out_row.chunks_mut(chunk_rows).enumerate() {
-                let row_start = chunk_idx * chunk_rows;
-                scope.spawn(move || {
+    let luts_ref = &all_luts;
+    std::thread::scope(|scope| {
+        for (chunk_idx, chunk_buf) in thread_outputs.iter_mut().enumerate() {
+            let row_start = chunk_idx * chunk_rows;
+            let chunk_len = (n - row_start).min(chunk_rows);
+            scope.spawn(move || {
+                for row_m in 0..m {
+                    let x_row = &rotated_x[row_m * k..(row_m + 1) * k];
+                    let out_slice = &mut chunk_buf[row_m * chunk_len..(row_m + 1) * chunk_len];
                     process_row_chunk_avx2(
                         x_row,
-                        luts_ref,
+                        &luts_ref[row_m],
                         packed_weights,
                         scales_fp16,
-                        out_chunk,
+                        out_slice,
                         row_start,
                     );
-                });
-            }
-        });
+                }
+            });
+        }
+    });
+
+    for (chunk_idx, chunk_buf) in thread_outputs.iter().enumerate() {
+        let row_start = chunk_idx * chunk_rows;
+        let chunk_len = (n - row_start).min(chunk_rows);
+        for row_m in 0..m {
+            let src = &chunk_buf[row_m * chunk_len..(row_m + 1) * chunk_len];
+            let dst = &mut output[row_m * n + row_start..row_m * n + row_start + chunk_len];
+            dst.copy_from_slice(src);
+        }
     }
 }
 
