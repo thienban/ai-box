@@ -51,12 +51,23 @@ def pack_ternary_2bit_rows(w_ternary: torch.Tensor) -> np.ndarray:
     return packed.cpu().numpy()
 
 
-def quantize_hadamard_ternary(
+def pack_binary_1bit_rows(w_binary: torch.Tensor) -> np.ndarray:
+    """Compacte [N, K] de {-1, +1} en [N, K // 8] uint8 (8 poids/octet LSB-first: 1=+1, 0=-1)."""
+    n_rows, k_cols = w_binary.shape
+    bits = (w_binary > 0).to(torch.uint8).reshape(n_rows, k_cols // 8, 8)
+    packed = bits[..., 0]
+    for b in range(1, 8):
+        packed = packed | (bits[..., b] << b)
+    return packed.cpu().numpy()
+
+
+def quantize_hadamard(
     weight_f32: np.ndarray,
     h_128: torch.Tensor,
     device: torch.device,
+    bits: int = 2,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Applique H_128, quantifie en {-1, 0, +1} par groupes de 128 et packe en 2-bit."""
+    """Applique H_128, quantifie en 1-bit {-1, +1} ou 2-bit {-1, 0, +1} par groupes de 128."""
     w = torch.from_numpy(weight_f32).to(device=device, dtype=torch.float32)
     n_rows, k_cols = w.shape
     if k_cols % GROUP_SIZE != 0:
@@ -65,9 +76,14 @@ def quantize_hadamard_ternary(
     w_groups = w.reshape(n_rows, k_cols // GROUP_SIZE, GROUP_SIZE)
     w_rot = w_groups @ h_128
     scales = w_rot.abs().mean(dim=-1).clamp(min=1e-6)
-    w_ternary = torch.clamp(torch.round(w_rot / scales.unsqueeze(-1)), -1.0, 1.0)
 
-    packed_u8 = pack_ternary_2bit_rows(w_ternary.reshape(n_rows, k_cols))
+    if bits == 1:
+        w_binary = torch.where(w_rot >= 0.0, 1.0, -1.0)
+        packed_u8 = pack_binary_1bit_rows(w_binary.reshape(n_rows, k_cols))
+    else:
+        w_ternary = torch.clamp(torch.round(w_rot / scales.unsqueeze(-1)), -1.0, 1.0)
+        packed_u8 = pack_ternary_2bit_rows(w_ternary.reshape(n_rows, k_cols))
+
     scales_f16 = scales.to(torch.float16).cpu().numpy()
     return packed_u8, scales_f16
 
@@ -159,6 +175,18 @@ def dequantize_q1_0(data: np.ndarray, target_dtype: Any = np.float32) -> np.ndar
     return (signs * scales).astype(target_dtype).reshape(out_shape)
 
 
+def q1_0_to_binary_1bit(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Copie directe GGUF Q1_0 vers le format natif 1-bit AI Box (16 octets/groupe) + scales FP16."""
+    raw = np.ascontiguousarray(data.view(np.uint8))
+    n_rows = raw.shape[0]
+    n_groups = raw.shape[1] // 18
+    blocks = raw.reshape(n_rows, n_groups, 18)
+
+    scales_f16 = np.ascontiguousarray(blocks[:, :, :2]).view(np.float16).reshape(n_rows, n_groups)
+    packed_u8 = np.ascontiguousarray(blocks[:, :, 2:]).reshape(n_rows, n_groups * 16)
+    return packed_u8, scales_f16
+
+
 def q1_0_to_ternary_2bit(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Convertit GGUF Q1_0 sans perte vers le format 2-bit AI Box (1->+1, 3->-1) + scales FP16."""
     raw = np.ascontiguousarray(data.view(np.uint8))
@@ -180,7 +208,13 @@ def dequantize_tensor(tensor: Any, gguf_mod: Any, target_dtype: Any = np.float32
     return gguf_mod.quants.dequantize(tensor.data, tensor.tensor_type).astype(target_dtype)
 
 
-def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None, force_hadamard: bool = False) -> None:
+def convert_gguf(
+    gguf_path: Path,
+    out_dir: Path,
+    max_layers: int | None,
+    force_hadamard: bool = False,
+    bits: int = 2,
+) -> None:
     import gguf
     from safetensors.numpy import save_file
 
@@ -200,8 +234,8 @@ def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None, force_h
     with open(out_dir / "quant_config.json", "w", encoding="utf-8") as f:
         json.dump(
             {
-                "bits": 2,
-                "format": "ternary_2bit",
+                "bits": bits,
+                "format": "binary_1bit" if bits == 1 else "ternary_2bit",
                 "group_size": GROUP_SIZE,
                 "hadamard": use_hadamard,
             },
@@ -221,14 +255,17 @@ def convert_gguf(gguf_path: Path, out_dir: Path, max_layers: int | None, force_h
 
         if is_ternary:
             if not use_hadamard and getattr(tensor.tensor_type, "name", "") == "Q1_0":
-                packed_u8, scales_f16 = q1_0_to_ternary_2bit(tensor.data)
+                if bits == 1:
+                    packed_u8, scales_f16 = q1_0_to_binary_1bit(tensor.data)
+                else:
+                    packed_u8, scales_f16 = q1_0_to_ternary_2bit(tensor.data)
             else:
                 dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
-                packed_u8, scales_f16 = quantize_hadamard_ternary(dequant, h_128, device)
+                packed_u8, scales_f16 = quantize_hadamard(dequant, h_128, device, bits=bits)
             scale_name = target_name.removesuffix(".weight") + ".scales"
             tensors_out[target_name] = packed_u8
             tensors_out[scale_name] = scales_f16
-            print(f"  [2-bit] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
+            print(f"  [{bits}-bit] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
         else:
             dequant_f16 = dequantize_tensor(tensor, gguf, target_dtype=np.float16)
             tensors_out[target_name] = dequant_f16
@@ -253,8 +290,21 @@ def main() -> None:
         action="store_true",
         help="Forcer la rotation Hadamard + re-quantification même sur Q1_0",
     )
+    parser.add_argument(
+        "--bits",
+        type=int,
+        choices=[1, 2],
+        default=2,
+        help="Largeur des poids quantifiés (1=binaire {-1,+1}, 2=ternaire {-1,0,+1})",
+    )
     args = parser.parse_args()
-    convert_gguf(args.gguf, args.out, args.max_layers, force_hadamard=args.force_hadamard)
+    convert_gguf(
+        args.gguf,
+        args.out,
+        args.max_layers,
+        force_hadamard=args.force_hadamard,
+        bits=args.bits,
+    )
 
 
 if __name__ == "__main__":

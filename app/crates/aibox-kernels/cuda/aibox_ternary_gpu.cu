@@ -7,6 +7,7 @@
 
 #define GROUP_SIZE 128
 #define PACKED_BYTES_PER_GROUP 32
+#define BINARY_PACKED_BYTES_PER_GROUP 16
 #define WARP_SIZE 32
 #define MAX_ATTN_SEQ 4096
 #define MAX_FUSED_RMS_DIM 8192
@@ -383,7 +384,17 @@ __global__ void fwht128_rows_f16_kernel(__half* __restrict__ x, int total_groups
     *reinterpret_cast<uint2*>(&x_group[base]) = *reinterpret_cast<const uint2*>(out_h2);
 }
 
-template <bool AddResidual, typename OutT>
+static __device__ __forceinline__ float dot_binary_nibble_h4(uint8_t nibble, __half2 h0, __half2 h1) {
+    float2 f0 = __half22float2(h0);
+    float2 f1 = __half22float2(h1);
+    float s0 = (nibble & 0x01) ? 1.0f : -1.0f;
+    float s1 = (nibble & 0x02) ? 1.0f : -1.0f;
+    float s2 = (nibble & 0x04) ? 1.0f : -1.0f;
+    float s3 = (nibble & 0x08) ? 1.0f : -1.0f;
+    return s0 * f0.x + s1 * f0.y + s2 * f1.x + s3 * f1.y;
+}
+
+template <bool AddResidual, typename OutT, int Bits = 2>
 __global__ void ternary_gemv_f16_kernel(
     const __half* __restrict__ x,
     const uint8_t* __restrict__ w_packed,
@@ -401,10 +412,12 @@ __global__ void ternary_gemv_f16_kernel(
     }
 
     int groups_per_row = k / GROUP_SIZE;
+    const int bytes_per_group = (Bits == 1) ? BINARY_PACKED_BYTES_PER_GROUP : PACKED_BYTES_PER_GROUP;
     const __half* x_row = x + (size_t)row_m * k;
-    const uint8_t* w_row = w_packed + (size_t)row_n * groups_per_row * PACKED_BYTES_PER_GROUP;
+    const uint8_t* w_row = w_packed + (size_t)row_n * groups_per_row * bytes_per_group;
     const uint16_t* s_row = scales + (size_t)row_n * groups_per_row;
     const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_row);
+    const uint16_t* w_u16 = reinterpret_cast<const uint16_t*>(w_row);
 
     float total = 0.0f;
     int sub_g = lane >> 3;
@@ -413,17 +426,26 @@ __global__ void ternary_gemv_f16_kernel(
     int g = 0;
     for (; g + 4 <= groups_per_row; g += 4) {
         int cur_g = g + sub_g;
-        uint32_t packed4 = w_u32[cur_g * 8 + sub_lane];
         const uint4* x_u4 = reinterpret_cast<const uint4*>(&x_row[cur_g * GROUP_SIZE + sub_lane * 16]);
         uint4 u0 = x_u4[0];
         uint4 u1 = x_u4[1];
         const __half2* h0 = reinterpret_cast<const __half2*>(&u0);
         const __half2* h1 = reinterpret_cast<const __half2*>(&u1);
 
-        float partial = dot_packed_byte_h4(packed4 & 0xFF, h0[0], h0[1])
-                      + dot_packed_byte_h4((packed4 >> 8) & 0xFF, h0[2], h0[3])
-                      + dot_packed_byte_h4((packed4 >> 16) & 0xFF, h1[0], h1[1])
-                      + dot_packed_byte_h4((packed4 >> 24) & 0xFF, h1[2], h1[3]);
+        float partial;
+        if (Bits == 1) {
+            uint16_t packed2 = w_u16[cur_g * 8 + sub_lane];
+            partial = dot_binary_nibble_h4(packed2 & 0x0F, h0[0], h0[1])
+                    + dot_binary_nibble_h4((packed2 >> 4) & 0x0F, h0[2], h0[3])
+                    + dot_binary_nibble_h4((packed2 >> 8) & 0x0F, h1[0], h1[1])
+                    + dot_binary_nibble_h4((packed2 >> 12) & 0x0F, h1[2], h1[3]);
+        } else {
+            uint32_t packed4 = w_u32[cur_g * 8 + sub_lane];
+            partial = dot_packed_byte_h4(packed4 & 0xFF, h0[0], h0[1])
+                    + dot_packed_byte_h4((packed4 >> 8) & 0xFF, h0[2], h0[3])
+                    + dot_packed_byte_h4((packed4 >> 16) & 0xFF, h1[0], h1[1])
+                    + dot_packed_byte_h4((packed4 >> 24) & 0xFF, h1[2], h1[3]);
+        }
 
         partial += __shfl_down_sync(0xFFFFFFFF, partial, 4);
         partial += __shfl_down_sync(0xFFFFFFFF, partial, 2);
@@ -438,8 +460,15 @@ __global__ void ternary_gemv_f16_kernel(
     for (; g < groups_per_row; ++g) {
         uint2 x_u2 = *reinterpret_cast<const uint2*>(&x_row[g * GROUP_SIZE + lane * 4]);
         const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
-        uint8_t packed = w_row[g * PACKED_BYTES_PER_GROUP + lane];
-        float partial = warp_reduce_sum(dot_packed_byte_h4(packed, h2[0], h2[1]));
+        float elem_dot;
+        if (Bits == 1) {
+            uint8_t nibble = (w_row[g * BINARY_PACKED_BYTES_PER_GROUP + (lane >> 1)] >> ((lane & 1) * 4)) & 0x0F;
+            elem_dot = dot_binary_nibble_h4(nibble, h2[0], h2[1]);
+        } else {
+            uint8_t packed = w_row[g * PACKED_BYTES_PER_GROUP + lane];
+            elem_dot = dot_packed_byte_h4(packed, h2[0], h2[1]);
+        }
+        float partial = warp_reduce_sum(elem_dot);
         if (lane == 0) {
             __half h_scale = *reinterpret_cast<const __half*>(&s_row[g]);
             total += partial * __half2float(h_scale);
@@ -822,6 +851,28 @@ __global__ void lm_head_f32_act_f16_kernel(
     }
 }
 
+template <bool AddResidual, typename OutT>
+static int launch_gemv_f16(
+    const uint16_t* dev_x,
+    const uint8_t* dev_w,
+    const uint16_t* dev_scales,
+    OutT* dev_out,
+    int m,
+    int n,
+    int k,
+    int bits
+) {
+    dim3 block(128);
+    dim3 grid((n + 3) / 4, m);
+    const __half* hx = reinterpret_cast<const __half*>(dev_x);
+    if (bits == 1) {
+        ternary_gemv_f16_kernel<AddResidual, OutT, 1><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+    } else {
+        ternary_gemv_f16_kernel<AddResidual, OutT, 2><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+    }
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
 extern "C" {
 
 int aibox_gpu_is_available(void) {
@@ -946,20 +997,12 @@ int aibox_gpu_matmul_ternary_f16_dev(
     uint16_t* dev_out,
     int m,
     int n,
-    int k
+    int k,
+    int bits
 ) {
-    dim3 block(128);
-    dim3 grid((n + 3) / 4, m);
-    ternary_gemv_f16_kernel<false, __half><<<grid, block>>>(
-        reinterpret_cast<const __half*>(dev_x),
-        dev_w,
-        dev_scales,
-        reinterpret_cast<__half*>(dev_out),
-        m,
-        n,
-        k
+    return launch_gemv_f16<false, __half>(
+        dev_x, dev_w, dev_scales, reinterpret_cast<__half*>(dev_out), m, n, k, bits
     );
-    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
 int aibox_gpu_matmul_ternary_f16_add_dev(
@@ -969,20 +1012,12 @@ int aibox_gpu_matmul_ternary_f16_add_dev(
     uint16_t* dev_out,
     int m,
     int n,
-    int k
+    int k,
+    int bits
 ) {
-    dim3 block(128);
-    dim3 grid((n + 3) / 4, m);
-    ternary_gemv_f16_kernel<true, __half><<<grid, block>>>(
-        reinterpret_cast<const __half*>(dev_x),
-        dev_w,
-        dev_scales,
-        reinterpret_cast<__half*>(dev_out),
-        m,
-        n,
-        k
+    return launch_gemv_f16<true, __half>(
+        dev_x, dev_w, dev_scales, reinterpret_cast<__half*>(dev_out), m, n, k, bits
     );
-    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
 int aibox_gpu_matmul_ternary_f16_to_f32_dev(
@@ -992,20 +1027,10 @@ int aibox_gpu_matmul_ternary_f16_to_f32_dev(
     float* dev_out,
     int m,
     int n,
-    int k
+    int k,
+    int bits
 ) {
-    dim3 block(128);
-    dim3 grid((n + 3) / 4, m);
-    ternary_gemv_f16_kernel<false, float><<<grid, block>>>(
-        reinterpret_cast<const __half*>(dev_x),
-        dev_w,
-        dev_scales,
-        dev_out,
-        m,
-        n,
-        k
-    );
-    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+    return launch_gemv_f16<false, float>(dev_x, dev_w, dev_scales, dev_out, m, n, k, bits);
 }
 
 int aibox_gpu_rms_norm_f16(

@@ -39,10 +39,10 @@ type FnArgmaxF32 = unsafe extern "C" fn(*const f32, c_int, *mut u32) -> c_int;
 type FnFwht128F16 = unsafe extern "C" fn(*mut u16, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
 type FnMatmulTernaryF16Dev =
-    unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut u16, c_int, c_int, c_int) -> c_int;
+    unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut u16, c_int, c_int, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
 type FnMatmulTernaryF16ToF32Dev =
-    unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut f32, c_int, c_int, c_int) -> c_int;
+    unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut f32, c_int, c_int, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
 type FnRmsNormF16 = unsafe extern "C" fn(*const u16, *const f32, *mut u16, c_int, c_int, f32) -> c_int;
 #[cfg(target_os = "linux")]
@@ -388,10 +388,11 @@ impl GpuBackend {
         m: usize,
         n: usize,
         k: usize,
+        bits: u8,
     ) -> Result<(), BackendError> {
         let (dev_w, dev_scales) = self.get_or_upload_weights(packed_weights, scales_fp16)?;
         let status = unsafe {
-            func(x.as_ptr(), dev_w, dev_scales, out.as_mut_ptr(), m as c_int, n as c_int, k as c_int)
+            func(x.as_ptr(), dev_w, dev_scales, out.as_mut_ptr(), m as c_int, n as c_int, k as c_int, bits as c_int)
         };
         check_cuda_status(op_name, status)
     }
@@ -406,6 +407,7 @@ impl GpuBackend {
         m: usize,
         n: usize,
         k: usize,
+        bits: u8,
     ) -> Result<(), BackendError> {
         self.run_matmul_ternary_f16_dev(
             "aibox_gpu_matmul_ternary_f16_dev",
@@ -417,6 +419,7 @@ impl GpuBackend {
             m,
             n,
             k,
+            bits,
         )
     }
 
@@ -430,6 +433,7 @@ impl GpuBackend {
         m: usize,
         n: usize,
         k: usize,
+        bits: u8,
     ) -> Result<(), BackendError> {
         self.run_matmul_ternary_f16_dev(
             "aibox_gpu_matmul_ternary_f16_add_dev",
@@ -441,6 +445,7 @@ impl GpuBackend {
             m,
             n,
             k,
+            bits,
         )
     }
 
@@ -454,6 +459,7 @@ impl GpuBackend {
         m: usize,
         n: usize,
         k: usize,
+        bits: u8,
     ) -> Result<(), BackendError> {
         let (dev_w, dev_scales) = self.get_or_upload_weights(packed_weights, scales_fp16)?;
         let status = unsafe {
@@ -465,6 +471,7 @@ impl GpuBackend {
                 m as c_int,
                 n as c_int,
                 k as c_int,
+                bits as c_int,
             )
         };
         check_cuda_status("aibox_gpu_matmul_ternary_f16_to_f32_dev", status)
@@ -721,15 +728,15 @@ impl GpuBackend {
         Err(linux_only_err())
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn matmul_ternary_f16_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
+    pub fn matmul_ternary_f16_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize, _bits: u8) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn matmul_ternary_f16_add_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
+    pub fn matmul_ternary_f16_add_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize, _bits: u8) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn matmul_ternary_f16_to_f32_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _out: &mut GpuBuffer<'_, f32>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
+    pub fn matmul_ternary_f16_to_f32_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _out: &mut GpuBuffer<'_, f32>, _m: usize, _n: usize, _k: usize, _bits: u8) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
     pub fn rms_norm_f16(&self, _x: &GpuBuffer<'_, u16>, _w: &[f32], _out: &mut GpuBuffer<'_, u16>, _m: usize, _dim: usize, _eps: f32) -> Result<(), BackendError> {

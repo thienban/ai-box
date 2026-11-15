@@ -280,6 +280,18 @@ fn project_ternary_batch(
     m: usize,
     use_hadamard: bool,
 ) -> Result<Vec<f32>, String> {
+    if tensor.is_binary() {
+        return aibox_kernels::scalar::matmul_binary_1bit(
+            input,
+            &tensor.packed_weights,
+            &tensor.scales_fp16,
+            m,
+            tensor.n_rows,
+            tensor.k_cols,
+            use_hadamard,
+        )
+        .map_err(|err| err.to_string());
+    }
     backend
         .matmul_ternary(
             input,
@@ -826,9 +838,9 @@ impl TransformerModel {
         } else {
             gpu.rms_norm_f16(&s.hidden, &layer.attn_norm, &mut s.normed, 1, h, eps).map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_q.packed_weights, &layer.attn_q.scales_fp16, &mut s.q, 1, q_dim, h).map_err(|e| e.to_string())?;
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_k.packed_weights, &layer.attn_k.scales_fp16, &mut s.k, 1, kv_dim, h).map_err(|e| e.to_string())?;
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_v.packed_weights, &layer.attn_v.scales_fp16, &mut s.v, 1, kv_dim, h).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_q.packed_weights, &layer.attn_q.scales_fp16, &mut s.q, 1, q_dim, h, layer.attn_q.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_k.packed_weights, &layer.attn_k.scales_fp16, &mut s.k, 1, kv_dim, h, layer.attn_k.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_v.packed_weights, &layer.attn_v.scales_fp16, &mut s.v, 1, kv_dim, h, layer.attn_v.bits).map_err(|e| e.to_string())?;
 
         gpu.rms_norm_heads_rope_f16(&mut s.q, layer.attn_q_norm.as_deref(), cfg.num_attention_heads, head_dim, pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
         gpu.rms_norm_heads_rope_f16(&mut s.k, layer.attn_k_norm.as_deref(), cfg.num_key_value_heads, head_dim, pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
@@ -850,7 +862,7 @@ impl TransformerModel {
         if use_hadamard {
             gpu.fwht128_inplace_f16(&mut s.attn_ctx, 1, q_dim).map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_add_dev(&s.attn_ctx, &layer.attn_o.packed_weights, &layer.attn_o.scales_fp16, &mut s.hidden, 1, h, q_dim)
+        gpu.matmul_ternary_f16_add_dev(&s.attn_ctx, &layer.attn_o.packed_weights, &layer.attn_o.scales_fp16, &mut s.hidden, 1, h, q_dim, layer.attn_o.bits)
             .map_err(|e| e.to_string())
     }
 
@@ -871,14 +883,14 @@ impl TransformerModel {
             gpu.rms_norm_f16(&s.hidden, &layer.ffn_norm, &mut s.normed, 1, h, self.config.rms_norm_eps)
                 .map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_gate.packed_weights, &layer.ffn_gate.scales_fp16, &mut s.gate, 1, inter, h).map_err(|e| e.to_string())?;
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_up.packed_weights, &layer.ffn_up.scales_fp16, &mut s.up, 1, inter, h).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_gate.packed_weights, &layer.ffn_gate.scales_fp16, &mut s.gate, 1, inter, h, layer.ffn_gate.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_up.packed_weights, &layer.ffn_up.scales_fp16, &mut s.up, 1, inter, h, layer.ffn_up.bits).map_err(|e| e.to_string())?;
         if use_hadamard {
             gpu.swiglu_fwht128_inplace_f16(&mut s.gate, &s.up, inter).map_err(|e| e.to_string())?;
         } else {
             gpu.swiglu_inplace_f16(&mut s.gate, &s.up, inter).map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_add_dev(&s.gate, &layer.ffn_down.packed_weights, &layer.ffn_down.scales_fp16, &mut s.hidden, 1, h, inter)
+        gpu.matmul_ternary_f16_add_dev(&s.gate, &layer.ffn_down.packed_weights, &layer.ffn_down.scales_fp16, &mut s.hidden, 1, h, inter, layer.ffn_down.bits)
             .map_err(|e| e.to_string())
     }
 
@@ -898,7 +910,7 @@ impl TransformerModel {
                     gpu.rms_norm_f16(&s.hidden, &self.final_norm, &mut s.normed, 1, h, cfg.rms_norm_eps)
                         .map_err(|e| e.to_string())?;
                 }
-                gpu.matmul_ternary_f16_to_f32_dev(&s.normed, &tensor.packed_weights, &tensor.scales_fp16, &mut s.logits, 1, cfg.vocab_size, h).map_err(|e| e.to_string())
+                gpu.matmul_ternary_f16_to_f32_dev(&s.normed, &tensor.packed_weights, &tensor.scales_fp16, &mut s.logits, 1, cfg.vocab_size, h, tensor.bits).map_err(|e| e.to_string())
             }
             LmHead::Dense(_) | LmHead::TiedEmbedding => {
                 gpu.rms_norm_f16(&s.hidden, &self.final_norm, &mut s.normed, 1, h, cfg.rms_norm_eps)

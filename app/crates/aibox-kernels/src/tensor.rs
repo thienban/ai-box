@@ -1,6 +1,9 @@
 //! KERN-01 : Loader, validation d'alignement 32 octets et packing 2-bit ternaire.
 
-use crate::{validate_ternary_geometry, BackendError, GROUP_SIZE, PACKED_BYTES_PER_GROUP};
+use crate::{
+    validate_packed_geometry, validate_ternary_geometry, BackendError,
+    BINARY_PACKED_BYTES_PER_GROUP, GROUP_SIZE, PACKED_BYTES_PER_GROUP,
+};
 
 /// Encode un poids ternaire `{-1, 0, +1}` sur 2 bits (`00 -> 0`, `01 -> +1`, `11 -> -1`).
 #[inline]
@@ -68,40 +71,135 @@ pub fn unpack_ternary_2bit_rows(
     Ok(unpacked)
 }
 
-/// Représentation mémoire validée d'un tenseur ternaire packé par groupes de 128.
+/// Compacte une matrice `[n_rows, k_cols]` de `{-1, +1}` en `[n_rows, k_cols / 8]` octets (`Q1_0`, 8 poids/octet LSB-first).
+pub fn pack_binary_1bit_rows(
+    weights: &[i8],
+    n_rows: usize,
+    k_cols: usize,
+) -> Result<Vec<u8>, BackendError> {
+    validate_packed_geometry(n_rows, k_cols, BINARY_PACKED_BYTES_PER_GROUP, None, None)?;
+    let expected = n_rows * k_cols;
+    if weights.len() != expected {
+        return Err(BackendError::BufferLengthMismatch(format!(
+            "weights len {} != expected {expected}",
+            weights.len()
+        )));
+    }
+
+    let mut packed = Vec::with_capacity(expected / 8);
+    for chunk in weights.chunks_exact(8) {
+        let mut byte = 0u8;
+        for (bit_idx, &w) in chunk.iter().enumerate() {
+            match w {
+                1 => byte |= 1 << bit_idx,
+                -1 => {}
+                other => return Err(BackendError::InvalidTernaryValue(other)),
+            }
+        }
+        packed.push(byte);
+    }
+    Ok(packed)
+}
+
+/// Décompacte `[n_rows, k_cols / 8]` octets (`Q1_0`) vers `[n_rows, k_cols]` en `{-1, +1}`.
+pub fn unpack_binary_1bit_rows(
+    packed: &[u8],
+    n_rows: usize,
+    k_cols: usize,
+) -> Result<Vec<i8>, BackendError> {
+    validate_packed_geometry(
+        n_rows,
+        k_cols,
+        BINARY_PACKED_BYTES_PER_GROUP,
+        Some(packed.len()),
+        None,
+    )?;
+
+    let mut unpacked = Vec::with_capacity(n_rows * k_cols);
+    for &byte in packed {
+        for bit_idx in 0..8 {
+            unpacked.push(if ((byte >> bit_idx) & 1) == 1 { 1 } else { -1 });
+        }
+    }
+    Ok(unpacked)
+}
+
+/// Représentation mémoire validée d'un tenseur quantifié (2-bit ternaire ou 1-bit binaire) par groupes de 128.
 #[derive(Debug, Clone)]
 pub struct TernaryTensor {
     pub n_rows: usize,
     pub k_cols: usize,
+    pub bits: u8,
     pub packed_weights: Vec<u8>,
     pub scales_fp16: Vec<u16>,
 }
 
 impl TernaryTensor {
-    /// Construit un `TernaryTensor` en validant les dimensions et la géométrie par groupes de 32 octets.
-    pub fn from_raw(
+    /// Construit un `TernaryTensor` (1-bit ou 2-bit) en validant sa géométrie par groupes de 128 poids.
+    pub fn from_raw_with_bits(
         n_rows: usize,
         k_cols: usize,
+        bits: u8,
         packed_weights: Vec<u8>,
         scales_fp16: Vec<u16>,
     ) -> Result<Self, BackendError> {
-        validate_ternary_geometry(
+        let bytes_per_group = match bits {
+            1 => BINARY_PACKED_BYTES_PER_GROUP,
+            2 => PACKED_BYTES_PER_GROUP,
+            other => {
+                return Err(BackendError::InvalidDimensions(format!(
+                    "unsupported quantized bit width {other} (expected 1 or 2)"
+                )))
+            }
+        };
+        validate_packed_geometry(
             n_rows,
             k_cols,
+            bytes_per_group,
             Some(packed_weights.len()),
             Some(scales_fp16.len()),
         )?;
         Ok(Self {
             n_rows,
             k_cols,
+            bits,
             packed_weights,
             scales_fp16,
         })
     }
 
-    /// Vérifie si le stride d'une ligne est un multiple exact de 32 octets (alignement SIMD).
+    /// Construit un `TernaryTensor` 2-bit en validant les dimensions et la géométrie par groupes de 32 octets.
+    pub fn from_raw(
+        n_rows: usize,
+        k_cols: usize,
+        packed_weights: Vec<u8>,
+        scales_fp16: Vec<u16>,
+    ) -> Result<Self, BackendError> {
+        Self::from_raw_with_bits(n_rows, k_cols, 2, packed_weights, scales_fp16)
+    }
+
+    /// Construit un `TernaryTensor` 1-bit (`Q1_0`) en validant la géométrie par groupes de 16 octets.
+    pub fn from_binary_raw(
+        n_rows: usize,
+        k_cols: usize,
+        packed_weights: Vec<u8>,
+        scales_fp16: Vec<u16>,
+    ) -> Result<Self, BackendError> {
+        Self::from_raw_with_bits(n_rows, k_cols, 1, packed_weights, scales_fp16)
+    }
+
+    pub fn is_binary(&self) -> bool {
+        self.bits == 1
+    }
+
+    /// Vérifie le stride d'une ligne en octets (multiple de 16 ou 32 octets).
     pub fn row_stride_bytes(&self) -> usize {
-        (self.k_cols / GROUP_SIZE) * PACKED_BYTES_PER_GROUP
+        let bytes_per_group = if self.is_binary() {
+            BINARY_PACKED_BYTES_PER_GROUP
+        } else {
+            PACKED_BYTES_PER_GROUP
+        };
+        (self.k_cols / GROUP_SIZE) * bytes_per_group
     }
 }
 
@@ -193,6 +291,26 @@ mod tests {
         let tensor = TernaryTensor::from_raw(n_rows, k_cols, packed, scales).expect("tensor valid");
         assert_eq!(tensor.row_stride_bytes(), 64);
         assert_eq!(tensor.row_stride_bytes() % PACKED_BYTES_PER_GROUP, 0);
+    }
+
+    #[test]
+    fn roundtrip_pack_unpack_binary_1bit() {
+        let n_rows = 4;
+        let k_cols = 256;
+        let weights: Vec<i8> = (0..(n_rows * k_cols))
+            .map(|i| if (i % 5) < 2 { 1 } else { -1 })
+            .collect();
+
+        let packed = pack_binary_1bit_rows(&weights, n_rows, k_cols).expect("pack 1-bit failed");
+        assert_eq!(packed.len(), n_rows * (k_cols / 8));
+
+        let unpacked = unpack_binary_1bit_rows(&packed, n_rows, k_cols).expect("unpack 1-bit failed");
+        assert_eq!(unpacked, weights);
+
+        let scales = vec![f32_to_f16(0.5); n_rows * (k_cols / GROUP_SIZE)];
+        let tensor = TernaryTensor::from_binary_raw(n_rows, k_cols, packed, scales).expect("1-bit tensor valid");
+        assert!(tensor.is_binary());
+        assert_eq!(tensor.row_stride_bytes(), 32);
     }
 
     #[test]

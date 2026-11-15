@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use aibox_kernels::tensor::{f16_to_f32, TernaryTensor};
-use aibox_kernels::GROUP_SIZE;
+use aibox_kernels::{BINARY_PACKED_BYTES_PER_GROUP, GROUP_SIZE, PACKED_BYTES_PER_GROUP};
 
 use crate::json::{parse_json, JsonValue};
 
@@ -146,13 +146,24 @@ impl SafeTensorsFile {
         }
 
         let n_rows = w_meta.shape[0];
-        let k_cols = w_meta.shape[1] * 4;
-        if s_meta.shape[0] != n_rows || s_meta.shape[1] != k_cols / GROUP_SIZE {
+        let n_groups = s_meta.shape[1];
+        if s_meta.shape[0] != n_rows || n_groups == 0 {
             return Err(format!(
                 "Shape mismatch between '{weight_name}' {:?} and '{scale_name}' {:?}",
                 w_meta.shape, s_meta.shape
             ));
         }
+        let k_cols = n_groups * GROUP_SIZE;
+        let bits = match w_meta.shape[1] / n_groups {
+            BINARY_PACKED_BYTES_PER_GROUP if w_meta.shape[1] == n_groups * BINARY_PACKED_BYTES_PER_GROUP => 1u8,
+            PACKED_BYTES_PER_GROUP if w_meta.shape[1] == n_groups * PACKED_BYTES_PER_GROUP => 2u8,
+            _ => {
+                return Err(format!(
+                    "Shape mismatch between '{weight_name}' {:?} and '{scale_name}' {:?} (expected {BINARY_PACKED_BYTES_PER_GROUP} or {PACKED_BYTES_PER_GROUP} bytes/group)",
+                    w_meta.shape, s_meta.shape
+                ));
+            }
+        };
 
         let packed_weights = self.read_tensor_bytes(weight_name)?;
         let scale_bytes = self.read_tensor_bytes(scale_name)?;
@@ -164,8 +175,8 @@ impl SafeTensorsFile {
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
 
-        TernaryTensor::from_raw(n_rows, k_cols, packed_weights, scales_fp16)
-            .map_err(|e| format!("Invalid TernaryTensor '{weight_name}': {e}"))
+        TernaryTensor::from_raw_with_bits(n_rows, k_cols, bits, packed_weights, scales_fp16)
+            .map_err(|e| format!("Invalid {bits}-bit TernaryTensor '{weight_name}': {e}"))
     }
 
     pub fn has_tensor(&self, name: &str) -> bool {

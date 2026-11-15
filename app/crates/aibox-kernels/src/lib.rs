@@ -16,8 +16,11 @@ use std::fmt;
 /// Nombre de poids ternaires par groupe de quantification.
 pub const GROUP_SIZE: usize = 128;
 
-/// Nombre d'octets packés (4 poids/octet) pour un groupe de 128 poids.
+/// Nombre d'octets packés (4 poids/octet) pour un groupe de 128 poids ternaires 2-bit.
 pub const PACKED_BYTES_PER_GROUP: usize = GROUP_SIZE / 4; // 32 octets
+
+/// Nombre d'octets packés (8 poids/octet) pour un groupe de 128 poids binaires 1-bit (`Q1_0`).
+pub const BINARY_PACKED_BYTES_PER_GROUP: usize = GROUP_SIZE / 8; // 16 octets
 
 /// Erreurs retournées par les loaders et backends de calcul.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,10 +89,11 @@ pub trait TernaryHadamardBackend: Send + Sync {
     }
 }
 
-/// Valide la géométrie d'un tenseur ternaire par groupes de 128 poids.
-pub(crate) fn validate_ternary_geometry(
+/// Valide la géométrie d'un tenseur quantifié (1-bit ou 2-bit) par groupes de 128 poids.
+pub(crate) fn validate_packed_geometry(
     rows: usize,
     cols: usize,
+    bytes_per_group: usize,
     packed_len: Option<usize>,
     scales_len: Option<usize>,
 ) -> Result<(), BackendError> {
@@ -104,7 +108,7 @@ pub(crate) fn validate_ternary_geometry(
         )));
     }
     if let Some(len) = packed_len {
-        let expected_w = rows * (cols / GROUP_SIZE) * PACKED_BYTES_PER_GROUP;
+        let expected_w = rows * (cols / GROUP_SIZE) * bytes_per_group;
         if len != expected_w {
             return Err(BackendError::BufferLengthMismatch(format!(
                 "packed_weights len {len} != expected {expected_w}"
@@ -120,6 +124,16 @@ pub(crate) fn validate_ternary_geometry(
         }
     }
     Ok(())
+}
+
+/// Valide la géométrie d'un tenseur ternaire 2-bit par groupes de 128 poids.
+pub(crate) fn validate_ternary_geometry(
+    rows: usize,
+    cols: usize,
+    packed_len: Option<usize>,
+    scales_len: Option<usize>,
+) -> Result<(), BackendError> {
+    validate_packed_geometry(rows, cols, PACKED_BYTES_PER_GROUP, packed_len, scales_len)
 }
 
 /// Valide les dimensions et tailles de tampons avant exécution d'un kernel.

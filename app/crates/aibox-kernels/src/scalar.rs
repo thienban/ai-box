@@ -3,8 +3,8 @@
 use crate::{
     fwht::apply_fwht_128_rows,
     tensor::{decode_ternary, f16_to_f32},
-    validate_matmul_inputs, BackendError, TernaryHadamardBackend, GROUP_SIZE,
-    PACKED_BYTES_PER_GROUP,
+    validate_matmul_inputs, validate_packed_geometry, BackendError, TernaryHadamardBackend,
+    BINARY_PACKED_BYTES_PER_GROUP, GROUP_SIZE, PACKED_BYTES_PER_GROUP,
 };
 
 /// Implémentation scalaire de référence de `TernaryHadamardBackend`.
@@ -35,31 +35,91 @@ impl TernaryHadamardBackend for ScalarBackend {
         use_hadamard: bool,
     ) -> Result<Vec<f32>, BackendError> {
         validate_matmul_inputs(activations, packed_weights, scales_fp16, m, n, k)?;
+        matmul_packed_scalar(activations, packed_weights, scales_fp16, m, n, k, use_hadamard, 2)
+    }
+}
 
-        let rotated_x;
-        let x_input = if use_hadamard {
-            rotated_x = apply_fwht_128_rows(activations, m, k)?;
-            rotated_x.as_slice()
-        } else {
-            activations
-        };
-        let groups_per_row = k / GROUP_SIZE;
-        let packed_row_stride = groups_per_row * PACKED_BYTES_PER_GROUP;
-        let mut output = vec![0.0f32; m * n];
+/// Multiplication matricielle 1-bit (`Q1_0`, 8 poids/octet LSB-first) de référence sur CPU.
+pub fn matmul_binary_1bit(
+    activations: &[f32],
+    packed_weights: &[u8],
+    scales_fp16: &[u16],
+    m: usize,
+    n: usize,
+    k: usize,
+    use_hadamard: bool,
+) -> Result<Vec<f32>, BackendError> {
+    if activations.len() != m * k {
+        return Err(BackendError::BufferLengthMismatch(format!(
+            "activations len {} != m*k ({})",
+            activations.len(),
+            m * k
+        )));
+    }
+    validate_packed_geometry(
+        n,
+        k,
+        BINARY_PACKED_BYTES_PER_GROUP,
+        Some(packed_weights.len()),
+        Some(scales_fp16.len()),
+    )?;
+    matmul_packed_scalar(activations, packed_weights, scales_fp16, m, n, k, use_hadamard, 1)
+}
 
-        for row_m in 0..m {
-            let x_row = &x_input[row_m * k..(row_m + 1) * k];
-            let out_row = &mut output[row_m * n..(row_m + 1) * n];
+fn matmul_packed_scalar(
+    activations: &[f32],
+    packed_weights: &[u8],
+    scales_fp16: &[u16],
+    m: usize,
+    n: usize,
+    k: usize,
+    use_hadamard: bool,
+    bits: u8,
+) -> Result<Vec<f32>, BackendError> {
+    let rotated_x;
+    let x_input = if use_hadamard {
+        rotated_x = apply_fwht_128_rows(activations, m, k)?;
+        rotated_x.as_slice()
+    } else {
+        activations
+    };
+    let bytes_per_group = if bits == 1 { BINARY_PACKED_BYTES_PER_GROUP } else { PACKED_BYTES_PER_GROUP };
+    let groups_per_row = k / GROUP_SIZE;
+    let packed_row_stride = groups_per_row * bytes_per_group;
+    let mut output = vec![0.0f32; m * n];
 
-            for row_n in 0..n {
-                let w_row = &packed_weights[row_n * packed_row_stride..(row_n + 1) * packed_row_stride];
-                let s_row = &scales_fp16[row_n * groups_per_row..(row_n + 1) * groups_per_row];
-                out_row[row_n] = dot_row_scalar(x_row, w_row, s_row, groups_per_row);
+    for row_m in 0..m {
+        let x_row = &x_input[row_m * k..(row_m + 1) * k];
+        let out_row = &mut output[row_m * n..(row_m + 1) * n];
+        for row_n in 0..n {
+            let w_row = &packed_weights[row_n * packed_row_stride..(row_n + 1) * packed_row_stride];
+            let s_row = &scales_fp16[row_n * groups_per_row..(row_n + 1) * groups_per_row];
+            out_row[row_n] = if bits == 1 {
+                dot_binary_row_scalar(x_row, w_row, s_row, groups_per_row)
+            } else {
+                dot_row_scalar(x_row, w_row, s_row, groups_per_row)
+            };
+        }
+    }
+    Ok(output)
+}
+
+fn dot_binary_row_scalar(x_row: &[f32], w_row: &[u8], s_row: &[u16], groups_per_row: usize) -> f32 {
+    let mut total = 0.0f32;
+    for g in 0..groups_per_row {
+        let x_g = &x_row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+        let w_g = &w_row[g * BINARY_PACKED_BYTES_PER_GROUP..(g + 1) * BINARY_PACKED_BYTES_PER_GROUP];
+        let mut acc = 0.0f32;
+        for (byte_idx, &byte) in w_g.iter().enumerate() {
+            let base = byte_idx * 8;
+            for bit in 0..8 {
+                let sign = if ((byte >> bit) & 1) == 1 { 1.0f32 } else { -1.0f32 };
+                acc += sign * x_g[base + bit];
             }
         }
-
-        Ok(output)
+        total += acc * f16_to_f32(s_row[g]);
     }
+    total
 }
 
 /// Calcule le produit scalaire complet d'une ligne de poids ternaires par groupes de 128.
@@ -180,6 +240,41 @@ mod tests {
 
         for (i, (&e, &g)) in expected.iter().zip(got.iter()).enumerate() {
             assert!((e - g).abs() < 1e-4, "idx={i} expected={e} got={g}");
+        }
+    }
+
+    #[test]
+    fn scalar_binary_1bit_matches_2bit_ternary() {
+        use crate::tensor::{pack_binary_1bit_rows, pack_ternary_2bit_rows};
+
+        let m = 2usize;
+        let n = 3usize;
+        let k = 256usize;
+        let groups = k / GROUP_SIZE;
+
+        let activations: Vec<f32> = (0..(m * k)).map(|i| ((i % 19) as f32 - 9.0) * 0.25).collect();
+        let weights: Vec<i8> = (0..(n * k)).map(|i| if (i % 3) == 0 { -1 } else { 1 }).collect();
+        let scales_fp16: Vec<u16> = (0..(n * groups))
+            .map(|i| f32_to_f16(0.5 + (i % 5) as f32 * 0.25))
+            .collect();
+
+        let packed_1bit = pack_binary_1bit_rows(&weights, n, k).unwrap();
+        let packed_2bit = pack_ternary_2bit_rows(&weights, n, k).unwrap();
+
+        let got_1bit_rot = matmul_binary_1bit(&activations, &packed_1bit, &scales_fp16, m, n, k, true).unwrap();
+        let got_2bit_rot = ScalarBackend
+            .matmul_hadamard_ternary(&activations, &packed_2bit, &scales_fp16, m, n, k)
+            .unwrap();
+        for (i, (&a, &b)) in got_1bit_rot.iter().zip(got_2bit_rot.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "rot idx={i} 1bit={a} 2bit={b}");
+        }
+
+        let got_1bit_plain = matmul_binary_1bit(&activations, &packed_1bit, &scales_fp16, m, n, k, false).unwrap();
+        let got_2bit_plain = ScalarBackend
+            .matmul_ternary(&activations, &packed_2bit, &scales_fp16, m, n, k, false)
+            .unwrap();
+        for (i, (&a, &b)) in got_1bit_plain.iter().zip(got_2bit_plain.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "plain idx={i} 1bit={a} 2bit={b}");
         }
     }
 }
