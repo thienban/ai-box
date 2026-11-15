@@ -28,6 +28,12 @@ ScratchBuffer g_dev_argmax_vals;
 ScratchBuffer g_dev_argmax_idxs;
 ScratchBuffer g_dev_argmax_out;
 
+cudaStream_t g_active_stream = nullptr;
+cudaStream_t g_graph_stream = nullptr;
+int* g_dev_pos = nullptr;
+cudaGraph_t g_decode_graph = nullptr;
+cudaGraphExec_t g_decode_graph_exec = nullptr;
+
 bool ensure_scratch_capacity(ScratchBuffer& buf, size_t required_bytes) {
     if (required_bytes <= buf.capacity) {
         return true;
@@ -680,12 +686,14 @@ __global__ void rms_norm_heads_rope_f16_kernel(
     const float* __restrict__ norm_w,
     int head_dim,
     int start_pos,
+    const int* __restrict__ dev_pos,
     float theta,
     float eps
 ) {
     int head = blockIdx.x;
     int tok = blockIdx.y;
-    int pos = start_pos + tok;
+    int effective_pos = (dev_pos != nullptr) ? *dev_pos : start_pos;
+    int pos = effective_pos + tok;
     __half* h_vec = vec + ((size_t)tok * gridDim.x + head) * head_dim;
 
     if (norm_w != nullptr) {
@@ -719,12 +727,14 @@ __global__ void kv_append_f16_kernel(
     __half* __restrict__ k_cache,
     __half* __restrict__ v_cache,
     int start_pos,
+    const int* __restrict__ dev_pos,
     int kv_dim,
     int total_kv
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total_kv) {
-        size_t dst = (size_t)start_pos * kv_dim + idx;
+        int effective_pos = (dev_pos != nullptr) ? *dev_pos : start_pos;
+        size_t dst = (size_t)effective_pos * kv_dim + idx;
         k_cache[dst] = k[idx];
         v_cache[dst] = v[idx];
     }
@@ -736,13 +746,15 @@ __global__ void gqa_attention_f16_kernel(
     const __half* __restrict__ v_cache,
     __half* __restrict__ out,
     int start_pos,
+    const int* __restrict__ dev_pos,
     int kv_dim,
     int heads_per_kv,
     int head_dim
 ) {
     int q_head = blockIdx.x;
     int tok = blockIdx.y;
-    int seq_len = start_pos + tok + 1;
+    int effective_pos = (dev_pos != nullptr) ? *dev_pos : start_pos;
+    int seq_len = effective_pos + tok + 1;
     int kv_offset = (q_head / heads_per_kv) * head_dim;
     size_t q_off = ((size_t)tok * gridDim.x + q_head) * head_dim;
     const __half* q_slice = q + q_off;
@@ -944,16 +956,16 @@ static int launch_gemv_f16(
     if (m == 1) {
         dim3 grid((n + 3) / 4, 1);
         if (bits == 1) {
-            ternary_gemv_f16_kernel<AddResidual, OutT, 1><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+            ternary_gemv_f16_kernel<AddResidual, OutT, 1><<<grid, block, 0, g_active_stream>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
         } else {
-            ternary_gemv_f16_kernel<AddResidual, OutT, 2><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+            ternary_gemv_f16_kernel<AddResidual, OutT, 2><<<grid, block, 0, g_active_stream>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
         }
     } else {
         dim3 grid((n + 3) / 4, (m + GEMM_BM - 1) / GEMM_BM);
         if (bits == 1) {
-            ternary_gemm_tiled_kernel<AddResidual, OutT, 1><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+            ternary_gemm_tiled_kernel<AddResidual, OutT, 1><<<grid, block, 0, g_active_stream>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
         } else {
-            ternary_gemm_tiled_kernel<AddResidual, OutT, 2><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+            ternary_gemm_tiled_kernel<AddResidual, OutT, 2><<<grid, block, 0, g_active_stream>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
         }
     }
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
@@ -1072,7 +1084,7 @@ int aibox_gpu_matmul_ternary(
 int aibox_gpu_fwht128_f16(uint16_t* dev_x, int m, int k) {
     int total_groups = m * (k / GROUP_SIZE);
     int blocks = (total_groups + 3) / 4;
-    fwht128_rows_f16_kernel<<<blocks, 128>>>(reinterpret_cast<__half*>(dev_x), total_groups);
+    fwht128_rows_f16_kernel<<<blocks, 128, 0, g_active_stream>>>(reinterpret_cast<__half*>(dev_x), total_groups);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
@@ -1127,7 +1139,7 @@ int aibox_gpu_rms_norm_f16(
     int dim,
     float eps
 ) {
-    rms_norm_f16_kernel<<<m, 256>>>(
+    rms_norm_f16_kernel<<<m, 256, 0, g_active_stream>>>(
         reinterpret_cast<const __half*>(dev_x),
         dev_w,
         reinterpret_cast<__half*>(dev_out),
@@ -1146,7 +1158,7 @@ int aibox_gpu_rms_norm_fwht128_f16(
     float eps
 ) {
     if (dim <= MAX_FUSED_RMS_DIM && (dim % GROUP_SIZE) == 0 && (dim & 7) == 0) {
-        rms_norm_fwht128_f16_kernel<<<m, 256>>>(
+        rms_norm_fwht128_f16_kernel<<<m, 256, 0, g_active_stream>>>(
             reinterpret_cast<const __half*>(dev_x),
             dev_w,
             reinterpret_cast<__half*>(dev_out),
@@ -1172,11 +1184,13 @@ int aibox_gpu_rms_norm_heads_rope_f16(
     float eps
 ) {
     dim3 grid(num_heads, m);
-    rms_norm_heads_rope_f16_kernel<<<grid, 128>>>(
+    const int* dev_pos = (g_active_stream != nullptr) ? g_dev_pos : nullptr;
+    rms_norm_heads_rope_f16_kernel<<<grid, 128, 0, g_active_stream>>>(
         reinterpret_cast<__half*>(dev_vec),
         dev_norm_w,
         head_dim,
         start_pos,
+        dev_pos,
         theta,
         eps
     );
@@ -1200,27 +1214,30 @@ int aibox_gpu_kv_append_gqa_f16(
     if (max_seq > MAX_ATTN_SEQ) {
         return -2;
     }
+    const int* dev_pos = (g_active_stream != nullptr) ? g_dev_pos : nullptr;
     int kv_dim = num_kv_heads * head_dim;
     int total_kv = m * kv_dim;
     int kv_blocks = (total_kv + 255) / 256;
-    kv_append_f16_kernel<<<kv_blocks, 256>>>(
+    kv_append_f16_kernel<<<kv_blocks, 256, 0, g_active_stream>>>(
         reinterpret_cast<const __half*>(dev_k),
         reinterpret_cast<const __half*>(dev_v),
         reinterpret_cast<__half*>(dev_k_cache),
         reinterpret_cast<__half*>(dev_v_cache),
         start_pos,
+        dev_pos,
         kv_dim,
         total_kv
     );
 
     int heads_per_kv = num_q_heads / num_kv_heads;
     dim3 attn_grid(num_q_heads, m);
-    gqa_attention_f16_kernel<<<attn_grid, 128>>>(
+    gqa_attention_f16_kernel<<<attn_grid, 128, 0, g_active_stream>>>(
         reinterpret_cast<const __half*>(dev_q),
         reinterpret_cast<const __half*>(dev_k_cache),
         reinterpret_cast<const __half*>(dev_v_cache),
         reinterpret_cast<__half*>(dev_out),
         start_pos,
+        dev_pos,
         kv_dim,
         heads_per_kv,
         head_dim
@@ -1230,7 +1247,7 @@ int aibox_gpu_kv_append_gqa_f16(
 
 int aibox_gpu_swiglu_inplace_f16(uint16_t* dev_gate, const uint16_t* dev_up, int len) {
     int blocks = (len + 255) / 256;
-    swiglu_inplace_f16_kernel<<<blocks, 256>>>(
+    swiglu_inplace_f16_kernel<<<blocks, 256, 0, g_active_stream>>>(
         reinterpret_cast<__half*>(dev_gate),
         reinterpret_cast<const __half*>(dev_up),
         len
@@ -1242,7 +1259,7 @@ int aibox_gpu_swiglu_fwht128_inplace_f16(uint16_t* dev_gate, const uint16_t* dev
     if ((len % GROUP_SIZE) == 0) {
         int total_groups = len / GROUP_SIZE;
         int blocks = (total_groups + 3) / 4;
-        swiglu_fwht128_inplace_f16_kernel<<<blocks, 128>>>(
+        swiglu_fwht128_inplace_f16_kernel<<<blocks, 128, 0, g_active_stream>>>(
             reinterpret_cast<__half*>(dev_gate),
             reinterpret_cast<const __half*>(dev_up),
             total_groups
@@ -1263,7 +1280,7 @@ int aibox_gpu_lm_head_f16_act_f16(
     int hidden_size
 ) {
     int blocks = (vocab_size + 3) / 4;
-    lm_head_f16_act_f16_kernel<<<blocks, 128>>>(
+    lm_head_f16_act_f16_kernel<<<blocks, 128, 0, g_active_stream>>>(
         reinterpret_cast<const __half*>(dev_hidden),
         dev_emb_f16,
         dev_logits,
@@ -1281,7 +1298,7 @@ int aibox_gpu_lm_head_f32_act_f16(
     int hidden_size
 ) {
     int blocks = (vocab_size + 3) / 4;
-    lm_head_f32_act_f16_kernel<<<blocks, 128>>>(
+    lm_head_f32_act_f16_kernel<<<blocks, 128, 0, g_active_stream>>>(
         reinterpret_cast<const __half*>(dev_hidden),
         dev_emb_f32,
         dev_logits,
@@ -1289,6 +1306,75 @@ int aibox_gpu_lm_head_f32_act_f16(
         hidden_size
     );
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_graph_begin_capture(void) {
+    if (g_graph_stream == nullptr) {
+        if (cudaStreamCreateWithFlags(&g_graph_stream, cudaStreamNonBlocking) != cudaSuccess) {
+            return -1;
+        }
+    }
+    if (g_dev_pos == nullptr) {
+        if (cudaMalloc(&g_dev_pos, sizeof(int)) != cudaSuccess) {
+            return -2;
+        }
+    }
+    if (g_decode_graph_exec != nullptr) {
+        cudaGraphExecDestroy(g_decode_graph_exec);
+        g_decode_graph_exec = nullptr;
+    }
+    if (g_decode_graph != nullptr) {
+        cudaGraphDestroy(g_decode_graph);
+        g_decode_graph = nullptr;
+    }
+    if (cudaStreamBeginCapture(g_graph_stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        return -3;
+    }
+    g_active_stream = g_graph_stream;
+    return 0;
+}
+
+int aibox_gpu_graph_end_capture(void) {
+    g_active_stream = nullptr;
+    if (cudaStreamEndCapture(g_graph_stream, &g_decode_graph) != cudaSuccess) {
+        return -1;
+    }
+    if (cudaGraphInstantiate(&g_decode_graph_exec, g_decode_graph, nullptr, nullptr, 0) != cudaSuccess) {
+        cudaGraphDestroy(g_decode_graph);
+        g_decode_graph = nullptr;
+        return -2;
+    }
+    return 0;
+}
+
+int aibox_gpu_graph_launch(
+    uint16_t* dev_hidden,
+    const uint16_t* host_hidden_f16,
+    int hidden_len,
+    int pos
+) {
+    if (g_decode_graph_exec == nullptr || g_graph_stream == nullptr || g_dev_pos == nullptr) {
+        return -1;
+    }
+    if (pos + 1 > MAX_ATTN_SEQ) {
+        return -2;
+    }
+    if (cudaMemcpyAsync(
+            dev_hidden,
+            host_hidden_f16,
+            (size_t)hidden_len * sizeof(uint16_t),
+            cudaMemcpyHostToDevice,
+            g_graph_stream
+        ) != cudaSuccess) {
+        return -3;
+    }
+    if (cudaMemcpyAsync(g_dev_pos, &pos, sizeof(int), cudaMemcpyHostToDevice, g_graph_stream) != cudaSuccess) {
+        return -4;
+    }
+    if (cudaGraphLaunch(g_decode_graph_exec, g_graph_stream) != cudaSuccess) {
+        return -5;
+    }
+    return (cudaStreamSynchronize(g_graph_stream) == cudaSuccess) ? 0 : -6;
 }
 
 }

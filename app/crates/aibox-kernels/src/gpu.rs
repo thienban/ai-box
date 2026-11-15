@@ -69,6 +69,10 @@ type FnLmHeadF16ActF16 = unsafe extern "C" fn(*const u16, *const u16, *mut f32, 
 #[cfg(target_os = "linux")]
 type FnLmHeadF32ActF16 = unsafe extern "C" fn(*const u16, *const f32, *mut f32, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
+type FnGraphCapture = unsafe extern "C" fn() -> c_int;
+#[cfg(target_os = "linux")]
+type FnGraphLaunch = unsafe extern "C" fn(*mut u16, *const u16, c_int, c_int) -> c_int;
+#[cfg(target_os = "linux")]
 type FnMatmulTernary = unsafe extern "C" fn(
     *const f32,
     *const u8,
@@ -119,6 +123,9 @@ struct CudaSymbols {
     swiglu_fwht128_inplace_f16: FnSwigluInplaceF16,
     lm_head_f16_act_f16: FnLmHeadF16ActF16,
     lm_head_f32_act_f16: FnLmHeadF32ActF16,
+    graph_begin_capture: FnGraphCapture,
+    graph_end_capture: FnGraphCapture,
+    graph_launch: FnGraphLaunch,
     matmul_ternary: FnMatmulTernary,
 }
 
@@ -365,6 +372,9 @@ impl GpuBackend {
                 swiglu_fwht128_inplace_f16: load_symbol(handle, "aibox_gpu_swiglu_fwht128_inplace_f16")?,
                 lm_head_f16_act_f16: load_symbol(handle, "aibox_gpu_lm_head_f16_act_f16")?,
                 lm_head_f32_act_f16: load_symbol(handle, "aibox_gpu_lm_head_f32_act_f16")?,
+                graph_begin_capture: load_symbol(handle, "aibox_gpu_graph_begin_capture")?,
+                graph_end_capture: load_symbol(handle, "aibox_gpu_graph_end_capture")?,
+                graph_launch: load_symbol(handle, "aibox_gpu_graph_launch")?,
                 matmul_ternary: load_symbol(handle, "aibox_gpu_matmul_ternary")?,
             })
         })();
@@ -675,6 +685,34 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_lm_head_f32_act_f16", status)
     }
 
+    pub fn graph_begin_capture(&self) -> Result<(), BackendError> {
+        let status = unsafe { (self.symbols.graph_begin_capture)() };
+        check_cuda_status("aibox_gpu_graph_begin_capture", status)
+    }
+
+    pub fn graph_end_capture(&self) -> Result<(), BackendError> {
+        let status = unsafe { (self.symbols.graph_end_capture)() };
+        check_cuda_status("aibox_gpu_graph_end_capture", status)
+    }
+
+    pub fn graph_launch(
+        &self,
+        hidden: &mut GpuBuffer<'_, u16>,
+        emb_f32: &[f32],
+        pos: usize,
+    ) -> Result<(), BackendError> {
+        let halfs: Vec<u16> = emb_f32.iter().map(|&v| f32_to_f16(v)).collect();
+        let status = unsafe {
+            (self.symbols.graph_launch)(
+                hidden.as_mut_ptr(),
+                halfs.as_ptr(),
+                halfs.len() as c_int,
+                pos as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_graph_launch", status)
+    }
+
     fn get_or_upload_raw_bytes(&self, host_ptr: *const c_void, byte_len: usize) -> Result<*mut c_void, BackendError> {
         let key = (host_ptr as usize, byte_len);
         let mut guard = self.raw_cache.lock().map_err(|_| {
@@ -804,6 +842,15 @@ impl GpuBackend {
         Err(linux_only_err())
     }
     pub fn lm_head_f32_act_f16(&self, _hidden: &GpuBuffer<'_, u16>, _emb: &[f32], _logits: &mut GpuBuffer<'_, f32>, _v: usize, _h: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn graph_begin_capture(&self) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn graph_end_capture(&self) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn graph_launch(&self, _hidden: &mut GpuBuffer<'_, u16>, _emb: &[f32], _pos: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
 }

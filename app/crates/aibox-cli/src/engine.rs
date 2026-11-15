@@ -752,6 +752,8 @@ impl TransformerModel {
         let decode_start = Instant::now();
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut next_token = self.sample_next_token_gpu(gpu, &session, params, &mut rng)?;
+        let h = self.config.hidden_size;
+        let mut graph_captured = false;
 
         for step in 0..max_new_tokens {
             if Some(next_token) == eos_token_id {
@@ -763,7 +765,15 @@ impl TransformerModel {
                 break;
             }
             let pos = prompt_tokens.len() + step;
-            self.forward_tokens_gpu(gpu, &mut session, &[next_token], pos, true)?;
+            if next_token >= self.config.vocab_size {
+                return Err(format!("token_id {next_token} >= vocab_size {}", self.config.vocab_size));
+            }
+            if !graph_captured {
+                self.capture_decode_graph_gpu(gpu, &mut session, pos)?;
+                graph_captured = true;
+            }
+            let emb_row = self.token_embeddings.read_row(next_token, h);
+            gpu.graph_launch(&mut session.hidden, &emb_row, pos).map_err(|e| e.to_string())?;
             next_token = self.sample_next_token_gpu(gpu, &session, params, &mut rng)?;
         }
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
@@ -773,6 +783,25 @@ impl TransformerModel {
             prefill_ms,
             decode_ms,
         })
+    }
+
+    fn capture_decode_graph_gpu<'a>(
+        &self,
+        gpu: &'a GpuBackend,
+        s: &mut GpuSession<'a>,
+        pos: usize,
+    ) -> Result<(), String> {
+        gpu.graph_begin_capture().map_err(|e| e.to_string())?;
+        let body_res = (|| {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                self.forward_attention_gpu(gpu, s, layer, layer_idx, pos, 1)?;
+                self.forward_ffn_gpu(gpu, s, layer, 1)?;
+            }
+            self.compute_logits_gpu(gpu, s)
+        })();
+        let end_res = gpu.graph_end_capture().map_err(|e| e.to_string());
+        body_res?;
+        end_res
     }
 
     fn forward_tokens_gpu<'a>(
