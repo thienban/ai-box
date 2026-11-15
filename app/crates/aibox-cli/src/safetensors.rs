@@ -154,12 +154,15 @@ impl SafeTensorsFile {
             ));
         }
         let k_cols = n_groups * GROUP_SIZE;
-        let bits = match w_meta.shape[1] / n_groups {
+        let bytes_per_group = w_meta.shape[1] / n_groups;
+        let bits = match bytes_per_group {
             BINARY_PACKED_BYTES_PER_GROUP if w_meta.shape[1] == n_groups * BINARY_PACKED_BYTES_PER_GROUP => 1u8,
             PACKED_BYTES_PER_GROUP if w_meta.shape[1] == n_groups * PACKED_BYTES_PER_GROUP => 2u8,
+            64 if w_meta.shape[1] == n_groups * 64 => 4u8,
+            128 if w_meta.shape[1] == n_groups * 128 => 8u8,
             _ => {
                 return Err(format!(
-                    "Shape mismatch between '{weight_name}' {:?} and '{scale_name}' {:?} (expected {BINARY_PACKED_BYTES_PER_GROUP} or {PACKED_BYTES_PER_GROUP} bytes/group)",
+                    "Shape mismatch between '{weight_name}' {:?} and '{scale_name}' {:?} (expected 16, 32, 64 or 128 bytes/group)",
                     w_meta.shape, s_meta.shape
                 ));
             }

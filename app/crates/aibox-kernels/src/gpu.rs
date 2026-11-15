@@ -69,6 +69,9 @@ type FnLmHeadF16ActF16 = unsafe extern "C" fn(*const u16, *const u16, *mut f32, 
 #[cfg(target_os = "linux")]
 type FnLmHeadF32ActF16 = unsafe extern "C" fn(*const u16, *const f32, *mut f32, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
+type FnLmHeadQuantActF16 =
+    unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut f32, c_int, c_int, c_int) -> c_int;
+#[cfg(target_os = "linux")]
 type FnGraphCapture = unsafe extern "C" fn() -> c_int;
 #[cfg(target_os = "linux")]
 type FnGraphLaunch = unsafe extern "C" fn(*mut u16, *const u16, c_int, c_int) -> c_int;
@@ -123,6 +126,7 @@ struct CudaSymbols {
     swiglu_fwht128_inplace_f16: FnSwigluInplaceF16,
     lm_head_f16_act_f16: FnLmHeadF16ActF16,
     lm_head_f32_act_f16: FnLmHeadF32ActF16,
+    lm_head_quant_act_f16: FnLmHeadQuantActF16,
     graph_begin_capture: FnGraphCapture,
     graph_end_capture: FnGraphCapture,
     graph_launch: FnGraphLaunch,
@@ -372,6 +376,7 @@ impl GpuBackend {
                 swiglu_fwht128_inplace_f16: load_symbol(handle, "aibox_gpu_swiglu_fwht128_inplace_f16")?,
                 lm_head_f16_act_f16: load_symbol(handle, "aibox_gpu_lm_head_f16_act_f16")?,
                 lm_head_f32_act_f16: load_symbol(handle, "aibox_gpu_lm_head_f32_act_f16")?,
+                lm_head_quant_act_f16: load_symbol(handle, "aibox_gpu_lm_head_quant_act_f16")?,
                 graph_begin_capture: load_symbol(handle, "aibox_gpu_graph_begin_capture")?,
                 graph_end_capture: load_symbol(handle, "aibox_gpu_graph_end_capture")?,
                 graph_launch: load_symbol(handle, "aibox_gpu_graph_launch")?,
@@ -685,6 +690,32 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_lm_head_f32_act_f16", status)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn lm_head_quant_act_f16(
+        &self,
+        hidden: &GpuBuffer<'_, u16>,
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        logits_dev: &mut GpuBuffer<'_, f32>,
+        vocab_size: usize,
+        hidden_size: usize,
+        bits: u8,
+    ) -> Result<(), BackendError> {
+        let (dev_w, dev_scales) = self.get_or_upload_weights(packed_weights, scales_fp16)?;
+        let status = unsafe {
+            (self.symbols.lm_head_quant_act_f16)(
+                hidden.as_ptr(),
+                dev_w,
+                dev_scales,
+                logits_dev.as_mut_ptr(),
+                vocab_size as c_int,
+                hidden_size as c_int,
+                bits as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_lm_head_quant_act_f16", status)
+    }
+
     pub fn graph_begin_capture(&self) -> Result<(), BackendError> {
         let status = unsafe { (self.symbols.graph_begin_capture)() };
         check_cuda_status("aibox_gpu_graph_begin_capture", status)
@@ -842,6 +873,10 @@ impl GpuBackend {
         Err(linux_only_err())
     }
     pub fn lm_head_f32_act_f16(&self, _hidden: &GpuBuffer<'_, u16>, _emb: &[f32], _logits: &mut GpuBuffer<'_, f32>, _v: usize, _h: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn lm_head_quant_act_f16(&self, _hidden: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _logits: &mut GpuBuffer<'_, f32>, _v: usize, _h: usize, _bits: u8) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
     pub fn graph_begin_capture(&self) -> Result<(), BackendError> {

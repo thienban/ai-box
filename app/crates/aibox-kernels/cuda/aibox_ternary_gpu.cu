@@ -940,6 +940,59 @@ __global__ void lm_head_f32_act_f16_kernel(
     }
 }
 
+template <int Bits>
+__global__ void lm_head_quant_act_f16_kernel(
+    const __half* __restrict__ hidden,
+    const uint8_t* __restrict__ w_packed,
+    const uint16_t* __restrict__ scales,
+    float* __restrict__ logits,
+    int vocab_size,
+    int hidden_size
+) {
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int v = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    if (v >= vocab_size) {
+        return;
+    }
+
+    int groups_per_row = hidden_size / GROUP_SIZE;
+    int bytes_per_group = (Bits == 4) ? 64 : 128;
+    const uint8_t* w_row = w_packed + (size_t)v * groups_per_row * bytes_per_group;
+    const uint16_t* s_row = scales + (size_t)v * groups_per_row;
+    float total = 0.0f;
+
+    for (int g = 0; g < groups_per_row; ++g) {
+        uint2 x_u2 = *reinterpret_cast<const uint2*>(&hidden[g * GROUP_SIZE + lane * 4]);
+        const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+        float2 x0 = __half22float2(h2[0]);
+        float2 x1 = __half22float2(h2[1]);
+        float scale = __half2float(*reinterpret_cast<const __half*>(&s_row[g]));
+        float dot = 0.0f;
+
+        if (Bits == 8) {
+            uint32_t w4 = *reinterpret_cast<const uint32_t*>(&w_row[g * 128 + lane * 4]);
+            int8_t q0 = static_cast<int8_t>(w4 & 0xFF);
+            int8_t q1 = static_cast<int8_t>((w4 >> 8) & 0xFF);
+            int8_t q2 = static_cast<int8_t>((w4 >> 16) & 0xFF);
+            int8_t q3 = static_cast<int8_t>((w4 >> 24) & 0xFF);
+            dot = (float)q0 * x0.x + (float)q1 * x0.y + (float)q2 * x1.x + (float)q3 * x1.y;
+        } else {
+            uint16_t w2 = *reinterpret_cast<const uint16_t*>(&w_row[g * 64 + lane * 2]);
+            float q0 = (float)((w2 & 0x0F)) - 8.0f;
+            float q1 = (float)(((w2 >> 4) & 0x0F)) - 8.0f;
+            float q2 = (float)(((w2 >> 8) & 0x0F)) - 8.0f;
+            float q3 = (float)(((w2 >> 12) & 0x0F)) - 8.0f;
+            dot = q0 * x0.x + q1 * x0.y + q2 * x1.x + q3 * x1.y;
+        }
+        total += dot * scale;
+    }
+
+    total = warp_reduce_sum(total);
+    if (lane == 0) {
+        logits[v] = total;
+    }
+}
+
 template <bool AddResidual, typename OutT>
 static int launch_gemv_f16(
     const uint16_t* dev_x,
@@ -1305,6 +1358,32 @@ int aibox_gpu_lm_head_f32_act_f16(
         vocab_size,
         hidden_size
     );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_lm_head_quant_act_f16(
+    const uint16_t* dev_hidden,
+    const uint8_t* dev_w,
+    const uint16_t* dev_scales,
+    float* dev_logits,
+    int vocab_size,
+    int hidden_size,
+    int bits
+) {
+    if (bits != 4 && bits != 8) {
+        return -1;
+    }
+    int blocks = (vocab_size + 3) / 4;
+    const __half* hx = reinterpret_cast<const __half*>(dev_hidden);
+    if (bits == 4) {
+        lm_head_quant_act_f16_kernel<4><<<blocks, 128, 0, g_active_stream>>>(
+            hx, dev_w, dev_scales, dev_logits, vocab_size, hidden_size
+        );
+    } else {
+        lm_head_quant_act_f16_kernel<8><<<blocks, 128, 0, g_active_stream>>>(
+            hx, dev_w, dev_scales, dev_logits, vocab_size, hidden_size
+        );
+    }
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 

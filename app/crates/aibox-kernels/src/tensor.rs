@@ -146,9 +146,10 @@ impl TernaryTensor {
         let bytes_per_group = match bits {
             1 => BINARY_PACKED_BYTES_PER_GROUP,
             2 => PACKED_BYTES_PER_GROUP,
+            4 | 8 => (GROUP_SIZE * bits as usize) / 8,
             other => {
                 return Err(BackendError::InvalidDimensions(format!(
-                    "unsupported quantized bit width {other} (expected 1 or 2)"
+                    "unsupported quantized bit width {other} (expected 1, 2, 4 or 8)"
                 )))
             }
         };
@@ -192,14 +193,9 @@ impl TernaryTensor {
         self.bits == 1
     }
 
-    /// Vérifie le stride d'une ligne en octets (multiple de 16 ou 32 octets).
+    /// Vérifie le stride d'une ligne en octets (16, 32, 64 ou 128 octets par groupe).
     pub fn row_stride_bytes(&self) -> usize {
-        let bytes_per_group = if self.is_binary() {
-            BINARY_PACKED_BYTES_PER_GROUP
-        } else {
-            PACKED_BYTES_PER_GROUP
-        };
-        (self.k_cols / GROUP_SIZE) * bytes_per_group
+        (self.k_cols / GROUP_SIZE) * ((GROUP_SIZE * self.bits as usize) / 8)
     }
 }
 

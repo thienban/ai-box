@@ -88,6 +88,33 @@ def quantize_hadamard(
     return packed_u8, scales_f16
 
 
+def quantize_grouped_linear(weight_f32: np.ndarray, bits: int) -> tuple[np.ndarray, np.ndarray]:
+    """Quantifie [N, K] sans Hadamard par groupes de 128 en Q8 (int8->uint8) ou Q4 (offset +8, 2/octet)."""
+    if bits not in (4, 8):
+        raise ValueError(f"bits={bits} non supporté (attendu 4 ou 8)")
+    n_rows, k_cols = weight_f32.shape
+    if k_cols % GROUP_SIZE != 0:
+        raise ValueError(f"k_cols={k_cols} doit être multiple de {GROUP_SIZE}")
+    n_groups = k_cols // GROUP_SIZE
+    out_cols = k_cols if bits == 8 else k_cols // 2
+    packed_out = np.empty((n_rows, out_cols), dtype=np.uint8)
+    scales_out = np.empty((n_rows, n_groups), dtype=np.float16)
+    qmax = 127.0 if bits == 8 else 7.0
+
+    for start in range(0, n_rows, 4096):
+        end = min(start + 4096, n_rows)
+        chunk = weight_f32[start:end].reshape(-1, n_groups, GROUP_SIZE)
+        scales = np.maximum(np.abs(chunk).max(axis=-1), 1e-8) / qmax
+        q = np.clip(np.round(chunk / scales[..., None]), -qmax, qmax).astype(np.int16)
+        scales_out[start:end] = scales.astype(np.float16)
+        if bits == 8:
+            packed_out[start:end] = q.astype(np.int8).view(np.uint8).reshape(-1, k_cols)
+        else:
+            u4 = (q + 8).astype(np.uint8).reshape(-1, k_cols // 2, 2)
+            packed_out[start:end] = u4[..., 0] | (u4[..., 1] << 4)
+    return packed_out, scales_out
+
+
 def get_gguf_scalar(reader: Any, keys: list[str], default: Any = None) -> Any:
     for key in keys:
         field = reader.fields.get(key)
@@ -214,6 +241,7 @@ def convert_gguf(
     max_layers: int | None,
     force_hadamard: bool = False,
     bits: int = 2,
+    lm_head_bits: int = 16,
 ) -> None:
     import gguf
     from safetensors.numpy import save_file
@@ -266,6 +294,12 @@ def convert_gguf(
             tensors_out[target_name] = packed_u8
             tensors_out[scale_name] = scales_f16
             print(f"  [{bits}-bit] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
+        elif target_name == "output.weight" and lm_head_bits in (4, 8):
+            dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
+            packed_u8, scales_f16 = quantize_grouped_linear(dequant, lm_head_bits)
+            tensors_out["output.weight"] = packed_u8
+            tensors_out["output.scales"] = scales_f16
+            print(f"  [Q{lm_head_bits}   ] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
         else:
             dequant_f16 = dequantize_tensor(tensor, gguf, target_dtype=np.float16)
             tensors_out[target_name] = dequant_f16
@@ -297,6 +331,13 @@ def main() -> None:
         default=2,
         help="Largeur des poids quantifiés (1=binaire {-1,+1}, 2=ternaire {-1,0,+1})",
     )
+    parser.add_argument(
+        "--lm-head-bits",
+        type=int,
+        choices=[4, 8, 16],
+        default=16,
+        help="Largeur de quantification de output.weight / lm_head (4=Q4, 8=Q8, 16=FP16)",
+    )
     args = parser.parse_args()
     convert_gguf(
         args.gguf,
@@ -304,6 +345,7 @@ def main() -> None:
         args.max_layers,
         force_hadamard=args.force_hadamard,
         bits=args.bits,
+        lm_head_bits=args.lm_head_bits,
     )
 
 

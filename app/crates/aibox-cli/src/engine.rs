@@ -382,6 +382,40 @@ fn silu(val: f32) -> f32 {
     val / (1.0 + (-val).exp())
 }
 
+fn dot_quantized_group(x_g: &[f32], w_g: &[u8], bits: u8) -> f32 {
+    if bits == 8 {
+        return x_g.iter().zip(w_g.iter()).map(|(&x, &b)| x * (b as i8) as f32).sum();
+    }
+    w_g.iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let q0 = ((b & 0x0F) as i32 - 8) as f32;
+            let q1 = (((b >> 4) & 0x0F) as i32 - 8) as f32;
+            x_g[i * 2] * q0 + x_g[i * 2 + 1] * q1
+        })
+        .sum()
+}
+
+fn dot_quantized_lm_head_cpu(hidden: &[f32], tensor: &TernaryTensor) -> Vec<f32> {
+    let lut = f16_lut();
+    let n_groups = tensor.k_cols / aibox_kernels::GROUP_SIZE;
+    let bytes_per_group = (aibox_kernels::GROUP_SIZE * tensor.bits as usize) / 8;
+    let row_stride = n_groups * bytes_per_group;
+    (0..tensor.n_rows)
+        .map(|row| {
+            let w_row = &tensor.packed_weights[row * row_stride..(row + 1) * row_stride];
+            let s_row = &tensor.scales_fp16[row * n_groups..(row + 1) * n_groups];
+            (0..n_groups)
+                .map(|g| {
+                    let x_g = &hidden[g * aibox_kernels::GROUP_SIZE..(g + 1) * aibox_kernels::GROUP_SIZE];
+                    let w_g = &w_row[g * bytes_per_group..(g + 1) * bytes_per_group];
+                    dot_quantized_group(x_g, w_g, tensor.bits) * lut[s_row[g] as usize]
+                })
+                .sum()
+        })
+        .collect()
+}
+
 impl TransformerModel {
     /// Charge un modèle réel AI Box (config.json + quant_config.json + model.safetensors).
     pub fn load_from_dir(model_dir: &Path) -> Result<Self, String> {
@@ -560,6 +594,9 @@ impl TransformerModel {
     ) -> Result<Vec<f32>, String> {
         let hidden_size = self.config.hidden_size;
         match &self.lm_head {
+            LmHead::Ternary(tensor) if tensor.bits == 4 || tensor.bits == 8 => {
+                Ok(dot_quantized_lm_head_cpu(final_hidden, tensor))
+            }
             LmHead::Ternary(tensor) => {
                 project_ternary(backend, final_hidden, tensor, self.config.use_hadamard)
             }
@@ -936,6 +973,20 @@ impl TransformerModel {
         let cfg = &self.config;
         let h = cfg.hidden_size;
         match &self.lm_head {
+            LmHead::Ternary(tensor) if tensor.bits == 4 || tensor.bits == 8 => {
+                gpu.rms_norm_f16(&s.hidden, &self.final_norm, &mut s.normed, 1, h, cfg.rms_norm_eps)
+                    .map_err(|e| e.to_string())?;
+                gpu.lm_head_quant_act_f16(
+                    &s.normed,
+                    &tensor.packed_weights,
+                    &tensor.scales_fp16,
+                    &mut s.logits,
+                    cfg.vocab_size,
+                    h,
+                    tensor.bits,
+                )
+                .map_err(|e| e.to_string())
+            }
             LmHead::Ternary(tensor) => {
                 if cfg.use_hadamard {
                     gpu.rms_norm_fwht128_f16(&s.hidden, &self.final_norm, &mut s.normed, 1, h, cfg.rms_norm_eps)
@@ -1128,5 +1179,54 @@ mod tests {
             .map(|(&a, &b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-4, "max_diff={max_diff} >= 1e-4");
+    }
+
+    #[test]
+    fn dot_quantized_lm_head_cpu_matches_q8_and_q4_reference() {
+        let rows = 2;
+        let cols = 128;
+        let act: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.03) - 1.5).collect();
+        let scale_f16 = aibox_kernels::tensor::f32_to_f16(0.25);
+        let scale = aibox_kernels::tensor::f16_to_f32(scale_f16);
+
+        let q8_packed: Vec<u8> = (0..(rows * cols))
+            .map(|i| (((i % 251) as i32 - 125) as i8) as u8)
+            .collect();
+        let q8_tensor = TernaryTensor::from_raw_with_bits(
+            rows,
+            cols,
+            8,
+            q8_packed.clone(),
+            vec![scale_f16; rows],
+        )
+        .unwrap();
+        let q8_out = dot_quantized_lm_head_cpu(&act, &q8_tensor);
+        for r in 0..rows {
+            let expected: f32 = (0..cols)
+                .map(|c| (q8_packed[r * cols + c] as i8 as f32) * scale * act[c])
+                .sum();
+            assert!((q8_out[r] - expected).abs() < 1e-3, "q8 row {r}: {} vs {expected}", q8_out[r]);
+        }
+
+        let q4_packed: Vec<u8> = (0..(rows * 64)).map(|i| ((i * 37) & 0xFF) as u8).collect();
+        let q4_tensor = TernaryTensor::from_raw_with_bits(
+            rows,
+            cols,
+            4,
+            q4_packed.clone(),
+            vec![scale_f16; rows],
+        )
+        .unwrap();
+        let q4_out = dot_quantized_lm_head_cpu(&act, &q4_tensor);
+        for r in 0..rows {
+            let mut expected = 0.0f32;
+            for b in 0..64 {
+                let byte = q4_packed[r * 64 + b];
+                let q0 = ((byte & 0x0F) as i32 - 8) as f32;
+                let q1 = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
+                expected += (q0 * act[2 * b] + q1 * act[2 * b + 1]) * scale;
+            }
+            assert!((q4_out[r] - expected).abs() < 1e-3, "q4 row {r}: {} vs {expected}", q4_out[r]);
+        }
     }
 }
