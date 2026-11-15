@@ -9,7 +9,7 @@ pub mod tensor;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod avx2;
 
-pub use gpu::GpuBackend;
+pub use gpu::{GpuBackend, GpuBuffer};
 
 use std::fmt;
 
@@ -78,6 +78,11 @@ pub trait TernaryHadamardBackend: Send + Sync {
                 "Plain ternary matmul (hadamard=false) not implemented for this backend".to_string(),
             ))
         }
+    }
+
+    /// Retourne une référence vers le backend GPU CUDA si ce backend s'exécute sur GPU.
+    fn as_gpu(&self) -> Option<&GpuBackend> {
+        None
     }
 }
 

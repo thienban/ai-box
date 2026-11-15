@@ -1,7 +1,4 @@
-//! Backend GPU CUDA chargé dynamiquement (`libaibox_gpu.so`) avec cache VRAM des poids.
-//!
-//! Zéro dépendance externe : compile sans SDK CUDA sur Windows/macOS/Linux
-//! et charge la bibliothèque partagée CUDA au runtime sous Linux.
+//! Backend GPU CUDA chargé dynamiquement (`libaibox_gpu.so`) avec cache VRAM.
 
 use crate::{validate_matmul_inputs, BackendError, TernaryHadamardBackend};
 
@@ -26,9 +23,46 @@ unsafe extern "C" {
 #[cfg(target_os = "linux")]
 type FnIsAvailable = unsafe extern "C" fn() -> c_int;
 #[cfg(target_os = "linux")]
+type FnAlloc = unsafe extern "C" fn(usize) -> *mut c_void;
+#[cfg(target_os = "linux")]
 type FnAllocCopy = unsafe extern "C" fn(*const c_void, usize) -> *mut c_void;
 #[cfg(target_os = "linux")]
 type FnFree = unsafe extern "C" fn(*mut c_void);
+#[cfg(target_os = "linux")]
+type FnMemcpyH2D = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
+#[cfg(target_os = "linux")]
+type FnMemcpyD2H = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
+#[cfg(target_os = "linux")]
+type FnFwht128 = unsafe extern "C" fn(*mut f32, c_int, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnMatmulTernaryDev =
+    unsafe extern "C" fn(*const f32, *const u8, *const u16, *mut f32, c_int, c_int, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnRmsNorm = unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, f32) -> c_int;
+#[cfg(target_os = "linux")]
+type FnRmsNormHeadsRope =
+    unsafe extern "C" fn(*mut f32, *const f32, c_int, c_int, c_int, f32, f32) -> c_int;
+#[cfg(target_os = "linux")]
+type FnKvAppendGqa = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut f32,
+    *mut f32,
+    *mut f32,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+) -> c_int;
+#[cfg(target_os = "linux")]
+type FnSwigluInplace = unsafe extern "C" fn(*mut f32, *const f32, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnAddInplace = unsafe extern "C" fn(*mut f32, *const f32, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnLmHeadF16 = unsafe extern "C" fn(*const f32, *const u16, *mut f32, c_int, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnLmHeadF32 = unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
 type FnMatmulTernary = unsafe extern "C" fn(
     *const f32,
@@ -53,10 +87,29 @@ unsafe impl Send for GpuWeightPair {}
 unsafe impl Sync for GpuWeightPair {}
 
 #[cfg(target_os = "linux")]
+struct RawPtr(*mut c_void);
+#[cfg(target_os = "linux")]
+unsafe impl Send for RawPtr {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for RawPtr {}
+
+#[cfg(target_os = "linux")]
 struct CudaSymbols {
     handle: *mut c_void,
+    alloc: FnAlloc,
     alloc_copy: FnAllocCopy,
     free: FnFree,
+    memcpy_h2d: FnMemcpyH2D,
+    memcpy_d2h: FnMemcpyD2H,
+    fwht128: FnFwht128,
+    matmul_ternary_dev: FnMatmulTernaryDev,
+    rms_norm: FnRmsNorm,
+    rms_norm_heads_rope: FnRmsNormHeadsRope,
+    kv_append_gqa: FnKvAppendGqa,
+    swiglu_inplace: FnSwigluInplace,
+    add_inplace: FnAddInplace,
+    lm_head_f16: FnLmHeadF16,
+    lm_head_f32: FnLmHeadF32,
     matmul_ternary: FnMatmulTernary,
 }
 
@@ -68,12 +121,120 @@ unsafe impl Sync for CudaSymbols {}
 #[cfg(target_os = "linux")]
 type WeightCacheKey = (usize, usize, usize, usize);
 
+/// Tampon f32 alloué en VRAM avec libération automatique (RAII).
+pub struct GpuBuffer<'a> {
+    #[cfg(target_os = "linux")]
+    gpu: &'a GpuBackend,
+    #[cfg(target_os = "linux")]
+    ptr: *mut f32,
+    #[cfg(not(target_os = "linux"))]
+    _phantom: std::marker::PhantomData<&'a ()>,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GpuBuffer<'_> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { (self.gpu.symbols.free)(self.ptr as *mut c_void) };
+        }
+    }
+}
+
+impl<'a> GpuBuffer<'a> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn as_ptr(&self) -> *const f32 {
+        self.ptr
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn as_mut_ptr(&mut self) -> *mut f32 {
+        self.ptr
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn upload(&mut self, data: &[f32]) -> Result<(), BackendError> {
+        if data.len() > self.len {
+            return Err(BackendError::BufferLengthMismatch(format!(
+                "upload {} > GpuBuffer len {}",
+                data.len(),
+                self.len
+            )));
+        }
+        let status = unsafe {
+            (self.gpu.symbols.memcpy_h2d)(
+                self.ptr as *mut c_void,
+                data.as_ptr() as *const c_void,
+                std::mem::size_of_val(data),
+            )
+        };
+        check_cuda_status("cudaMemcpy H2D", status)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn download(&self, out: &mut [f32]) -> Result<(), BackendError> {
+        if out.len() > self.len {
+            return Err(BackendError::BufferLengthMismatch(format!(
+                "download {} > GpuBuffer len {}",
+                out.len(),
+                self.len
+            )));
+        }
+        let status = unsafe {
+            (self.gpu.symbols.memcpy_d2h)(
+                out.as_mut_ptr() as *mut c_void,
+                self.ptr as *const c_void,
+                std::mem::size_of_val(out),
+            )
+        };
+        check_cuda_status("cudaMemcpy D2H", status)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn upload(&mut self, _data: &[f32]) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn download(&self, _out: &mut [f32]) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+}
+
 /// Backend d'inférence ternaire sur GPU CUDA (via `libaibox_gpu.so`).
 pub struct GpuBackend {
     #[cfg(target_os = "linux")]
     symbols: CudaSymbols,
     #[cfg(target_os = "linux")]
-    cache: Mutex<HashMap<WeightCacheKey, GpuWeightPair>>,
+    weight_cache: Mutex<HashMap<WeightCacheKey, GpuWeightPair>>,
+    #[cfg(target_os = "linux")]
+    raw_cache: Mutex<HashMap<(usize, usize), RawPtr>>,
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_only_err() -> BackendError {
+    BackendError::UnsupportedFeature(
+        "CUDA dynamic library backend is only supported on Linux".to_string(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn check_cuda_status(op: &str, status: c_int) -> Result<(), BackendError> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(BackendError::UnsupportedFeature(format!(
+            "{op} failed with status {status}"
+        )))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -132,8 +293,20 @@ impl GpuBackend {
                 }
                 Ok(CudaSymbols {
                     handle,
+                    alloc: load_symbol(handle, "aibox_gpu_alloc")?,
                     alloc_copy: load_symbol(handle, "aibox_gpu_alloc_copy")?,
                     free: load_symbol(handle, "aibox_gpu_free")?,
+                    memcpy_h2d: load_symbol(handle, "aibox_gpu_memcpy_h2d")?,
+                    memcpy_d2h: load_symbol(handle, "aibox_gpu_memcpy_d2h")?,
+                    fwht128: load_symbol(handle, "aibox_gpu_fwht128")?,
+                    matmul_ternary_dev: load_symbol(handle, "aibox_gpu_matmul_ternary_dev")?,
+                    rms_norm: load_symbol(handle, "aibox_gpu_rms_norm")?,
+                    rms_norm_heads_rope: load_symbol(handle, "aibox_gpu_rms_norm_heads_rope")?,
+                    kv_append_gqa: load_symbol(handle, "aibox_gpu_kv_append_gqa")?,
+                    swiglu_inplace: load_symbol(handle, "aibox_gpu_swiglu_inplace")?,
+                    add_inplace: load_symbol(handle, "aibox_gpu_add_inplace")?,
+                    lm_head_f16: load_symbol(handle, "aibox_gpu_lm_head_f16")?,
+                    lm_head_f32: load_symbol(handle, "aibox_gpu_lm_head_f32")?,
                     matmul_ternary: load_symbol(handle, "aibox_gpu_matmul_ternary")?,
                 })
             })();
@@ -141,7 +314,8 @@ impl GpuBackend {
             match load_result {
                 Ok(symbols) => Ok(Self {
                     symbols,
-                    cache: Mutex::new(HashMap::new()),
+                    weight_cache: Mutex::new(HashMap::new()),
+                    raw_cache: Mutex::new(HashMap::new()),
                 }),
                 Err(err) => {
                     unsafe { dlclose(handle) };
@@ -152,10 +326,322 @@ impl GpuBackend {
 
         #[cfg(not(target_os = "linux"))]
         {
-            Err(BackendError::UnsupportedFeature(
-                "CUDA dynamic library backend is only supported on Linux".to_string(),
-            ))
+            Err(linux_only_err())
         }
+    }
+
+    pub fn alloc_f32(&self, len: usize) -> Result<GpuBuffer<'_>, BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let bytes = len.max(1) * std::mem::size_of::<f32>();
+            let ptr = unsafe { (self.symbols.alloc)(bytes) };
+            if ptr.is_null() {
+                return Err(BackendError::UnsupportedFeature(
+                    "cudaMalloc failed for GpuBuffer".to_string(),
+                ));
+            }
+            Ok(GpuBuffer {
+                gpu: self,
+                ptr: ptr as *mut f32,
+                len,
+            })
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = len;
+            Err(linux_only_err())
+        }
+    }
+
+    pub fn fwht128_inplace(&self, buf: &mut GpuBuffer<'_>, m: usize, k: usize) -> Result<(), BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let status = unsafe { (self.symbols.fwht128)(buf.as_mut_ptr(), m as c_int, k as c_int) };
+            check_cuda_status("aibox_gpu_fwht128", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (buf, m, k);
+            Err(linux_only_err())
+        }
+    }
+
+    pub fn matmul_ternary_dev(
+        &self,
+        x: &GpuBuffer<'_>,
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        out: &mut GpuBuffer<'_>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let (dev_w, dev_scales) = self.get_or_upload_weights(packed_weights, scales_fp16)?;
+            let status = unsafe {
+                (self.symbols.matmul_ternary_dev)(
+                    x.as_ptr(),
+                    dev_w,
+                    dev_scales,
+                    out.as_mut_ptr(),
+                    m as c_int,
+                    n as c_int,
+                    k as c_int,
+                )
+            };
+            check_cuda_status("aibox_gpu_matmul_ternary_dev", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (x, packed_weights, scales_fp16, out, m, n, k);
+            Err(linux_only_err())
+        }
+    }
+
+    pub fn rms_norm(
+        &self,
+        x: &GpuBuffer<'_>,
+        weight: &[f32],
+        out: &mut GpuBuffer<'_>,
+        m: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let dev_w = self.get_or_upload_raw_f32(weight)?;
+            let status = unsafe {
+                (self.symbols.rms_norm)(
+                    x.as_ptr(),
+                    dev_w,
+                    out.as_mut_ptr(),
+                    m as c_int,
+                    dim as c_int,
+                    eps,
+                )
+            };
+            check_cuda_status("aibox_gpu_rms_norm", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (x, weight, out, m, dim, eps);
+            Err(linux_only_err())
+        }
+    }
+
+    pub fn rms_norm_heads_rope(
+        &self,
+        vec: &mut GpuBuffer<'_>,
+        norm_w: Option<&[f32]>,
+        num_heads: usize,
+        head_dim: usize,
+        pos: usize,
+        theta: f32,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let dev_norm = match norm_w {
+                Some(w) => self.get_or_upload_raw_f32(w)?,
+                None => std::ptr::null(),
+            };
+            let status = unsafe {
+                (self.symbols.rms_norm_heads_rope)(
+                    vec.as_mut_ptr(),
+                    dev_norm,
+                    num_heads as c_int,
+                    head_dim as c_int,
+                    pos as c_int,
+                    theta,
+                    eps,
+                )
+            };
+            check_cuda_status("aibox_gpu_rms_norm_heads_rope", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (vec, norm_w, num_heads, head_dim, pos, theta, eps);
+            Err(linux_only_err())
+        }
+    }
+
+    pub fn kv_append_gqa(
+        &self,
+        q: &GpuBuffer<'_>,
+        k: &GpuBuffer<'_>,
+        v: &GpuBuffer<'_>,
+        k_cache: &mut GpuBuffer<'_>,
+        v_cache: &mut GpuBuffer<'_>,
+        out: &mut GpuBuffer<'_>,
+        pos: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let status = unsafe {
+                (self.symbols.kv_append_gqa)(
+                    q.as_ptr(),
+                    k.as_ptr(),
+                    v.as_ptr(),
+                    k_cache.as_mut_ptr(),
+                    v_cache.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    pos as c_int,
+                    num_q_heads as c_int,
+                    num_kv_heads as c_int,
+                    head_dim as c_int,
+                )
+            };
+            check_cuda_status("aibox_gpu_kv_append_gqa", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (q, k, v, k_cache, v_cache, out, pos, num_q_heads, num_kv_heads, head_dim);
+            Err(linux_only_err())
+        }
+    }
+
+    pub fn swiglu_inplace(
+        &self,
+        gate: &mut GpuBuffer<'_>,
+        up: &GpuBuffer<'_>,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let status = unsafe {
+                (self.symbols.swiglu_inplace)(gate.as_mut_ptr(), up.as_ptr(), len as c_int)
+            };
+            check_cuda_status("aibox_gpu_swiglu_inplace", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (gate, up, len);
+            Err(linux_only_err())
+        }
+    }
+
+    pub fn add_inplace(
+        &self,
+        target: &mut GpuBuffer<'_>,
+        delta: &GpuBuffer<'_>,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let status = unsafe {
+                (self.symbols.add_inplace)(target.as_mut_ptr(), delta.as_ptr(), len as c_int)
+            };
+            check_cuda_status("aibox_gpu_add_inplace", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (target, delta, len);
+            Err(linux_only_err())
+        }
+    }
+
+    pub fn lm_head_f16(
+        &self,
+        hidden: &GpuBuffer<'_>,
+        emb_f16: &[u16],
+        logits_dev: &mut GpuBuffer<'_>,
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<(), BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let dev_emb = self.get_or_upload_raw_u16(emb_f16)?;
+            let status = unsafe {
+                (self.symbols.lm_head_f16)(
+                    hidden.as_ptr(),
+                    dev_emb,
+                    logits_dev.as_mut_ptr(),
+                    vocab_size as c_int,
+                    hidden_size as c_int,
+                )
+            };
+            check_cuda_status("aibox_gpu_lm_head_f16", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (hidden, emb_f16, logits_dev, vocab_size, hidden_size);
+            Err(linux_only_err())
+        }
+    }
+
+    pub fn lm_head_f32(
+        &self,
+        hidden: &GpuBuffer<'_>,
+        emb_f32: &[f32],
+        logits_dev: &mut GpuBuffer<'_>,
+        vocab_size: usize,
+        hidden_size: usize,
+    ) -> Result<(), BackendError> {
+        #[cfg(target_os = "linux")]
+        {
+            let dev_emb = self.get_or_upload_raw_f32(emb_f32)?;
+            let status = unsafe {
+                (self.symbols.lm_head_f32)(
+                    hidden.as_ptr(),
+                    dev_emb,
+                    logits_dev.as_mut_ptr(),
+                    vocab_size as c_int,
+                    hidden_size as c_int,
+                )
+            };
+            check_cuda_status("aibox_gpu_lm_head_f32", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (hidden, emb_f32, logits_dev, vocab_size, hidden_size);
+            Err(linux_only_err())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn get_or_upload_raw_bytes(
+        &self,
+        host_ptr: *const c_void,
+        byte_len: usize,
+    ) -> Result<*mut c_void, BackendError> {
+        let key = (host_ptr as usize, byte_len);
+        let mut guard = self.raw_cache.lock().map_err(|_| {
+            BackendError::UnsupportedFeature("GPU raw cache mutex poisoned".to_string())
+        })?;
+        if let Some(entry) = guard.get(&key) {
+            return Ok(entry.0);
+        }
+        let dev_ptr = unsafe { (self.symbols.alloc_copy)(host_ptr, byte_len) };
+        if dev_ptr.is_null() {
+            return Err(BackendError::UnsupportedFeature(
+                "cudaMalloc/cudaMemcpy failed for raw tensor".to_string(),
+            ));
+        }
+        guard.insert(key, RawPtr(dev_ptr));
+        Ok(dev_ptr)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn get_or_upload_raw_f32(&self, slice: &[f32]) -> Result<*const f32, BackendError> {
+        let ptr = self.get_or_upload_raw_bytes(
+            slice.as_ptr() as *const c_void,
+            std::mem::size_of_val(slice),
+        )?;
+        Ok(ptr as *const f32)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn get_or_upload_raw_u16(&self, slice: &[u16]) -> Result<*const u16, BackendError> {
+        let ptr = self.get_or_upload_raw_bytes(
+            slice.as_ptr() as *const c_void,
+            std::mem::size_of_val(slice),
+        )?;
+        Ok(ptr as *const u16)
     }
 
     #[cfg(target_os = "linux")]
@@ -204,7 +690,7 @@ impl GpuBackend {
             scales_fp16.as_ptr() as usize,
             scales_fp16.len(),
         );
-        let mut guard = self.cache.lock().map_err(|_| {
+        let mut guard = self.weight_cache.lock().map_err(|_| {
             BackendError::UnsupportedFeature("GPU weight cache mutex poisoned".to_string())
         })?;
 
@@ -222,7 +708,7 @@ impl GpuBackend {
 #[cfg(target_os = "linux")]
 impl Drop for GpuBackend {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.cache.lock() {
+        if let Ok(mut guard) = self.weight_cache.lock() {
             for (_, pair) in guard.drain() {
                 unsafe {
                     (self.symbols.free)(pair.dev_w);
@@ -230,13 +716,20 @@ impl Drop for GpuBackend {
                 }
             }
         }
-        unsafe {
-            dlclose(self.symbols.handle);
+        if let Ok(mut guard) = self.raw_cache.lock() {
+            for (_, raw) in guard.drain() {
+                unsafe { (self.symbols.free)(raw.0) };
+            }
         }
+        unsafe { dlclose(self.symbols.handle) };
     }
 }
 
 impl TernaryHadamardBackend for GpuBackend {
+    fn as_gpu(&self) -> Option<&GpuBackend> {
+        Some(self)
+    }
+
     fn matmul_hadamard_ternary(
         &self,
         activations: &[f32],
@@ -277,20 +770,14 @@ impl TernaryHadamardBackend for GpuBackend {
                     if use_hadamard { 1 } else { 0 },
                 )
             };
-            if status != 0 {
-                return Err(BackendError::UnsupportedFeature(format!(
-                    "aibox_gpu_matmul_ternary failed with status {status}"
-                )));
-            }
+            check_cuda_status("aibox_gpu_matmul_ternary", status)?;
             Ok(out)
         }
 
         #[cfg(not(target_os = "linux"))]
         {
             let _ = use_hadamard;
-            Err(BackendError::UnsupportedFeature(
-                "CUDA dynamic library backend is only supported on Linux".to_string(),
-            ))
+            Err(linux_only_err())
         }
     }
 }
