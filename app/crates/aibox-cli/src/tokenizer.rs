@@ -139,28 +139,107 @@ impl SimpleTokenizer {
         ids
     }
 
-    pub fn decode_token(&self, token_id: usize) -> String {
-        let piece = self.id_to_piece.get(token_id).map(String::as_str).unwrap_or("");
+    pub fn decode(&self, token_ids: &[usize]) -> String {
+        let mut decoder = TokenStreamDecoder::new(self);
+        let mut out = String::new();
+        for &id in token_ids {
+            out.push_str(&decoder.push(id));
+        }
+        out.push_str(&decoder.finish());
+        out
+    }
+
+    fn raw_piece(&self, token_id: usize) -> &str {
+        self.id_to_piece.get(token_id).map(String::as_str).unwrap_or("")
+    }
+}
+
+/// Décodeur incrémental gérant les octets UTF-8 GPT-2/Qwen répartis sur plusieurs tokens.
+pub struct TokenStreamDecoder<'a> {
+    tokenizer: &'a SimpleTokenizer,
+    pending_bytes: Vec<u8>,
+}
+
+impl<'a> TokenStreamDecoder<'a> {
+    pub fn new(tokenizer: &'a SimpleTokenizer) -> Self {
+        Self {
+            tokenizer,
+            pending_bytes: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, token_id: usize) -> String {
+        let piece = self.tokenizer.raw_piece(token_id);
         if piece == "<|im_end|>" || piece == "<|endoftext|>" || piece == "<|im_start|>" {
             return String::new();
         }
-        piece
-            .chars()
-            .map(|ch| match ch {
-                '\u{0120}' => ' ',
-                '\u{010A}' => '\n',
-                other => other,
-            })
-            .collect()
+        for ch in piece.chars() {
+            if let Some(byte) = gpt2_unicode_to_byte(ch) {
+                self.pending_bytes.push(byte);
+            } else {
+                let mut buf = [0u8; 4];
+                self.pending_bytes
+                    .extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        self.drain_valid_utf8()
     }
 
-    pub fn decode(&self, token_ids: &[usize]) -> String {
-        let mut out = String::new();
-        for &id in token_ids {
-            out.push_str(&self.decode_token(id));
+    pub fn finish(&mut self) -> String {
+        if self.pending_bytes.is_empty() {
+            return String::new();
         }
-        out
+        let lossy = String::from_utf8_lossy(&self.pending_bytes).to_string();
+        self.pending_bytes.clear();
+        lossy
     }
+
+    fn drain_valid_utf8(&mut self) -> String {
+        match std::str::from_utf8(&self.pending_bytes) {
+            Ok(valid) => {
+                let s = valid.to_string();
+                self.pending_bytes.clear();
+                s
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to == 0 {
+                    if err.error_len().is_none() {
+                        return String::new();
+                    }
+                    let lossy = String::from_utf8_lossy(&self.pending_bytes).to_string();
+                    self.pending_bytes.clear();
+                    return lossy;
+                }
+                let s = std::str::from_utf8(&self.pending_bytes[..valid_up_to])
+                    .unwrap_or("")
+                    .to_string();
+                self.pending_bytes.drain(..valid_up_to);
+                s
+            }
+        }
+    }
+}
+
+fn gpt2_unicode_to_byte(ch: char) -> Option<u8> {
+    let code = ch as u32;
+    if (33..=126).contains(&code) || (161..=172).contains(&code) || (174..=255).contains(&code) {
+        return Some(code as u8);
+    }
+    if !(256..324).contains(&code) {
+        return None;
+    }
+    let mut target = 256u32;
+    for b in 0u32..=255 {
+        let printable = (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
+        if !printable {
+            if target == code {
+                return Some(b as u8);
+            }
+            target += 1;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -197,5 +276,27 @@ mod tests {
         let ids = tok.encode_chat("Bonjour Paris");
         assert_eq!(ids, vec![0, 2, 4, 5, 6, 7, 1, 4, 0, 3, 4]);
         assert_eq!(tok.decode(&[5, 6, 7]), "Bonjour Paris");
+    }
+
+    #[test]
+    fn decodes_gpt2_byte_level_utf8_emoji() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = env::temp_dir().join(format!("aibox_tok_utf8_{unique}.json"));
+        let json = r#"{
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "Bonjour": 0,
+                    "Ġ!": 1,
+                    "Ġ": 2,
+                    "ðŁĺĬ": 3
+                }
+            }
+        }"#;
+        fs::write(&path, json).unwrap();
+        let tok = SimpleTokenizer::from_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(tok.decode(&[0, 1, 2, 3]), "Bonjour ! 😊");
     }
 }

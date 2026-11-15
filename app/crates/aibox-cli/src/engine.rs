@@ -548,6 +548,23 @@ impl TransformerModel {
         params: SamplingParams,
         backend: &dyn TernaryHadamardBackend,
     ) -> Result<GenerationStats, String> {
+        self.generate_tokens_streaming(prompt_tokens, max_new_tokens, eos_token_id, params, backend, |_| {
+            Ok(())
+        })
+    }
+
+    pub fn generate_tokens_streaming<F>(
+        &self,
+        prompt_tokens: &[usize],
+        max_new_tokens: usize,
+        eos_token_id: Option<usize>,
+        params: SamplingParams,
+        backend: &dyn TernaryHadamardBackend,
+        mut on_token: F,
+    ) -> Result<GenerationStats, String>
+    where
+        F: FnMut(usize) -> Result<(), String>,
+    {
         if prompt_tokens.is_empty() {
             return Err("prompt_tokens cannot be empty".to_string());
         }
@@ -568,6 +585,7 @@ impl TransformerModel {
                 break;
             }
             generated.push(next_token);
+            on_token(next_token)?;
             if step + 1 == max_new_tokens {
                 break;
             }

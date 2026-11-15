@@ -17,7 +17,7 @@ use crate::engine::{
 use crate::json::{escape_json_string, parse_json, JsonValue};
 use crate::models;
 use crate::sampling::SamplingParams;
-use crate::tokenizer::SimpleTokenizer;
+use crate::tokenizer::{SimpleTokenizer, TokenStreamDecoder};
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 11434;
@@ -62,7 +62,6 @@ struct CompletionRequest {
 
 struct InferenceOutput {
     model: String,
-    chunks: Vec<String>,
     full_text: String,
     prompt_tokens: usize,
     completion_tokens: usize,
@@ -276,11 +275,11 @@ fn handle_openai_chat(stream: &mut TcpStream, body: &str, state: &ServerState) -
         Ok(req) => req,
         Err(err) => return write_json_error(stream, "400 Bad Request", &err),
     };
-    let output = run_inference(&req, state)?;
     if req.stream {
-        return send_openai_sse(stream, &output);
+        return stream_openai_sse(stream, &req, state);
     }
 
+    let output = run_inference(&req, state)?;
     let created = unix_timestamp_secs();
     let total_tokens = output.prompt_tokens + output.completion_tokens;
     let payload = format!(
@@ -301,11 +300,11 @@ fn handle_ollama_chat(stream: &mut TcpStream, body: &str, state: &ServerState) -
         Ok(req) => req,
         Err(err) => return write_json_error(stream, "400 Bad Request", &err),
     };
-    let output = run_inference(&req, state)?;
     if req.stream {
-        return send_ollama_ndjson(stream, &output, true);
+        return stream_ollama_ndjson(stream, &req, state, true);
     }
 
+    let output = run_inference(&req, state)?;
     let payload = format!(
         "{{\"model\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\
          \"message\":{{\"role\":\"assistant\",\"content\":{}}},\
@@ -325,11 +324,11 @@ fn handle_ollama_generate(stream: &mut TcpStream, body: &str, state: &ServerStat
         Ok(req) => req,
         Err(err) => return write_json_error(stream, "400 Bad Request", &err),
     };
-    let output = run_inference(&req, state)?;
     if req.stream {
-        return send_ollama_ndjson(stream, &output, false);
+        return stream_ollama_ndjson(stream, &req, state, false);
     }
 
+    let output = run_inference(&req, state)?;
     let payload = format!(
         "{{\"model\":{},\"created_at\":\"2026-01-01T00:00:00Z\",\
          \"response\":{},\"done\":true,\"done_reason\":\"stop\",\"total_duration\":{},\
@@ -436,21 +435,24 @@ fn parse_sampling_params(
     params
 }
 
-fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<InferenceOutput, String> {
+fn encode_prompt_ids(prompt: &str, state: &ServerState) -> Vec<usize> {
     let vocab_size = state.model.config.vocab_size;
-    let prompt_ids: Vec<usize> = if let Some(ref tok) = state.tokenizer {
-        let ids = tok.encode_chat(&req.prompt);
+    if let Some(ref tok) = state.tokenizer {
+        let ids = tok.encode_chat(prompt);
         if ids.is_empty() { vec![1] } else { ids }
-    } else if req.prompt.is_empty() {
+    } else if prompt.is_empty() {
         vec![1]
     } else {
-        req.prompt
+        prompt
             .bytes()
             .take(64)
             .map(|byte| (byte as usize) % vocab_size)
             .collect()
-    };
+    }
+}
 
+fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<InferenceOutput, String> {
+    let prompt_ids = encode_prompt_ids(&req.prompt, state);
     let eos_id = state.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
     let stats = state.model.generate_tokens(
         &prompt_ids,
@@ -460,8 +462,8 @@ fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<Inferen
         &state.backend,
     )?;
 
-    let chunks: Vec<String> = if let Some(ref tok) = state.tokenizer {
-        stats.tokens.iter().map(|&t| tok.decode_token(t)).collect()
+    let full_text = if let Some(ref tok) = state.tokenizer {
+        tok.decode(&stats.tokens)
     } else {
         stats
             .tokens
@@ -474,14 +476,13 @@ fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<Inferen
                     format!(" tok_{tok}")
                 }
             })
-            .collect()
+            .collect::<Vec<_>>()
+            .concat()
     };
-    let full_text = chunks.concat();
     let total_duration_ns = ((stats.prefill_ms + stats.decode_ms) * 1_000_000.0) as u128;
 
     Ok(InferenceOutput {
         model: req.model.clone(),
-        chunks,
         full_text,
         prompt_tokens: prompt_ids.len(),
         completion_tokens: stats.tokens.len(),
@@ -489,7 +490,11 @@ fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<Inferen
     })
 }
 
-fn send_openai_sse(stream: &mut TcpStream, output: &InferenceOutput) -> Result<(), String> {
+fn stream_openai_sse(
+    stream: &mut TcpStream,
+    req: &CompletionRequest,
+    state: &ServerState,
+) -> Result<(), String> {
     let headers = concat!(
         "HTTP/1.1 200 OK\r\n",
         "Content-Type: text/event-stream; charset=utf-8\r\n",
@@ -500,17 +505,50 @@ fn send_openai_sse(stream: &mut TcpStream, output: &InferenceOutput) -> Result<(
         "Access-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n"
     );
     stream.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
 
     let created = unix_timestamp_secs();
-    let model_json = escape_json_string(&output.model);
-    for chunk in &output.chunks {
+    let model_json = escape_json_string(&req.model);
+    let prompt_ids = encode_prompt_ids(&req.prompt, state);
+    let eos_id = state.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
+    let mut decoder = state.tokenizer.as_ref().map(TokenStreamDecoder::new);
+    let mut tok_idx = 0usize;
+
+    let write_sse_delta = |s: &mut TcpStream, text: &str| -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
         let line = format!(
             "data: {{\"id\":\"chatcmpl-aibox-{created}\",\"object\":\"chat.completion.chunk\",\
              \"created\":{created},\"model\":{model_json},\
              \"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":null}}]}}\n\n",
-            escape_json_string(chunk)
+            escape_json_string(text)
         );
-        stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        s.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        s.flush().map_err(|e| e.to_string())
+    };
+
+    state.model.generate_tokens_streaming(
+        &prompt_ids,
+        req.max_tokens,
+        eos_id,
+        req.sampling,
+        &state.backend,
+        |tok| {
+            let chunk = if let Some(ref mut dec) = decoder {
+                dec.push(tok)
+            } else if tok_idx == 0 {
+                format!("[tmac:{tok}]")
+            } else {
+                format!(" tok_{tok}")
+            };
+            tok_idx += 1;
+            write_sse_delta(stream, &chunk)
+        },
+    )?;
+
+    if let Some(ref mut dec) = decoder {
+        write_sse_delta(stream, &dec.finish())?;
     }
 
     let final_chunk = format!(
@@ -523,9 +561,10 @@ fn send_openai_sse(stream: &mut TcpStream, output: &InferenceOutput) -> Result<(
     stream.flush().map_err(|e| e.to_string())
 }
 
-fn send_ollama_ndjson(
+fn stream_ollama_ndjson(
     stream: &mut TcpStream,
-    output: &InferenceOutput,
+    req: &CompletionRequest,
+    state: &ServerState,
     is_chat: bool,
 ) -> Result<(), String> {
     let headers = concat!(
@@ -537,10 +576,19 @@ fn send_ollama_ndjson(
         "Access-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n"
     );
     stream.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
 
-    let model_json = escape_json_string(&output.model);
-    for chunk in &output.chunks {
-        let escaped = escape_json_string(chunk);
+    let model_json = escape_json_string(&req.model);
+    let prompt_ids = encode_prompt_ids(&req.prompt, state);
+    let eos_id = state.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
+    let mut decoder = state.tokenizer.as_ref().map(TokenStreamDecoder::new);
+    let mut tok_idx = 0usize;
+
+    let write_ndjson_chunk = |s: &mut TcpStream, text: &str| -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let escaped = escape_json_string(text);
         let line = if is_chat {
             format!(
                 "{{\"model\":{model_json},\"created_at\":\"2026-01-01T00:00:00Z\",\
@@ -552,22 +600,47 @@ fn send_ollama_ndjson(
                  \"response\":{escaped},\"done\":false}}\n"
             )
         };
-        stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        s.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        s.flush().map_err(|e| e.to_string())
+    };
+
+    let stats = state.model.generate_tokens_streaming(
+        &prompt_ids,
+        req.max_tokens,
+        eos_id,
+        req.sampling,
+        &state.backend,
+        |tok| {
+            let chunk = if let Some(ref mut dec) = decoder {
+                dec.push(tok)
+            } else if tok_idx == 0 {
+                format!("[tmac:{tok}]")
+            } else {
+                format!(" tok_{tok}")
+            };
+            tok_idx += 1;
+            write_ndjson_chunk(stream, &chunk)
+        },
+    )?;
+
+    if let Some(ref mut dec) = decoder {
+        write_ndjson_chunk(stream, &dec.finish())?;
     }
 
+    let total_duration_ns = ((stats.prefill_ms + stats.decode_ms) * 1_000_000.0) as u128;
     let done_line = if is_chat {
         format!(
             "{{\"model\":{model_json},\"created_at\":\"2026-01-01T00:00:00Z\",\
              \"message\":{{\"role\":\"assistant\",\"content\":\"\"}},\"done\":true,\"done_reason\":\"stop\",\
              \"total_duration\":{},\"prompt_eval_count\":{},\"eval_count\":{}}}\n",
-            output.total_duration_ns, output.prompt_tokens, output.completion_tokens
+            total_duration_ns, prompt_ids.len(), stats.tokens.len()
         )
     } else {
         format!(
             "{{\"model\":{model_json},\"created_at\":\"2026-01-01T00:00:00Z\",\
              \"response\":\"\",\"done\":true,\"done_reason\":\"stop\",\
              \"total_duration\":{},\"prompt_eval_count\":{},\"eval_count\":{}}}\n",
-            output.total_duration_ns, output.prompt_tokens, output.completion_tokens
+            total_duration_ns, prompt_ids.len(), stats.tokens.len()
         )
     };
     stream.write_all(done_line.as_bytes()).map_err(|e| e.to_string())?;
