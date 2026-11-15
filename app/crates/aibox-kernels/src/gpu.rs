@@ -47,7 +47,7 @@ type FnMatmulTernaryF16ToF32Dev =
 type FnRmsNormF16 = unsafe extern "C" fn(*const u16, *const f32, *mut u16, c_int, c_int, f32) -> c_int;
 #[cfg(target_os = "linux")]
 type FnRmsNormHeadsRopeF16 =
-    unsafe extern "C" fn(*mut u16, *const f32, c_int, c_int, c_int, f32, f32) -> c_int;
+    unsafe extern "C" fn(*mut u16, *const f32, c_int, c_int, c_int, c_int, f32, f32) -> c_int;
 #[cfg(target_os = "linux")]
 type FnKvAppendGqaF16 = unsafe extern "C" fn(
     *const u16,
@@ -56,6 +56,7 @@ type FnKvAppendGqaF16 = unsafe extern "C" fn(
     *mut u16,
     *mut u16,
     *mut u16,
+    c_int,
     c_int,
     c_int,
     c_int,
@@ -211,6 +212,38 @@ impl<'a> GpuBuffer<'a, u16> {
         };
         check_cuda_status("cudaMemcpy H2D (f16)", status)
     }
+
+    pub fn copy_row_to_front(&mut self, row_idx: usize, row_len: usize) -> Result<(), BackendError> {
+        if row_idx == 0 {
+            return Ok(());
+        }
+        let offset = row_idx * row_len;
+        if offset + row_len > self.len {
+            return Err(BackendError::BufferLengthMismatch(format!(
+                "copy_row_to_front {} > GpuBuffer len {}",
+                offset + row_len,
+                self.len
+            )));
+        }
+        let mut host = vec![0u16; row_len];
+        let bytes = row_len * std::mem::size_of::<u16>();
+        let d2h = unsafe {
+            (self.gpu.symbols.memcpy_d2h)(
+                host.as_mut_ptr() as *mut c_void,
+                self.ptr.add(offset) as *const c_void,
+                bytes,
+            )
+        };
+        check_cuda_status("cudaMemcpy D2H (row)", d2h)?;
+        let h2d = unsafe {
+            (self.gpu.symbols.memcpy_h2d)(
+                self.ptr as *mut c_void,
+                host.as_ptr() as *const c_void,
+                bytes,
+            )
+        };
+        check_cuda_status("cudaMemcpy H2D (row)", h2d)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -224,6 +257,10 @@ impl<'a> GpuBuffer<'a, f32> {
 impl<'a> GpuBuffer<'a, u16> {
     pub fn upload_f32_as_f16(&mut self, data: &[f32]) -> Result<(), BackendError> {
         let _ = f32_to_f16(data.first().copied().unwrap_or(0.0));
+        Err(linux_only_err())
+    }
+
+    pub fn copy_row_to_front(&mut self, _row_idx: usize, _row_len: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
 }
@@ -514,9 +551,10 @@ impl GpuBackend {
         &self,
         vec: &mut GpuBuffer<'_, u16>,
         norm_w: Option<&[f32]>,
+        m: usize,
         num_heads: usize,
         head_dim: usize,
-        pos: usize,
+        start_pos: usize,
         theta: f32,
         eps: f32,
     ) -> Result<(), BackendError> {
@@ -528,9 +566,10 @@ impl GpuBackend {
             (self.symbols.rms_norm_heads_rope_f16)(
                 vec.as_mut_ptr(),
                 dev_norm,
+                m as c_int,
                 num_heads as c_int,
                 head_dim as c_int,
-                pos as c_int,
+                start_pos as c_int,
                 theta,
                 eps,
             )
@@ -548,7 +587,8 @@ impl GpuBackend {
         v_cache: &mut GpuBuffer<'_, u16>,
         layer_offset: usize,
         out: &mut GpuBuffer<'_, u16>,
-        pos: usize,
+        start_pos: usize,
+        m: usize,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
@@ -561,7 +601,8 @@ impl GpuBackend {
                 k_cache.as_mut_ptr().add(layer_offset),
                 v_cache.as_mut_ptr().add(layer_offset),
                 out.as_mut_ptr(),
-                pos as c_int,
+                start_pos as c_int,
+                m as c_int,
                 num_q_heads as c_int,
                 num_kv_heads as c_int,
                 head_dim as c_int,
@@ -746,11 +787,11 @@ impl GpuBackend {
         Err(linux_only_err())
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn rms_norm_heads_rope_f16(&self, _vec: &mut GpuBuffer<'_, u16>, _nw: Option<&[f32]>, _nh: usize, _hd: usize, _pos: usize, _theta: f32, _eps: f32) -> Result<(), BackendError> {
+    pub fn rms_norm_heads_rope_f16(&self, _vec: &mut GpuBuffer<'_, u16>, _nw: Option<&[f32]>, _m: usize, _nh: usize, _hd: usize, _pos: usize, _theta: f32, _eps: f32) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn kv_append_gqa_layer_f16(&self, _q: &GpuBuffer<'_, u16>, _k: &GpuBuffer<'_, u16>, _v: &GpuBuffer<'_, u16>, _kc: &mut GpuBuffer<'_, u16>, _vc: &mut GpuBuffer<'_, u16>, _off: usize, _out: &mut GpuBuffer<'_, u16>, _pos: usize, _nq: usize, _nkv: usize, _hd: usize) -> Result<(), BackendError> {
+    pub fn kv_append_gqa_layer_f16(&self, _q: &GpuBuffer<'_, u16>, _k: &GpuBuffer<'_, u16>, _v: &GpuBuffer<'_, u16>, _kc: &mut GpuBuffer<'_, u16>, _vc: &mut GpuBuffer<'_, u16>, _off: usize, _out: &mut GpuBuffer<'_, u16>, _pos: usize, _m: usize, _nq: usize, _nkv: usize, _hd: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
     pub fn swiglu_inplace_f16(&self, _gate: &mut GpuBuffer<'_, u16>, _up: &GpuBuffer<'_, u16>, _len: usize) -> Result<(), BackendError> {

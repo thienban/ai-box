@@ -742,14 +742,11 @@ impl TransformerModel {
         F: FnMut(usize) -> Result<(), String>,
     {
         let max_seq = prompt_tokens.len() + max_new_tokens;
-        let mut session = GpuSession::new(gpu, &self.config, self.layers.len(), max_seq)?;
+        let mut session = GpuSession::new(gpu, &self.config, self.layers.len(), max_seq, prompt_tokens.len())?;
         let mut rng = XorShift64::new(params.seed);
 
         let prefill_start = Instant::now();
-        for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            let need_logits = pos + 1 == prompt_tokens.len();
-            self.forward_token_gpu_step(gpu, &mut session, tok, pos, need_logits)?;
-        }
+        self.forward_tokens_gpu(gpu, &mut session, prompt_tokens, 0, true)?;
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
         let decode_start = Instant::now();
@@ -766,7 +763,7 @@ impl TransformerModel {
                 break;
             }
             let pos = prompt_tokens.len() + step;
-            self.forward_token_gpu_step(gpu, &mut session, next_token, pos, true)?;
+            self.forward_tokens_gpu(gpu, &mut session, &[next_token], pos, true)?;
             next_token = self.sample_next_token_gpu(gpu, &session, params, &mut rng)?;
         }
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
@@ -778,25 +775,30 @@ impl TransformerModel {
         })
     }
 
-    fn forward_token_gpu_step<'a>(
+    fn forward_tokens_gpu<'a>(
         &self,
         gpu: &'a GpuBackend,
         s: &mut GpuSession<'a>,
-        token_id: usize,
-        pos: usize,
+        tokens: &[usize],
+        start_pos: usize,
         compute_logits: bool,
     ) -> Result<(), String> {
-        if token_id >= self.config.vocab_size {
-            return Err(format!("token_id {token_id} >= vocab_size {}", self.config.vocab_size));
-        }
+        let m = tokens.len();
         let h = self.config.hidden_size;
-        let emb_row = self.token_embeddings.read_row(token_id, h);
-        s.hidden.upload_f32_as_f16(&emb_row).map_err(|e| e.to_string())?;
+        let mut emb_batch = Vec::with_capacity(m * h);
+        for &tok in tokens {
+            if tok >= self.config.vocab_size {
+                return Err(format!("token_id {tok} >= vocab_size {}", self.config.vocab_size));
+            }
+            emb_batch.extend_from_slice(&self.token_embeddings.read_row(tok, h));
+        }
+        s.hidden.upload_f32_as_f16(&emb_batch).map_err(|e| e.to_string())?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            self.forward_attention_gpu(gpu, s, layer, layer_idx, pos)?;
-            self.forward_ffn_gpu(gpu, s, layer)?;
+            self.forward_attention_gpu(gpu, s, layer, layer_idx, start_pos, m)?;
+            self.forward_ffn_gpu(gpu, s, layer, m)?;
         }
         if compute_logits {
+            s.hidden.copy_row_to_front(m - 1, h).map_err(|e| e.to_string())?;
             self.compute_logits_gpu(gpu, s)?;
         }
         Ok(())
@@ -823,7 +825,8 @@ impl TransformerModel {
         s: &mut GpuSession<'a>,
         layer: &TernaryLayerWeights,
         layer_idx: usize,
-        pos: usize,
+        start_pos: usize,
+        m: usize,
     ) -> Result<(), String> {
         let cfg = &self.config;
         let h = cfg.hidden_size;
@@ -834,16 +837,16 @@ impl TransformerModel {
         let use_hadamard = cfg.use_hadamard;
 
         if use_hadamard {
-            gpu.rms_norm_fwht128_f16(&s.hidden, &layer.attn_norm, &mut s.normed, 1, h, eps).map_err(|e| e.to_string())?;
+            gpu.rms_norm_fwht128_f16(&s.hidden, &layer.attn_norm, &mut s.normed, m, h, eps).map_err(|e| e.to_string())?;
         } else {
-            gpu.rms_norm_f16(&s.hidden, &layer.attn_norm, &mut s.normed, 1, h, eps).map_err(|e| e.to_string())?;
+            gpu.rms_norm_f16(&s.hidden, &layer.attn_norm, &mut s.normed, m, h, eps).map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_q.packed_weights, &layer.attn_q.scales_fp16, &mut s.q, 1, q_dim, h, layer.attn_q.bits).map_err(|e| e.to_string())?;
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_k.packed_weights, &layer.attn_k.scales_fp16, &mut s.k, 1, kv_dim, h, layer.attn_k.bits).map_err(|e| e.to_string())?;
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_v.packed_weights, &layer.attn_v.scales_fp16, &mut s.v, 1, kv_dim, h, layer.attn_v.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_q.packed_weights, &layer.attn_q.scales_fp16, &mut s.q, m, q_dim, h, layer.attn_q.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_k.packed_weights, &layer.attn_k.scales_fp16, &mut s.k, m, kv_dim, h, layer.attn_k.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.attn_v.packed_weights, &layer.attn_v.scales_fp16, &mut s.v, m, kv_dim, h, layer.attn_v.bits).map_err(|e| e.to_string())?;
 
-        gpu.rms_norm_heads_rope_f16(&mut s.q, layer.attn_q_norm.as_deref(), cfg.num_attention_heads, head_dim, pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
-        gpu.rms_norm_heads_rope_f16(&mut s.k, layer.attn_k_norm.as_deref(), cfg.num_key_value_heads, head_dim, pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
+        gpu.rms_norm_heads_rope_f16(&mut s.q, layer.attn_q_norm.as_deref(), m, cfg.num_attention_heads, head_dim, start_pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
+        gpu.rms_norm_heads_rope_f16(&mut s.k, layer.attn_k_norm.as_deref(), m, cfg.num_key_value_heads, head_dim, start_pos, cfg.rope_theta, eps).map_err(|e| e.to_string())?;
 
         gpu.kv_append_gqa_layer_f16(
             &s.q,
@@ -853,16 +856,17 @@ impl TransformerModel {
             &mut s.v_cache,
             layer_idx * s.layer_kv_stride,
             &mut s.attn_ctx,
-            pos,
+            start_pos,
+            m,
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
             head_dim,
         ).map_err(|e| e.to_string())?;
 
         if use_hadamard {
-            gpu.fwht128_inplace_f16(&mut s.attn_ctx, 1, q_dim).map_err(|e| e.to_string())?;
+            gpu.fwht128_inplace_f16(&mut s.attn_ctx, m, q_dim).map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_add_dev(&s.attn_ctx, &layer.attn_o.packed_weights, &layer.attn_o.scales_fp16, &mut s.hidden, 1, h, q_dim, layer.attn_o.bits)
+        gpu.matmul_ternary_f16_add_dev(&s.attn_ctx, &layer.attn_o.packed_weights, &layer.attn_o.scales_fp16, &mut s.hidden, m, h, q_dim, layer.attn_o.bits)
             .map_err(|e| e.to_string())
     }
 
@@ -871,26 +875,27 @@ impl TransformerModel {
         gpu: &'a GpuBackend,
         s: &mut GpuSession<'a>,
         layer: &TernaryLayerWeights,
+        m: usize,
     ) -> Result<(), String> {
         let h = self.config.hidden_size;
         let inter = self.config.intermediate_size;
         let use_hadamard = self.config.use_hadamard;
 
         if use_hadamard {
-            gpu.rms_norm_fwht128_f16(&s.hidden, &layer.ffn_norm, &mut s.normed, 1, h, self.config.rms_norm_eps)
+            gpu.rms_norm_fwht128_f16(&s.hidden, &layer.ffn_norm, &mut s.normed, m, h, self.config.rms_norm_eps)
                 .map_err(|e| e.to_string())?;
         } else {
-            gpu.rms_norm_f16(&s.hidden, &layer.ffn_norm, &mut s.normed, 1, h, self.config.rms_norm_eps)
+            gpu.rms_norm_f16(&s.hidden, &layer.ffn_norm, &mut s.normed, m, h, self.config.rms_norm_eps)
                 .map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_gate.packed_weights, &layer.ffn_gate.scales_fp16, &mut s.gate, 1, inter, h, layer.ffn_gate.bits).map_err(|e| e.to_string())?;
-        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_up.packed_weights, &layer.ffn_up.scales_fp16, &mut s.up, 1, inter, h, layer.ffn_up.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_gate.packed_weights, &layer.ffn_gate.scales_fp16, &mut s.gate, m, inter, h, layer.ffn_gate.bits).map_err(|e| e.to_string())?;
+        gpu.matmul_ternary_f16_dev(&s.normed, &layer.ffn_up.packed_weights, &layer.ffn_up.scales_fp16, &mut s.up, m, inter, h, layer.ffn_up.bits).map_err(|e| e.to_string())?;
         if use_hadamard {
-            gpu.swiglu_fwht128_inplace_f16(&mut s.gate, &s.up, inter).map_err(|e| e.to_string())?;
+            gpu.swiglu_fwht128_inplace_f16(&mut s.gate, &s.up, m * inter).map_err(|e| e.to_string())?;
         } else {
-            gpu.swiglu_inplace_f16(&mut s.gate, &s.up, inter).map_err(|e| e.to_string())?;
+            gpu.swiglu_inplace_f16(&mut s.gate, &s.up, m * inter).map_err(|e| e.to_string())?;
         }
-        gpu.matmul_ternary_f16_add_dev(&s.gate, &layer.ffn_down.packed_weights, &layer.ffn_down.scales_fp16, &mut s.hidden, 1, h, inter, layer.ffn_down.bits)
+        gpu.matmul_ternary_f16_add_dev(&s.gate, &layer.ffn_down.packed_weights, &layer.ffn_down.scales_fp16, &mut s.hidden, m, h, inter, layer.ffn_down.bits)
             .map_err(|e| e.to_string())
     }
 
@@ -944,7 +949,14 @@ struct GpuSession<'a> {
 }
 
 impl<'a> GpuSession<'a> {
-    fn new(gpu: &'a GpuBackend, cfg: &ModelConfig, num_layers: usize, max_seq: usize) -> Result<Self, String> {
+    fn new(
+        gpu: &'a GpuBackend,
+        cfg: &ModelConfig,
+        num_layers: usize,
+        max_seq: usize,
+        max_batch: usize,
+    ) -> Result<Self, String> {
+        let m = max_batch.max(1);
         let h = cfg.hidden_size;
         let head_dim = cfg.head_dim();
         let q_dim = cfg.num_attention_heads * head_dim;
@@ -954,14 +966,14 @@ impl<'a> GpuSession<'a> {
         let total_kv = num_layers.max(1) * layer_kv_stride;
 
         Ok(Self {
-            hidden: gpu.alloc_f16(h).map_err(|e| e.to_string())?,
-            normed: gpu.alloc_f16(h).map_err(|e| e.to_string())?,
-            q: gpu.alloc_f16(q_dim).map_err(|e| e.to_string())?,
-            k: gpu.alloc_f16(kv_dim).map_err(|e| e.to_string())?,
-            v: gpu.alloc_f16(kv_dim).map_err(|e| e.to_string())?,
-            attn_ctx: gpu.alloc_f16(q_dim).map_err(|e| e.to_string())?,
-            gate: gpu.alloc_f16(inter).map_err(|e| e.to_string())?,
-            up: gpu.alloc_f16(inter).map_err(|e| e.to_string())?,
+            hidden: gpu.alloc_f16(m * h).map_err(|e| e.to_string())?,
+            normed: gpu.alloc_f16(m * h).map_err(|e| e.to_string())?,
+            q: gpu.alloc_f16(m * q_dim).map_err(|e| e.to_string())?,
+            k: gpu.alloc_f16(m * kv_dim).map_err(|e| e.to_string())?,
+            v: gpu.alloc_f16(m * kv_dim).map_err(|e| e.to_string())?,
+            attn_ctx: gpu.alloc_f16(m * q_dim).map_err(|e| e.to_string())?,
+            gate: gpu.alloc_f16(m * inter).map_err(|e| e.to_string())?,
+            up: gpu.alloc_f16(m * inter).map_err(|e| e.to_string())?,
             logits: gpu.alloc_f32(cfg.vocab_size).map_err(|e| e.to_string())?,
             k_cache: gpu.alloc_f16(total_kv).map_err(|e| e.to_string())?,
             v_cache: gpu.alloc_f16(total_kv).map_err(|e| e.to_string())?,

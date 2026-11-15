@@ -8,6 +8,7 @@
 #define GROUP_SIZE 128
 #define PACKED_BYTES_PER_GROUP 32
 #define BINARY_PACKED_BYTES_PER_GROUP 16
+#define GEMM_BM 16
 #define WARP_SIZE 32
 #define MAX_ATTN_SEQ 4096
 #define MAX_FUSED_RMS_DIM 8192
@@ -483,6 +484,76 @@ __global__ void ternary_gemv_f16_kernel(
     }
 }
 
+template <bool AddResidual, typename OutT, int Bits = 2>
+__global__ void ternary_gemm_tiled_kernel(
+    const __half* __restrict__ x,
+    const uint8_t* __restrict__ w_packed,
+    const uint16_t* __restrict__ scales,
+    OutT* __restrict__ out,
+    int m,
+    int n,
+    int k
+) {
+    int warp_id = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row_n = blockIdx.x * 4 + warp_id;
+    int m0 = blockIdx.y * GEMM_BM;
+    int m_count = min(GEMM_BM, m - m0);
+    if (m_count <= 0) {
+        return;
+    }
+
+    __shared__ __half s_x[GEMM_BM][GROUP_SIZE];
+    int groups_per_row = k / GROUP_SIZE;
+    const int bytes_per_group = (Bits == 1) ? BINARY_PACKED_BYTES_PER_GROUP : PACKED_BYTES_PER_GROUP;
+    const uint8_t* w_row = (row_n < n) ? (w_packed + (size_t)row_n * groups_per_row * bytes_per_group) : nullptr;
+    const uint16_t* s_row = (row_n < n) ? (scales + (size_t)row_n * groups_per_row) : nullptr;
+
+    float acc[GEMM_BM];
+    #pragma unroll
+    for (int tm = 0; tm < GEMM_BM; ++tm) {
+        acc[tm] = 0.0f;
+    }
+
+    // 128 threads load m_count * 128 __halfs = m_count * 16 uint4s into shared memory
+    int total_u4 = m_count * (GROUP_SIZE >> 3);
+    for (int g = 0; g < groups_per_row; ++g) {
+        for (int idx = threadIdx.x; idx < total_u4; idx += blockDim.x) {
+            int tm = idx >> 4;
+            int col_u4 = idx & 15;
+            uint4 v = *reinterpret_cast<const uint4*>(&x[(size_t)(m0 + tm) * k + g * GROUP_SIZE + (col_u4 << 3)]);
+            *reinterpret_cast<uint4*>(&s_x[tm][col_u4 << 3]) = v;
+        }
+        __syncthreads();
+
+        if (row_n < n) {
+            float scale = __half2float(*reinterpret_cast<const __half*>(&s_row[g]));
+            uint8_t w_code = (Bits == 1)
+                ? ((w_row[g * BINARY_PACKED_BYTES_PER_GROUP + (lane >> 1)] >> ((lane & 1) * 4)) & 0x0F)
+                : w_row[g * PACKED_BYTES_PER_GROUP + lane];
+
+            for (int tm = 0; tm < m_count; ++tm) {
+                uint2 x_u2 = *reinterpret_cast<const uint2*>(&s_x[tm][lane * 4]);
+                const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+                float elem_dot = (Bits == 1)
+                    ? dot_binary_nibble_h4(w_code, h2[0], h2[1])
+                    : dot_packed_byte_h4(w_code, h2[0], h2[1]);
+                acc[tm] += elem_dot * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row_n < n) {
+        for (int tm = 0; tm < m_count; ++tm) {
+            float sum = warp_reduce_sum(acc[tm]);
+            if (lane == 0) {
+                store_gemv_out<AddResidual>(out, (size_t)(m0 + tm) * n + row_n, sum);
+            }
+        }
+    }
+}
+
 __global__ void rms_norm_f16_kernel(
     const __half* __restrict__ x,
     const float* __restrict__ weight,
@@ -608,12 +679,14 @@ __global__ void rms_norm_heads_rope_f16_kernel(
     __half* __restrict__ vec,
     const float* __restrict__ norm_w,
     int head_dim,
-    int pos,
+    int start_pos,
     float theta,
     float eps
 ) {
     int head = blockIdx.x;
-    __half* h_vec = vec + (size_t)head * head_dim;
+    int tok = blockIdx.y;
+    int pos = start_pos + tok;
+    __half* h_vec = vec + ((size_t)tok * gridDim.x + head) * head_dim;
 
     if (norm_w != nullptr) {
         float local_sq = 0.0f;
@@ -645,12 +718,13 @@ __global__ void kv_append_f16_kernel(
     const __half* __restrict__ v,
     __half* __restrict__ k_cache,
     __half* __restrict__ v_cache,
-    int pos,
-    int kv_dim
+    int start_pos,
+    int kv_dim,
+    int total_kv
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < kv_dim) {
-        size_t dst = (size_t)pos * kv_dim + idx;
+    if (idx < total_kv) {
+        size_t dst = (size_t)start_pos * kv_dim + idx;
         k_cache[dst] = k[idx];
         v_cache[dst] = v[idx];
     }
@@ -661,15 +735,18 @@ __global__ void gqa_attention_f16_kernel(
     const __half* __restrict__ k_cache,
     const __half* __restrict__ v_cache,
     __half* __restrict__ out,
-    int seq_len,
+    int start_pos,
     int kv_dim,
     int heads_per_kv,
     int head_dim
 ) {
     int q_head = blockIdx.x;
+    int tok = blockIdx.y;
+    int seq_len = start_pos + tok + 1;
     int kv_offset = (q_head / heads_per_kv) * head_dim;
-    const __half* q_slice = q + (size_t)q_head * head_dim;
-    __half* out_slice = out + (size_t)q_head * head_dim;
+    size_t q_off = ((size_t)tok * gridDim.x + q_head) * head_dim;
+    const __half* q_slice = q + q_off;
+    __half* out_slice = out + q_off;
     float scale = rsqrtf((float)head_dim);
 
     __shared__ float s_scores[MAX_ATTN_SEQ];
@@ -863,12 +940,21 @@ static int launch_gemv_f16(
     int bits
 ) {
     dim3 block(128);
-    dim3 grid((n + 3) / 4, m);
     const __half* hx = reinterpret_cast<const __half*>(dev_x);
-    if (bits == 1) {
-        ternary_gemv_f16_kernel<AddResidual, OutT, 1><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+    if (m == 1) {
+        dim3 grid((n + 3) / 4, 1);
+        if (bits == 1) {
+            ternary_gemv_f16_kernel<AddResidual, OutT, 1><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+        } else {
+            ternary_gemv_f16_kernel<AddResidual, OutT, 2><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+        }
     } else {
-        ternary_gemv_f16_kernel<AddResidual, OutT, 2><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+        dim3 grid((n + 3) / 4, (m + GEMM_BM - 1) / GEMM_BM);
+        if (bits == 1) {
+            ternary_gemm_tiled_kernel<AddResidual, OutT, 1><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+        } else {
+            ternary_gemm_tiled_kernel<AddResidual, OutT, 2><<<grid, block>>>(hx, dev_w, dev_scales, dev_out, m, n, k);
+        }
     }
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
@@ -1078,17 +1164,19 @@ int aibox_gpu_rms_norm_fwht128_f16(
 int aibox_gpu_rms_norm_heads_rope_f16(
     uint16_t* dev_vec,
     const float* dev_norm_w,
+    int m,
     int num_heads,
     int head_dim,
-    int pos,
+    int start_pos,
     float theta,
     float eps
 ) {
-    rms_norm_heads_rope_f16_kernel<<<num_heads, 128>>>(
+    dim3 grid(num_heads, m);
+    rms_norm_heads_rope_f16_kernel<<<grid, 128>>>(
         reinterpret_cast<__half*>(dev_vec),
         dev_norm_w,
         head_dim,
-        pos,
+        start_pos,
         theta,
         eps
     );
@@ -1102,33 +1190,37 @@ int aibox_gpu_kv_append_gqa_f16(
     uint16_t* dev_k_cache,
     uint16_t* dev_v_cache,
     uint16_t* dev_out,
-    int pos,
+    int start_pos,
+    int m,
     int num_q_heads,
     int num_kv_heads,
     int head_dim
 ) {
-    int seq_len = pos + 1;
-    if (seq_len > MAX_ATTN_SEQ) {
+    int max_seq = start_pos + m;
+    if (max_seq > MAX_ATTN_SEQ) {
         return -2;
     }
     int kv_dim = num_kv_heads * head_dim;
-    int kv_blocks = (kv_dim + 255) / 256;
+    int total_kv = m * kv_dim;
+    int kv_blocks = (total_kv + 255) / 256;
     kv_append_f16_kernel<<<kv_blocks, 256>>>(
         reinterpret_cast<const __half*>(dev_k),
         reinterpret_cast<const __half*>(dev_v),
         reinterpret_cast<__half*>(dev_k_cache),
         reinterpret_cast<__half*>(dev_v_cache),
-        pos,
-        kv_dim
+        start_pos,
+        kv_dim,
+        total_kv
     );
 
     int heads_per_kv = num_q_heads / num_kv_heads;
-    gqa_attention_f16_kernel<<<num_q_heads, 128>>>(
+    dim3 attn_grid(num_q_heads, m);
+    gqa_attention_f16_kernel<<<attn_grid, 128>>>(
         reinterpret_cast<const __half*>(dev_q),
         reinterpret_cast<const __half*>(dev_k_cache),
         reinterpret_cast<const __half*>(dev_v_cache),
         reinterpret_cast<__half*>(dev_out),
-        seq_len,
+        start_pos,
         kv_dim,
         heads_per_kv,
         head_dim
