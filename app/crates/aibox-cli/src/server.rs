@@ -22,6 +22,7 @@ use crate::tokenizer::{SimpleTokenizer, TokenStreamDecoder};
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 11434;
 const DEFAULT_MODEL_NAME: &str = "aibox-ternary-demo";
+const MAX_GENERATION_TOKENS: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -378,7 +379,7 @@ fn parse_completion_request(
         .get("max_tokens")
         .or_else(|| options_obj.and_then(|opts| opts.get("num_predict")))
         .and_then(JsonValue::as_u64)
-        .map(|v| (v as usize).clamp(1, 64))
+        .map(|v| (v as usize).clamp(1, MAX_GENERATION_TOKENS))
         .unwrap_or(16);
 
     let sampling = parse_sampling_params(obj, options_obj);

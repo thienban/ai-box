@@ -538,17 +538,26 @@ impl TransformerModel {
         }
 
         let final_hidden = rms_norm(&hidden, &self.final_norm, self.config.rms_norm_eps);
+        self.compute_logits_cpu(&final_hidden, backend)
+    }
+
+    fn compute_logits_cpu(
+        &self,
+        final_hidden: &[f32],
+        backend: &dyn TernaryHadamardBackend,
+    ) -> Result<Vec<f32>, String> {
+        let hidden_size = self.config.hidden_size;
         match &self.lm_head {
             LmHead::Ternary(tensor) => {
-                project_ternary(backend, &final_hidden, tensor, self.config.use_hadamard)
+                project_ternary(backend, final_hidden, tensor, self.config.use_hadamard)
             }
             LmHead::Dense(table) => Ok(table.dot_all_rows(
-                &final_hidden,
+                final_hidden,
                 self.config.vocab_size,
                 hidden_size,
             )),
             LmHead::TiedEmbedding => Ok(self.token_embeddings.dot_all_rows(
-                &final_hidden,
+                final_hidden,
                 self.config.vocab_size,
                 hidden_size,
             )),
@@ -633,19 +642,7 @@ impl TransformerModel {
 
         let last_hidden = &hidden[(m - 1) * hidden_size..m * hidden_size];
         let final_hidden = rms_norm(last_hidden, &self.final_norm, eps);
-        match &self.lm_head {
-            LmHead::Ternary(tensor) => project_ternary(backend, &final_hidden, tensor, use_hadamard),
-            LmHead::Dense(table) => Ok(table.dot_all_rows(
-                &final_hidden,
-                self.config.vocab_size,
-                hidden_size,
-            )),
-            LmHead::TiedEmbedding => Ok(self.token_embeddings.dot_all_rows(
-                &final_hidden,
-                self.config.vocab_size,
-                hidden_size,
-            )),
-        }
+        self.compute_logits_cpu(&final_hidden, backend)
     }
 
     pub fn generate_tokens(
@@ -883,14 +880,16 @@ impl TransformerModel {
                 }
                 gpu.matmul_ternary_dev(&s.normed, &tensor.packed_weights, &tensor.scales_fp16, &mut s.logits, 1, cfg.vocab_size, h).map_err(|e| e.to_string())?;
             }
-            LmHead::Dense(table) => match table {
-                EmbeddingTable::F16(data) => gpu.lm_head_f16(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,
-                EmbeddingTable::F32(data) => gpu.lm_head_f32(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,
-            },
-            LmHead::TiedEmbedding => match &self.token_embeddings {
-                EmbeddingTable::F16(data) => gpu.lm_head_f16(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,
-                EmbeddingTable::F32(data) => gpu.lm_head_f32(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,
-            },
+            LmHead::Dense(_) | LmHead::TiedEmbedding => {
+                let table = match &self.lm_head {
+                    LmHead::Dense(t) => t,
+                    _ => &self.token_embeddings,
+                };
+                match table {
+                    EmbeddingTable::F16(data) => gpu.lm_head_f16(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,
+                    EmbeddingTable::F32(data) => gpu.lm_head_f32(&s.normed, data, &mut s.logits, cfg.vocab_size, h).map_err(|e| e.to_string())?,
+                }
+            }
         }
         let mut host_logits = vec![0.0f32; cfg.vocab_size];
         s.logits.download(&mut host_logits).map_err(|e| e.to_string())?;
