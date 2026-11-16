@@ -155,6 +155,29 @@ impl Gemma4Linear {
         self.forward_cpu(input)
     }
 
+    fn forward_q4_into_dev(
+        &self,
+        gpu: &GpuBackend,
+        x_dev: &aibox_kernels::GpuBuffer<'_, u16>,
+        out_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
+    ) -> Result<usize, String> {
+        let Self::Q4Affine(t) = self else {
+            return Err("forward_q4_into_dev requires Q4Affine".to_string());
+        };
+        gpu.matmul_q4_affine_f16_dev(
+            x_dev,
+            &t.packed_weights,
+            &t.scales_fp16,
+            &t.zeros_fp16,
+            out_dev,
+            1,
+            t.n_rows,
+            t.k_cols,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(t.n_rows)
+    }
+
     fn forward_with_scratch(
         &self,
         input: &[f32],
@@ -766,6 +789,29 @@ fn attention_gqa_windowed(
     out
 }
 
+fn try_forward_resident_geglu_vram(
+    normed: &[f32],
+    expert: &Gemma4ExpertWeights,
+    sc: &mut Gemma4GpuScratch<'_>,
+) -> Result<Option<Vec<f32>>, String> {
+    if !matches!(
+        (&expert.gate, &expert.up, &expert.down),
+        (Gemma4Linear::Q4Affine(_), Gemma4Linear::Q4Affine(_), Gemma4Linear::Q4Affine(_))
+    ) {
+        return Ok(None);
+    }
+    sc.x_dev.upload_f32_as_f16(normed).map_err(|e| e.to_string())?;
+    let gate_rows = expert.gate.forward_q4_into_dev(sc.gpu, &sc.x_dev, &mut sc.gate_dev)?;
+    let _ = expert.up.forward_q4_into_dev(sc.gpu, &sc.x_dev, &mut sc.up_dev)?;
+    sc.gpu
+        .geglu_inplace_f16(&mut sc.gate_dev, &sc.up_dev, gate_rows)
+        .map_err(|e| e.to_string())?;
+    let down_rows = expert.down.forward_q4_into_dev(sc.gpu, &sc.gate_dev, &mut sc.out_dev)?;
+    let mut out = vec![0.0f32; down_rows];
+    sc.out_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
+    Ok(Some(out))
+}
+
 fn forward_geglu_expert(
     normed: &[f32],
     expert: &Gemma4ExpertWeights,
@@ -773,6 +819,13 @@ fn forward_geglu_expert(
     backend: &dyn TernaryHadamardBackend,
     resident: bool,
 ) -> Result<Vec<f32>, String> {
+    if resident {
+        if let Some(sc) = scratch.as_deref_mut() {
+            if let Some(out) = try_forward_resident_geglu_vram(normed, expert, sc)? {
+                return Ok(out);
+            }
+        }
+    }
     let gate = expert.gate.forward_with_scratch(normed, scratch.as_deref_mut(), backend, resident)?;
     let up = expert.up.forward_with_scratch(normed, scratch.as_deref_mut(), backend, resident)?;
     let hidden: Vec<f32> = gate
