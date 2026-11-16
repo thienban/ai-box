@@ -5,8 +5,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use aibox_kernels::tensor::{f16_to_f32, TernaryTensor};
-use aibox_kernels::{BINARY_PACKED_BYTES_PER_GROUP, GROUP_SIZE, PACKED_BYTES_PER_GROUP};
+use aibox_kernels::tensor::{f16_to_f32, Q2AffineTensor, Q4AffineTensor, TernaryTensor};
+use aibox_kernels::{
+    BINARY_PACKED_BYTES_PER_GROUP, GROUP_SIZE, PACKED_BYTES_PER_GROUP, Q2_GROUP_SIZE,
+    Q2_PACKED_BYTES_PER_GROUP, Q4_GROUP_SIZE, Q4_PACKED_BYTES_PER_GROUP,
+};
 
 use crate::json::{parse_json, JsonValue};
 
@@ -15,44 +18,81 @@ pub struct TensorMeta {
     pub dtype: String,
     pub shape: Vec<usize>,
     pub data_offsets: (usize, usize),
+    pub shard_idx: usize,
 }
 
-/// Lecteur SafeTensors basé sur un fichier disque (lecture sélective par offset) ou tampon mémoire.
+/// Lecteur SafeTensors basé sur un ou plusieurs fichiers disque (lecture sélective par offset) ou tampon mémoire.
 pub struct SafeTensorsFile {
-    data_start: u64,
     tensors: BTreeMap<String, TensorMeta>,
     source: SafeTensorsSource,
 }
 
 enum SafeTensorsSource {
-    File(File),
+    Files(Vec<(u64, File)>),
     #[cfg(test)]
-    Memory(Vec<u8>),
+    Memory { data_start: u64, buf: Vec<u8> },
+}
+
+fn read_shard_header(path: &Path) -> Result<(u64, File, BTreeMap<String, TensorMeta>), String> {
+    let mut file = File::open(path)
+        .map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf)
+        .map_err(|e| format!("Failed to read safetensors header length: {e}"))?;
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes)
+        .map_err(|e| format!("Failed to read safetensors header: {e}"))?;
+    let header_str = std::str::from_utf8(&header_bytes)
+        .map_err(|e| format!("Invalid UTF-8 in safetensors header: {e}"))?;
+    let tensors = parse_header_metadata(header_str)?;
+    Ok((8 + header_len as u64, file, tensors))
 }
 
 impl SafeTensorsFile {
+    /// Ouvre `model.safetensors` ou tous les shards `model-*-of-*.safetensors` d'un dossier.
+    pub fn open_dir<P: AsRef<Path>>(dir: P) -> Result<Self, String> {
+        let dir = dir.as_ref();
+        let single = dir.join("model.safetensors");
+        if single.exists() {
+            return Self::open(single);
+        }
+        let mut shard_paths: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| format!("Failed to read '{}': {e}", dir.display()))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|s| s.starts_with("model-") && s.ends_with(".safetensors"))
+            })
+            .collect();
+        shard_paths.sort();
+        if shard_paths.is_empty() {
+            return Err(format!("No model.safetensors or shards found in '{}'", dir.display()));
+        }
+        let mut files = Vec::with_capacity(shard_paths.len());
+        let mut all_tensors = BTreeMap::new();
+        for (shard_idx, path) in shard_paths.iter().enumerate() {
+            let (data_start, file, tensors) = read_shard_header(path)?;
+            files.push((data_start, file));
+            for (name, mut meta) in tensors {
+                meta.shard_idx = shard_idx;
+                all_tensors.insert(name, meta);
+            }
+        }
+        Ok(Self {
+            tensors: all_tensors,
+            source: SafeTensorsSource::Files(files),
+        })
+    }
+
     /// Ouvre un fichier `.safetensors` et parse uniquement son en-tête JSON (démarrage instantané).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let mut file = File::open(path.as_ref())
-            .map_err(|e| format!("Failed to open '{}': {e}", path.as_ref().display()))?;
-
-        let mut len_buf = [0u8; 8];
-        file.read_exact(&mut len_buf)
-            .map_err(|e| format!("Failed to read safetensors header length: {e}"))?;
-        let header_len = u64::from_le_bytes(len_buf) as usize;
-
-        let mut header_bytes = vec![0u8; header_len];
-        file.read_exact(&mut header_bytes)
-            .map_err(|e| format!("Failed to read safetensors header: {e}"))?;
-
-        let header_str = std::str::from_utf8(&header_bytes)
-            .map_err(|e| format!("Invalid UTF-8 in safetensors header: {e}"))?;
-        let tensors = parse_header_metadata(header_str)?;
-
+        let (data_start, file, tensors) = read_shard_header(path.as_ref())?;
         Ok(Self {
-            data_start: 8 + header_len as u64,
             tensors,
-            source: SafeTensorsSource::File(file),
+            source: SafeTensorsSource::Files(vec![(data_start, file)]),
         })
     }
 
@@ -72,14 +112,54 @@ impl SafeTensorsFile {
         let tensors = parse_header_metadata(header_str)?;
 
         Ok(Self {
-            data_start: header_end as u64,
             tensors,
-            source: SafeTensorsSource::Memory(bytes),
+            source: SafeTensorsSource::Memory {
+                data_start: header_end as u64,
+                buf: bytes,
+            },
         })
     }
 
     pub fn tensors(&self) -> &BTreeMap<String, TensorMeta> {
         &self.tensors
+    }
+
+    pub fn tensor_meta(&self, name: &str) -> Option<&TensorMeta> {
+        self.tensors.get(name)
+    }
+
+    /// Lit une tranche d'octets `[byte_offset .. byte_offset + len]` d'un tenseur nommé (streaming disque).
+    pub fn read_tensor_slice(&mut self, name: &str, byte_offset: usize, len: usize) -> Result<Vec<u8>, String> {
+        let meta = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("Tensor '{name}' not found in safetensors"))?;
+        let (start, end) = meta.data_offsets;
+        if end < start || byte_offset + len > (end - start) {
+            return Err(format!(
+                "Slice [{byte_offset}..{}] out of bounds for '{name}' (len {})",
+                byte_offset + len,
+                end.saturating_sub(start)
+            ));
+        }
+        let shard_idx = meta.shard_idx;
+        let abs_offset = start + byte_offset;
+        match &mut self.source {
+            #[cfg(test)]
+            SafeTensorsSource::Memory { data_start, buf } => {
+                let s = *data_start as usize + abs_offset;
+                Ok(buf[s..s + len].to_vec())
+            }
+            SafeTensorsSource::Files(files) => {
+                let (data_start, file) = &mut files[shard_idx];
+                file.seek(SeekFrom::Start(*data_start + abs_offset as u64))
+                    .map_err(|e| format!("Seek failed for '{name}': {e}"))?;
+                let mut out = vec![0u8; len];
+                file.read_exact(&mut out)
+                    .map_err(|e| format!("Read failed for '{name}': {e}"))?;
+                Ok(out)
+            }
+        }
     }
 
     /// Lit les octets bruts d'un tenseur nommé.
@@ -92,20 +172,22 @@ impl SafeTensorsFile {
         if end < start {
             return Err(format!("Invalid offsets [{start}, {end}] for '{name}'"));
         }
+        let shard_idx = meta.shard_idx;
         let len = end - start;
 
         match &mut self.source {
             #[cfg(test)]
-            SafeTensorsSource::Memory(buf) => {
-                let abs_start = self.data_start as usize + start;
-                let abs_end = self.data_start as usize + end;
+            SafeTensorsSource::Memory { data_start, buf } => {
+                let abs_start = *data_start as usize + start;
+                let abs_end = *data_start as usize + end;
                 if abs_end > buf.len() {
                     return Err(format!("Tensor '{name}' exceeds buffer size"));
                 }
                 Ok(buf[abs_start..abs_end].to_vec())
             }
-            SafeTensorsSource::File(file) => {
-                file.seek(SeekFrom::Start(self.data_start + start as u64))
+            SafeTensorsSource::Files(files) => {
+                let (data_start, file) = &mut files[shard_idx];
+                file.seek(SeekFrom::Start(*data_start + start as u64))
                     .map_err(|e| format!("Seek failed for '{name}': {e}"))?;
                 let mut out = vec![0u8; len];
                 file.read_exact(&mut out)
@@ -180,6 +262,106 @@ impl SafeTensorsFile {
 
         TernaryTensor::from_raw_with_bits(n_rows, k_cols, bits, packed_weights, scales_fp16)
             .map_err(|e| format!("Invalid {bits}-bit TernaryTensor '{weight_name}': {e}"))
+    }
+
+    /// Charge une couche linéaire 2-bit affine (`U8` `[N, K/4]` + `F16` scales/zeros `[N, K/128]`).
+    pub fn load_q2_affine_layer(
+        &mut self,
+        weight_name: &str,
+        scale_name: &str,
+        zero_name: &str,
+    ) -> Result<Q2AffineTensor, String> {
+        let w_meta = self
+            .tensors
+            .get(weight_name)
+            .ok_or_else(|| format!("Missing weight tensor '{weight_name}'"))?
+            .clone();
+        let s_meta = self
+            .tensors
+            .get(scale_name)
+            .ok_or_else(|| format!("Missing scale tensor '{scale_name}'"))?
+            .clone();
+        let z_meta = self
+            .tensors
+            .get(zero_name)
+            .ok_or_else(|| format!("Missing zero tensor '{zero_name}'"))?
+            .clone();
+
+        if w_meta.dtype != "U8" || w_meta.shape.len() != 2 {
+            return Err(format!("Weight '{weight_name}' must be 2D U8"));
+        }
+        if s_meta.dtype != "F16" || z_meta.dtype != "F16" || s_meta.shape != z_meta.shape || s_meta.shape.len() != 2 {
+            return Err(format!("Scale/zero '{scale_name}'/'{zero_name}' must be matching 2D F16"));
+        }
+        let n_rows = w_meta.shape[0];
+        let n_groups = s_meta.shape[1];
+        if s_meta.shape[0] != n_rows || n_groups == 0 || w_meta.shape[1] != n_groups * Q2_PACKED_BYTES_PER_GROUP {
+            return Err(format!("Shape mismatch for q2_affine '{weight_name}'"));
+        }
+        let k_cols = n_groups * Q2_GROUP_SIZE;
+        let packed_weights = self.read_tensor_bytes(weight_name)?;
+        let scale_bytes = self.read_tensor_bytes(scale_name)?;
+        let zero_bytes = self.read_tensor_bytes(zero_name)?;
+        let scales_fp16 = scale_bytes
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        let zeros_fp16 = zero_bytes
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        Q2AffineTensor::from_raw(n_rows, k_cols, packed_weights, scales_fp16, zeros_fp16)
+            .map_err(|e| format!("Invalid Q2AffineTensor '{weight_name}': {e}"))
+    }
+
+    /// Charge une couche linéaire 4-bit affine (`U8` `[N, K/2]` + `F16` scales/zeros `[N, K/64]`).
+    pub fn load_q4_affine_layer(
+        &mut self,
+        weight_name: &str,
+        scale_name: &str,
+        zero_name: &str,
+    ) -> Result<Q4AffineTensor, String> {
+        let w_meta = self
+            .tensors
+            .get(weight_name)
+            .ok_or_else(|| format!("Missing weight tensor '{weight_name}'"))?
+            .clone();
+        let s_meta = self
+            .tensors
+            .get(scale_name)
+            .ok_or_else(|| format!("Missing scale tensor '{scale_name}'"))?
+            .clone();
+        let z_meta = self
+            .tensors
+            .get(zero_name)
+            .ok_or_else(|| format!("Missing zero tensor '{zero_name}'"))?
+            .clone();
+
+        if w_meta.dtype != "U8" || w_meta.shape.len() != 2 {
+            return Err(format!("Weight '{weight_name}' must be 2D U8"));
+        }
+        if s_meta.dtype != "F16" || z_meta.dtype != "F16" || s_meta.shape != z_meta.shape || s_meta.shape.len() != 2 {
+            return Err(format!("Scale/zero '{scale_name}'/'{zero_name}' must be matching 2D F16"));
+        }
+        let n_rows = w_meta.shape[0];
+        let n_groups = s_meta.shape[1];
+        if s_meta.shape[0] != n_rows || n_groups == 0 || w_meta.shape[1] != n_groups * Q4_PACKED_BYTES_PER_GROUP {
+            return Err(format!("Shape mismatch for q4_affine '{weight_name}'"));
+        }
+        let k_cols = n_groups * Q4_GROUP_SIZE;
+        let packed_weights = self.read_tensor_bytes(weight_name)?;
+        let scale_bytes = self.read_tensor_bytes(scale_name)?;
+        let zero_bytes = self.read_tensor_bytes(zero_name)?;
+        let scales_fp16 = scale_bytes
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        let zeros_fp16 = zero_bytes
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        Q4AffineTensor::from_raw(n_rows, k_cols, packed_weights, scales_fp16, zeros_fp16)
+            .map_err(|e| format!("Invalid Q4AffineTensor '{weight_name}': {e}"))
     }
 
     pub fn has_tensor(&self, name: &str) -> bool {
@@ -292,6 +474,7 @@ fn parse_header_metadata(header_str: &str) -> Result<BTreeMap<String, TensorMeta
                 dtype,
                 shape,
                 data_offsets: (start, end),
+                shard_idx: 0,
             },
         );
     }

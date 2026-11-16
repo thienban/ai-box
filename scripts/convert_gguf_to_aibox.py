@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 from pathlib import Path
@@ -115,6 +116,38 @@ def quantize_grouped_linear(weight_f32: np.ndarray, bits: int) -> tuple[np.ndarr
     return packed_out, scales_out
 
 
+Q2_GROUP_SIZE = 64
+
+
+def quantize_affine(weight_f32: np.ndarray, bits: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Quantifie [n_rows, k_cols] en 2-bit ou 4-bit affine par groupes de 64."""
+    n_rows, k_cols = weight_f32.shape
+    assert k_cols % Q2_GROUP_SIZE == 0, f"k_cols={k_cols} non multiple de {Q2_GROUP_SIZE}"
+    groups = k_cols // Q2_GROUP_SIZE
+    grouped = weight_f32.astype(np.float32).reshape(n_rows, groups, Q2_GROUP_SIZE)
+    min_w = grouped.min(axis=-1, keepdims=True)
+    max_w = grouped.max(axis=-1, keepdims=True)
+    levels = 15 if bits == 4 else 3
+    scales_f16 = ((max_w - min_w) / float(levels)).astype(np.float16)
+    zeros_f16 = min_w.astype(np.float16)
+    s_f32 = scales_f16.astype(np.float32)
+    z_f32 = zeros_f16.astype(np.float32)
+    safe_s = np.where(s_f32 > 1e-12, s_f32, 1.0)
+    codes = np.where(s_f32 > 1e-12, np.clip(np.round((grouped - z_f32) / safe_s), 0, levels), 0).astype(np.uint8)
+    if bits == 4:
+        codes_2 = codes.reshape(n_rows, k_cols // 2, 2)
+        packed = (codes_2[..., 0] | (codes_2[..., 1] << 4)).astype(np.uint8)
+    else:
+        codes_4 = codes.reshape(n_rows, k_cols // 4, 4)
+        packed = (
+            codes_4[..., 0]
+            | (codes_4[..., 1] << 2)
+            | (codes_4[..., 2] << 4)
+            | (codes_4[..., 3] << 6)
+        ).astype(np.uint8)
+    return packed, scales_f16.reshape(n_rows, groups), zeros_f16.reshape(n_rows, groups)
+
+
 def get_gguf_scalar(reader: Any, keys: list[str], default: Any = None) -> Any:
     for key in keys:
         field = reader.fields.get(key)
@@ -180,6 +213,22 @@ def extract_model_config(reader: Any, max_layers: int | None) -> dict[str, Any]:
         val = get_gguf_scalar(reader, [gguf_key], None)
         if val is not None:
             cfg[out_key] = int(val)
+
+    moe_fields = {
+        "sliding_window": f"{arch}.attention.sliding_window",
+        "num_experts": f"{arch}.expert_count",
+        "num_experts_per_tok": f"{arch}.expert_used_count",
+        "moe_intermediate_size": f"{arch}.expert_feed_forward_length",
+        "head_dim_swa": f"{arch}.attention.key_length_swa",
+        "rope_dim_swa": f"{arch}.rope.dimension_count_swa",
+    }
+    for out_key, gguf_key in moe_fields.items():
+        val = get_gguf_scalar(reader, [gguf_key], None)
+        if val is not None:
+            cfg[out_key] = int(val)
+    rope_theta_swa = get_gguf_scalar(reader, [f"{arch}.rope.freq_base_swa"], None)
+    if rope_theta_swa is not None:
+        cfg["rope_theta_swa"] = float(rope_theta_swa)
 
     return cfg
 
@@ -265,6 +314,9 @@ def convert_gguf(
     force_hadamard: bool = False,
     bits: int = 2,
     lm_head_bits: int = 16,
+    quant_format: str = "auto",
+    embed_bits: int = 16,
+    shard_mb: int = 0,
 ) -> None:
     import gguf
     from safetensors.numpy import save_file
@@ -283,12 +335,14 @@ def convert_gguf(
     with open(out_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     with open(out_dir / "quant_config.json", "w", encoding="utf-8") as f:
+        is_affine = quant_format in ("q2_affine", "q4_affine")
+        fmt = quant_format if is_affine else ("binary_1bit" if bits == 1 else "ternary_2bit")
         json.dump(
             {
-                "bits": bits,
-                "format": "binary_1bit" if bits == 1 else "ternary_2bit",
-                "group_size": GROUP_SIZE,
-                "hadamard": use_hadamard,
+                "bits": 4 if quant_format == "q4_affine" else bits,
+                "format": fmt,
+                "group_size": Q2_GROUP_SIZE if is_affine else GROUP_SIZE,
+                "hadamard": False if is_affine else use_hadamard,
             },
             f,
             indent=2,
@@ -297,6 +351,22 @@ def convert_gguf(
         json.dump(extract_minimal_tokenizer(reader), f)
 
     tensors_out: dict[str, np.ndarray] = {}
+    shard_idx = 1
+    total_tensors = 0
+
+    def flush_shard() -> None:
+        nonlocal shard_idx, total_tensors
+        if not tensors_out:
+            return
+        if shard_mb > 0:
+            shard_path = out_dir / f"model-{shard_idx:05d}.safetensors"
+            save_file(tensors_out, str(shard_path))
+            print(f"  [SHARD] {shard_path.name} écrit ({len(tensors_out)} tenseurs).", flush=True)
+            shard_idx += 1
+            total_tensors += len(tensors_out)
+            tensors_out.clear()
+            gc.collect()
+
     for tensor in reader.tensors:
         if not should_include_tensor(tensor.name, max_layers):
             continue
@@ -305,31 +375,83 @@ def convert_gguf(
         is_ternary = tensor.name.endswith(TERNARY_SUFFIXES) and len(tensor.shape) == 2
 
         if is_ternary:
-            if not use_hadamard and getattr(tensor.tensor_type, "name", "") == "Q1_0":
-                if bits == 1:
-                    packed_u8, scales_f16 = q1_0_to_binary_1bit(tensor.data)
-                else:
-                    packed_u8, scales_f16 = q1_0_to_ternary_2bit(tensor.data)
-            else:
+            if quant_format in ("q2_affine", "q4_affine"):
+                affine_bits = 4 if quant_format == "q4_affine" else 2
                 dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
-                packed_u8, scales_f16 = quantize_hadamard(dequant, h_128, device, bits=bits)
-            scale_name = target_name.removesuffix(".weight") + ".scales"
+                packed_u8, scales_f16, zeros_f16 = quantize_affine(dequant, bits=affine_bits)
+                prefix = target_name.removesuffix(".weight")
+                tensors_out[target_name] = packed_u8
+                tensors_out[prefix + ".scales"] = scales_f16
+                tensors_out[prefix + ".zeros"] = zeros_f16
+                print(
+                    f"  [Q{affine_bits}_AF] {target_name:32s} -> {packed_u8.shape} + scales/zeros {scales_f16.shape}",
+                    flush=True,
+                )
+            else:
+                if not use_hadamard and getattr(tensor.tensor_type, "name", "") == "Q1_0":
+                    if bits == 1:
+                        packed_u8, scales_f16 = q1_0_to_binary_1bit(tensor.data)
+                    else:
+                        packed_u8, scales_f16 = q1_0_to_ternary_2bit(tensor.data)
+                else:
+                    dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
+                    packed_u8, scales_f16 = quantize_hadamard(dequant, h_128, device, bits=bits)
+                scale_name = target_name.removesuffix(".weight") + ".scales"
+                tensors_out[target_name] = packed_u8
+                tensors_out[scale_name] = scales_f16
+                print(f"  [{bits}-bit] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
+        elif quant_format in ("q2_affine", "q4_affine") and len(tensor.shape) == 3 and tensor.name.endswith("ffn_gate_up_exps.weight"):
+            affine_bits = 4 if quant_format == "q4_affine" else 2
+            dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
+            num_e, two_inter, hidden = dequant.shape
+            inter = two_inter // 2
+            gate_flat = dequant[:, :inter, :].reshape(num_e * inter, hidden)
+            up_flat = dequant[:, inter:, :].reshape(num_e * inter, hidden)
+            base_prefix = target_name.removesuffix("ffn_gate_up_exps.weight")
+            for tag, mat in (("ffn_gate_exps", gate_flat), ("ffn_up_exps", up_flat)):
+                packed_u8, scales_f16, zeros_f16 = quantize_affine(mat, bits=affine_bits)
+                tensors_out[f"{base_prefix}{tag}.weight"] = packed_u8
+                tensors_out[f"{base_prefix}{tag}.scales"] = scales_f16
+                tensors_out[f"{base_prefix}{tag}.zeros"] = zeros_f16
+                print(f"  [Q{affine_bits}_EX] {base_prefix}{tag}.weight -> {packed_u8.shape}", flush=True)
+        elif quant_format in ("q2_affine", "q4_affine") and len(tensor.shape) == 3 and tensor.name.endswith("ffn_down_exps.weight"):
+            affine_bits = 4 if quant_format == "q4_affine" else 2
+            dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
+            num_e, hidden, inter = dequant.shape
+            packed_u8, scales_f16, zeros_f16 = quantize_affine(dequant.reshape(num_e * hidden, inter), bits=affine_bits)
+            prefix = target_name.removesuffix(".weight")
             tensors_out[target_name] = packed_u8
-            tensors_out[scale_name] = scales_f16
-            print(f"  [{bits}-bit] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
+            tensors_out[prefix + ".scales"] = scales_f16
+            tensors_out[prefix + ".zeros"] = zeros_f16
+            print(f"  [Q{affine_bits}_EX] {target_name:32s} -> {packed_u8.shape}", flush=True)
         elif target_name == "output.weight" and lm_head_bits in (4, 8):
             dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
             packed_u8, scales_f16 = quantize_grouped_linear(dequant, lm_head_bits)
             tensors_out["output.weight"] = packed_u8
             tensors_out["output.scales"] = scales_f16
             print(f"  [Q{lm_head_bits}   ] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
+        elif target_name == "token_embd.weight" and embed_bits in (4, 8):
+            dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
+            packed_u8, scales_f16 = quantize_grouped_linear(dequant, embed_bits)
+            tensors_out["token_embd.weight"] = packed_u8
+            tensors_out["token_embd.scales"] = scales_f16
+            print(f"  [Q{embed_bits}   ] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
         else:
             dequant_f16 = dequantize_tensor(tensor, gguf, target_dtype=np.float16)
             tensors_out[target_name] = dequant_f16
             print(f"  [FP16 ] {target_name:32s} -> {dequant_f16.shape}", flush=True)
 
-    save_file(tensors_out, str(out_dir / "model.safetensors"))
-    print(f"Export terminé dans {out_dir} ({len(tensors_out)} tenseurs).")
+        if shard_mb > 0:
+            cur_bytes = sum(arr.nbytes for arr in tensors_out.values())
+            if cur_bytes >= shard_mb * 1024 * 1024:
+                flush_shard()
+
+    if shard_mb > 0:
+        flush_shard()
+        print(f"Export terminé dans {out_dir} ({total_tensors} tenseurs en {shard_idx - 1} shards).")
+    else:
+        save_file(tensors_out, str(out_dir / "model.safetensors"))
+        print(f"Export terminé dans {out_dir} ({len(tensors_out)} tenseurs).")
 
 
 def main() -> None:
@@ -361,6 +483,26 @@ def main() -> None:
         default=16,
         help="Largeur de quantification de output.weight / lm_head (4=Q4, 8=Q8, 16=FP16)",
     )
+    parser.add_argument(
+        "--quant-format",
+        type=str,
+        choices=["auto", "q2_affine", "q4_affine"],
+        default="auto",
+        help="Format de quantification (auto=ternaire/1-bit Hadamard, q2_affine=2-bit affine, q4_affine=4-bit affine)",
+    )
+    parser.add_argument(
+        "--embed-bits",
+        type=int,
+        choices=[4, 8, 16],
+        default=16,
+        help="Largeur de quantification de token_embd.weight (4=Q4, 8=Q8, 16=FP16)",
+    )
+    parser.add_argument(
+        "--shard-mb",
+        type=int,
+        default=0,
+        help="Taille max par shard SafeTensors en Mo (0=fichier unique model.safetensors)",
+    )
     args = parser.parse_args()
     convert_gguf(
         args.gguf,
@@ -369,6 +511,9 @@ def main() -> None:
         force_hadamard=args.force_hadamard,
         bits=args.bits,
         lm_head_bits=args.lm_head_bits,
+        quant_format=args.quant_format,
+        embed_bits=args.embed_bits,
+        shard_mb=args.shard_mb,
     )
 
 

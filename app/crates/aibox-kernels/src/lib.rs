@@ -19,6 +19,18 @@ pub const GROUP_SIZE: usize = 128;
 /// Nombre d'octets packés (4 poids/octet) pour un groupe de 128 poids ternaires 2-bit.
 pub const PACKED_BYTES_PER_GROUP: usize = GROUP_SIZE / 4; // 32 octets
 
+/// Nombre de poids par groupe de quantification 2-bit affine (`q2_affine`).
+pub const Q2_GROUP_SIZE: usize = 64;
+
+/// Nombre d'octets packés (4 poids/octet) pour un groupe de 64 poids `q2_affine`.
+pub const Q2_PACKED_BYTES_PER_GROUP: usize = Q2_GROUP_SIZE / 4; // 16 octets
+
+/// Nombre de poids par groupe de quantification 4-bit affine (`q4_affine`).
+pub const Q4_GROUP_SIZE: usize = 64;
+
+/// Nombre d'octets packés (2 poids/octet) pour un groupe de 64 poids `q4_affine`.
+pub const Q4_PACKED_BYTES_PER_GROUP: usize = Q4_GROUP_SIZE / 2; // 32 octets
+
 /// Nombre d'octets packés (8 poids/octet) pour un groupe de 128 poids binaires 1-bit (`Q1_0`).
 pub const BINARY_PACKED_BYTES_PER_GROUP: usize = GROUP_SIZE / 8; // 16 octets
 
@@ -124,6 +136,53 @@ pub(crate) fn validate_packed_geometry(
         }
     }
     Ok(())
+}
+
+/// Valide la géométrie d'un tenseur `q2_affine` ou `q4_affine` par groupes de 64 poids.
+pub(crate) fn validate_group64_affine_geometry(
+    rows: usize,
+    cols: usize,
+    bytes_per_group: usize,
+    packed_len: Option<usize>,
+    scales_len: Option<usize>,
+) -> Result<(), BackendError> {
+    if rows == 0 || cols == 0 {
+        return Err(BackendError::InvalidDimensions(format!(
+            "rows={rows}, cols={cols} must both be non-zero"
+        )));
+    }
+    if cols % Q2_GROUP_SIZE != 0 {
+        return Err(BackendError::InvalidDimensions(format!(
+            "cols={cols} must be a multiple of Q2_GROUP_SIZE ({Q2_GROUP_SIZE})"
+        )));
+    }
+    if let Some(len) = packed_len {
+        let expected_w = rows * (cols / Q2_GROUP_SIZE) * bytes_per_group;
+        if len != expected_w {
+            return Err(BackendError::BufferLengthMismatch(format!(
+                "packed_weights len {len} != expected {expected_w}"
+            )));
+        }
+    }
+    if let Some(len) = scales_len {
+        let expected_s = rows * (cols / Q2_GROUP_SIZE);
+        if len != expected_s {
+            return Err(BackendError::BufferLengthMismatch(format!(
+                "scales_fp16 len {len} != expected {expected_s}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Valide la géométrie d'un tenseur `q2_affine` par groupes de 64 poids.
+pub(crate) fn validate_q2_affine_geometry(
+    rows: usize,
+    cols: usize,
+    packed_len: Option<usize>,
+    scales_len: Option<usize>,
+) -> Result<(), BackendError> {
+    validate_group64_affine_geometry(rows, cols, Q2_PACKED_BYTES_PER_GROUP, packed_len, scales_len)
 }
 
 /// Valide la géométrie d'un tenseur ternaire 2-bit par groupes de 128 poids.

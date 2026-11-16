@@ -177,7 +177,9 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
 
     let model_dir = resolve_model_path(target)?;
     println!("Chargement du modèle depuis {}...", model_dir.display());
-    let model = TransformerModel::load_from_dir(&model_dir)?;
+    let cfg_raw = std::fs::read_to_string(model_dir.join("config.json"))
+        .map_err(|e| format!("Failed to read config.json: {e}"))?;
+    let cfg_json = json::parse_json(&cfg_raw)?;
     let tok = tokenizer::SimpleTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
     let prompt_ids = tok.encode_chat(prompt);
 
@@ -188,7 +190,13 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
         top_p: if temperature > 0.0 { 0.95 } else { 1.0 },
         seed: 42,
     };
-    let stats = model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &*backend)?;
+    let stats = if engine::gemma4::Gemma4Config::is_gemma4_json(&cfg_json) {
+        let model = engine::gemma4::Gemma4Model::load_from_dir(&model_dir)?;
+        model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &*backend)?
+    } else {
+        let model = TransformerModel::load_from_dir(&model_dir)?;
+        model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &*backend)?
+    };
     let text = tok.decode(&stats.tokens);
     let decode_tok_s = (stats.tokens.len() as f64) / (stats.decode_ms / 1000.0).max(1e-6);
 

@@ -3,8 +3,10 @@
 use crate::{
     fwht::apply_fwht_128_rows,
     tensor::{decode_ternary, f16_to_f32},
-    validate_matmul_inputs, validate_packed_geometry, BackendError, TernaryHadamardBackend,
-    BINARY_PACKED_BYTES_PER_GROUP, GROUP_SIZE, PACKED_BYTES_PER_GROUP,
+    validate_group64_affine_geometry, validate_matmul_inputs, validate_packed_geometry,
+    validate_q2_affine_geometry, BackendError, TernaryHadamardBackend,
+    BINARY_PACKED_BYTES_PER_GROUP, GROUP_SIZE, PACKED_BYTES_PER_GROUP, Q2_GROUP_SIZE,
+    Q2_PACKED_BYTES_PER_GROUP, Q4_GROUP_SIZE, Q4_PACKED_BYTES_PER_GROUP,
 };
 
 /// Implémentation scalaire de référence de `TernaryHadamardBackend`.
@@ -118,6 +120,153 @@ fn dot_binary_row_scalar(x_row: &[f32], w_row: &[u8], s_row: &[u16], groups_per_
             }
         }
         total += acc * f16_to_f32(s_row[g]);
+    }
+    total
+}
+
+/// Multiplication matricielle 2-bit affine (`w = q * scale + zero`, `q in 0..=3`) sur CPU.
+pub fn matmul_q2_affine(
+    activations: &[f32],
+    packed_weights: &[u8],
+    scales_fp16: &[u16],
+    zeros_fp16: &[u16],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>, BackendError> {
+    if activations.len() != m * k {
+        return Err(BackendError::BufferLengthMismatch(format!(
+            "activations len {} != m*k ({})",
+            activations.len(),
+            m * k
+        )));
+    }
+    validate_q2_affine_geometry(
+        n,
+        k,
+        Some(packed_weights.len()),
+        Some(scales_fp16.len()),
+    )?;
+    let groups_per_row = k / Q2_GROUP_SIZE;
+    if zeros_fp16.len() != n * groups_per_row {
+        return Err(BackendError::BufferLengthMismatch(format!(
+            "zeros_fp16 len {} != expected {}",
+            zeros_fp16.len(),
+            n * groups_per_row
+        )));
+    }
+    let packed_row_stride = groups_per_row * Q2_PACKED_BYTES_PER_GROUP;
+    let mut output = vec![0.0f32; m * n];
+    for row_m in 0..m {
+        let x_row = &activations[row_m * k..(row_m + 1) * k];
+        let out_row = &mut output[row_m * n..(row_m + 1) * n];
+        for row_n in 0..n {
+            let w_row = &packed_weights[row_n * packed_row_stride..(row_n + 1) * packed_row_stride];
+            let s_row = &scales_fp16[row_n * groups_per_row..(row_n + 1) * groups_per_row];
+            let z_row = &zeros_fp16[row_n * groups_per_row..(row_n + 1) * groups_per_row];
+            out_row[row_n] = dot_q2_affine_row_scalar(x_row, w_row, s_row, z_row, groups_per_row);
+        }
+    }
+    Ok(output)
+}
+
+fn dot_q2_affine_row_scalar(
+    x_row: &[f32],
+    w_row: &[u8],
+    s_row: &[u16],
+    z_row: &[u16],
+    groups_per_row: usize,
+) -> f32 {
+    let mut total = 0.0f32;
+    for g in 0..groups_per_row {
+        let x_g = &x_row[g * Q2_GROUP_SIZE..(g + 1) * Q2_GROUP_SIZE];
+        let w_g = &w_row[g * Q2_PACKED_BYTES_PER_GROUP..(g + 1) * Q2_PACKED_BYTES_PER_GROUP];
+        let mut sum_q = 0.0f32;
+        let mut sum_x = 0.0f32;
+        for (byte_idx, &byte) in w_g.iter().enumerate() {
+            let base = byte_idx * 4;
+            for sub in 0..4 {
+                let q = ((byte >> (sub * 2)) & 0b11) as f32;
+                let x = x_g[base + sub];
+                sum_q += q * x;
+                sum_x += x;
+            }
+        }
+        total += sum_q * f16_to_f32(s_row[g]) + sum_x * f16_to_f32(z_row[g]);
+    }
+    total
+}
+
+/// Multiplication matricielle 4-bit affine (`w = q * scale + zero`, `q in 0..=15`) sur CPU.
+pub fn matmul_q4_affine(
+    activations: &[f32],
+    packed_weights: &[u8],
+    scales_fp16: &[u16],
+    zeros_fp16: &[u16],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>, BackendError> {
+    if activations.len() != m * k {
+        return Err(BackendError::BufferLengthMismatch(format!(
+            "activations len {} != m*k ({})",
+            activations.len(),
+            m * k
+        )));
+    }
+    validate_group64_affine_geometry(
+        n,
+        k,
+        Q4_PACKED_BYTES_PER_GROUP,
+        Some(packed_weights.len()),
+        Some(scales_fp16.len()),
+    )?;
+    let groups_per_row = k / Q4_GROUP_SIZE;
+    if zeros_fp16.len() != n * groups_per_row {
+        return Err(BackendError::BufferLengthMismatch(format!(
+            "zeros_fp16 len {} != expected {}",
+            zeros_fp16.len(),
+            n * groups_per_row
+        )));
+    }
+    let packed_row_stride = groups_per_row * Q4_PACKED_BYTES_PER_GROUP;
+    let mut output = vec![0.0f32; m * n];
+    for row_m in 0..m {
+        let x_row = &activations[row_m * k..(row_m + 1) * k];
+        let out_row = &mut output[row_m * n..(row_m + 1) * n];
+        for row_n in 0..n {
+            let w_row = &packed_weights[row_n * packed_row_stride..(row_n + 1) * packed_row_stride];
+            let s_row = &scales_fp16[row_n * groups_per_row..(row_n + 1) * groups_per_row];
+            let z_row = &zeros_fp16[row_n * groups_per_row..(row_n + 1) * groups_per_row];
+            out_row[row_n] = dot_q4_affine_row_scalar(x_row, w_row, s_row, z_row, groups_per_row);
+        }
+    }
+    Ok(output)
+}
+
+fn dot_q4_affine_row_scalar(
+    x_row: &[f32],
+    w_row: &[u8],
+    s_row: &[u16],
+    z_row: &[u16],
+    groups_per_row: usize,
+) -> f32 {
+    let mut total = 0.0f32;
+    for g in 0..groups_per_row {
+        let x_g = &x_row[g * Q4_GROUP_SIZE..(g + 1) * Q4_GROUP_SIZE];
+        let w_g = &w_row[g * Q4_PACKED_BYTES_PER_GROUP..(g + 1) * Q4_PACKED_BYTES_PER_GROUP];
+        let mut sum_q = 0.0f32;
+        let mut sum_x = 0.0f32;
+        for (byte_idx, &byte) in w_g.iter().enumerate() {
+            let base = byte_idx * 2;
+            let q0 = (byte & 0x0F) as f32;
+            let q1 = ((byte >> 4) & 0x0F) as f32;
+            let x0 = x_g[base];
+            let x1 = x_g[base + 1];
+            sum_q += q0 * x0 + q1 * x1;
+            sum_x += x0 + x1;
+        }
+        total += sum_q * f16_to_f32(s_row[g]) + sum_x * f16_to_f32(z_row[g]);
     }
     total
 }
@@ -275,6 +424,98 @@ mod tests {
             .unwrap();
         for (i, (&a, &b)) in got_1bit_plain.iter().zip(got_2bit_plain.iter()).enumerate() {
             assert!((a - b).abs() < 1e-4, "plain idx={i} 1bit={a} 2bit={b}");
+        }
+    }
+
+    #[test]
+    fn scalar_q2_affine_matches_dequant_matmul() {
+        use crate::tensor::{quantize_q2_affine_f32, unpack_q2_affine_rows};
+
+        let m = 2usize;
+        let n = 3usize;
+        let k = 192usize;
+        let groups = k / Q2_GROUP_SIZE;
+
+        let activations: Vec<f32> = (0..(m * k)).map(|i| ((i % 17) as f32 - 8.0) * 0.15).collect();
+        let weights: Vec<f32> = (0..(n * k)).map(|i| ((i % 23) as f32 - 11.0) * 0.1).collect();
+        let q2 = quantize_q2_affine_f32(&weights, n, k).unwrap();
+        let codes = unpack_q2_affine_rows(&q2.packed_weights, n, k).unwrap();
+
+        let mut expected = vec![0.0f32; m * n];
+        for rm in 0..m {
+            for rn in 0..n {
+                let mut acc = 0.0f32;
+                for g in 0..groups {
+                    let s = f16_to_f32(q2.scales_fp16[rn * groups + g]);
+                    let z = f16_to_f32(q2.zeros_fp16[rn * groups + g]);
+                    for idx in 0..Q2_GROUP_SIZE {
+                        let c = codes[rn * k + g * Q2_GROUP_SIZE + idx] as f32;
+                        let w = c * s + z;
+                        acc += activations[rm * k + g * Q2_GROUP_SIZE + idx] * w;
+                    }
+                }
+                expected[rm * n + rn] = acc;
+            }
+        }
+
+        let got = matmul_q2_affine(
+            &activations,
+            &q2.packed_weights,
+            &q2.scales_fp16,
+            &q2.zeros_fp16,
+            m,
+            n,
+            k,
+        )
+        .unwrap();
+        for (i, (&e, &g)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!((e - g).abs() < 1e-4, "q2 idx={i} expected={e} got={g}");
+        }
+    }
+
+    #[test]
+    fn scalar_q4_affine_matches_dequant_matmul() {
+        use crate::tensor::{quantize_q4_affine_f32, unpack_q4_affine_rows};
+
+        let m = 2usize;
+        let n = 3usize;
+        let k = 192usize;
+        let groups = k / Q4_GROUP_SIZE;
+
+        let activations: Vec<f32> = (0..(m * k)).map(|i| ((i % 17) as f32 - 8.0) * 0.15).collect();
+        let weights: Vec<f32> = (0..(n * k)).map(|i| ((i % 23) as f32 - 11.0) * 0.1).collect();
+        let q4 = quantize_q4_affine_f32(&weights, n, k).unwrap();
+        let codes = unpack_q4_affine_rows(&q4.packed_weights, n, k).unwrap();
+
+        let mut expected = vec![0.0f32; m * n];
+        for rm in 0..m {
+            for rn in 0..n {
+                let mut acc = 0.0f32;
+                for g in 0..groups {
+                    let s = f16_to_f32(q4.scales_fp16[rn * groups + g]);
+                    let z = f16_to_f32(q4.zeros_fp16[rn * groups + g]);
+                    for idx in 0..Q4_GROUP_SIZE {
+                        let c = codes[rn * k + g * Q4_GROUP_SIZE + idx] as f32;
+                        let w = c * s + z;
+                        acc += activations[rm * k + g * Q4_GROUP_SIZE + idx] * w;
+                    }
+                }
+                expected[rm * n + rn] = acc;
+            }
+        }
+
+        let got = matmul_q4_affine(
+            &activations,
+            &q4.packed_weights,
+            &q4.scales_fp16,
+            &q4.zeros_fp16,
+            m,
+            n,
+            k,
+        )
+        .unwrap();
+        for (i, (&e, &g)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!((e - g).abs() < 1e-4, "q4 idx={i} expected={e} got={g}");
         }
     }
 }

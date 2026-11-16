@@ -135,6 +135,23 @@ type FnGdnStepF16 = unsafe extern "C" fn(
 #[cfg(target_os = "linux")]
 type FnMatmulDenseF16Dev =
     unsafe extern "C" fn(*const u16, *const u16, *mut u16, c_int, c_int, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnMatmulQ2AffineF16Dev = unsafe extern "C" fn(
+    *const u16,
+    *const u8,
+    *const u16,
+    *const u16,
+    *mut u16,
+    c_int,
+    c_int,
+    c_int,
+) -> c_int;
+#[cfg(target_os = "linux")]
+type FnAllocPinned = unsafe extern "C" fn(usize) -> *mut c_void;
+#[cfg(target_os = "linux")]
+type FnFreePinned = unsafe extern "C" fn(*mut c_void);
+#[cfg(target_os = "linux")]
+type FnMemcpyH2DAsync = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
 
 #[cfg(target_os = "linux")]
 struct GpuWeightPair {
@@ -187,6 +204,11 @@ struct CudaSymbols {
     gdn_conv_silu_f16: FnGdnConvSiluF16,
     gdn_step_f16: FnGdnStepF16,
     matmul_dense_f16_dev: FnMatmulDenseF16Dev,
+    matmul_q2_affine_f16_dev: FnMatmulQ2AffineF16Dev,
+    matmul_q4_affine_f16_dev: FnMatmulQ2AffineF16Dev,
+    alloc_pinned: FnAllocPinned,
+    free_pinned: FnFreePinned,
+    memcpy_h2d_async: FnMemcpyH2DAsync,
 }
 
 #[cfg(target_os = "linux")]
@@ -329,6 +351,29 @@ impl<'a> GpuBuffer<'a, u16> {
         };
         check_cuda_status("cudaMemcpy H2D (row)", h2d)
     }
+
+    pub fn download_as_f32(&self, out: &mut [f32]) -> Result<(), BackendError> {
+        if out.len() > self.len {
+            return Err(BackendError::BufferLengthMismatch(format!(
+                "download {} > GpuBuffer len {}",
+                out.len(),
+                self.len
+            )));
+        }
+        let mut halfs = vec![0u16; out.len()];
+        let status = unsafe {
+            (self.gpu.symbols.memcpy_d2h)(
+                halfs.as_mut_ptr() as *mut c_void,
+                self.ptr as *const c_void,
+                std::mem::size_of_val(halfs.as_slice()),
+            )
+        };
+        check_cuda_status("cudaMemcpy D2H (f16)", status)?;
+        for (dst, &bits) in out.iter_mut().zip(halfs.iter()) {
+            *dst = crate::tensor::f16_to_f32(bits);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -350,6 +395,10 @@ impl<'a> GpuBuffer<'a, u16> {
     }
 
     pub fn copy_row_to_front(&mut self, _row_idx: usize, _row_len: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+
+    pub fn download_as_f32(&self, _out: &mut [f32]) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
 }
@@ -466,6 +515,11 @@ impl GpuBackend {
                 gdn_conv_silu_f16: load_symbol(handle, "aibox_gpu_gdn_conv_silu_f16")?,
                 gdn_step_f16: load_symbol(handle, "aibox_gpu_gdn_step_f16")?,
                 matmul_dense_f16_dev: load_symbol(handle, "aibox_gpu_matmul_dense_f16_dev")?,
+                matmul_q2_affine_f16_dev: load_symbol(handle, "aibox_gpu_matmul_q2_affine_f16_dev")?,
+                matmul_q4_affine_f16_dev: load_symbol(handle, "aibox_gpu_matmul_q4_affine_f16_dev")?,
+                alloc_pinned: load_symbol(handle, "aibox_gpu_alloc_pinned")?,
+                free_pinned: load_symbol(handle, "aibox_gpu_free_pinned")?,
+                memcpy_h2d_async: load_symbol(handle, "aibox_gpu_memcpy_h2d_async")?,
             })
         })();
 
@@ -1028,6 +1082,226 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_graph_launch", status)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q2_affine_f16_dev(
+        &self,
+        x_dev: &GpuBuffer<'_, u16>,
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        zeros_fp16: &[u16],
+        out_dev: &mut GpuBuffer<'_, u16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        let dev_w = self.get_or_upload_raw_bytes(packed_weights.as_ptr() as *const c_void, packed_weights.len())?;
+        let dev_s = self.get_or_upload_raw_bytes(
+            scales_fp16.as_ptr() as *const c_void,
+            std::mem::size_of_val(scales_fp16),
+        )?;
+        let dev_z = self.get_or_upload_raw_bytes(
+            zeros_fp16.as_ptr() as *const c_void,
+            std::mem::size_of_val(zeros_fp16),
+        )?;
+        let status = unsafe {
+            (self.symbols.matmul_q2_affine_f16_dev)(
+                x_dev.as_ptr(),
+                dev_w as *const u8,
+                dev_s as *const u16,
+                dev_z as *const u16,
+                out_dev.as_mut_ptr(),
+                m as c_int,
+                n as c_int,
+                k as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_matmul_q2_affine_f16_dev", status)
+    }
+
+    pub fn alloc_u8(&self, len: usize) -> Result<GpuBuffer<'_, u8>, BackendError> {
+        let ptr = unsafe { (self.symbols.alloc)(len.max(1)) };
+        if ptr.is_null() {
+            return Err(BackendError::UnsupportedFeature("cudaMalloc u8 failed".to_string()));
+        }
+        Ok(GpuBuffer { gpu: self, ptr: ptr as *mut u8, len })
+    }
+
+    pub fn alloc_u16(&self, len: usize) -> Result<GpuBuffer<'_, u16>, BackendError> {
+        self.alloc_f16(len)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q4_affine_f16_dev(
+        &self,
+        x_dev: &GpuBuffer<'_, u16>,
+        packed_weights: &[u8],
+        scales_fp16: &[u16],
+        zeros_fp16: &[u16],
+        out_dev: &mut GpuBuffer<'_, u16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        let dev_w = self.get_or_upload_raw_bytes(packed_weights.as_ptr() as *const c_void, packed_weights.len())?;
+        let dev_s = self.get_or_upload_raw_bytes(
+            scales_fp16.as_ptr() as *const c_void,
+            std::mem::size_of_val(scales_fp16),
+        )?;
+        let dev_z = self.get_or_upload_raw_bytes(
+            zeros_fp16.as_ptr() as *const c_void,
+            std::mem::size_of_val(zeros_fp16),
+        )?;
+        let status = unsafe {
+            (self.symbols.matmul_q4_affine_f16_dev)(
+                x_dev.as_ptr(),
+                dev_w as *const u8,
+                dev_s as *const u16,
+                dev_z as *const u16,
+                out_dev.as_mut_ptr(),
+                m as c_int,
+                n as c_int,
+                k as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_matmul_q4_affine_f16_dev", status)
+    }
+
+    /// Streame les poids `q4_affine` depuis la RAM (ou RAM pinnée) vers des tampons VRAM réutilisables
+    /// sans saturer `raw_cache` (pour les experts froids MoE sur GPU 6 Go).
+    ///
+    /// # Safety
+    /// `pinned_host` doit pointer vers un tampon valide d'au moins `packed_len + scales_bytes + zeros_bytes`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matmul_q4_affine_f16_streaming_dev(
+        &self,
+        x_dev: &GpuBuffer<'_, u16>,
+        pinned_host: *const u8,
+        packed_len: usize,
+        scales_len: usize,
+        stage_w: &mut GpuBuffer<'_, u8>,
+        stage_s: &mut GpuBuffer<'_, u16>,
+        stage_z: &mut GpuBuffer<'_, u16>,
+        out_dev: &mut GpuBuffer<'_, u16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        let s_bytes = scales_len * std::mem::size_of::<u16>();
+        unsafe {
+            self.memcpy_h2d_async(stage_w, pinned_host, packed_len)?;
+            let st_s = (self.symbols.memcpy_h2d_async)(
+                stage_s.as_mut_ptr() as *mut c_void,
+                pinned_host.add(packed_len) as *const c_void,
+                s_bytes,
+            );
+            check_cuda_status("aibox_gpu_memcpy_h2d_async (scales)", st_s)?;
+            let st_z = (self.symbols.memcpy_h2d_async)(
+                stage_z.as_mut_ptr() as *mut c_void,
+                pinned_host.add(packed_len + s_bytes) as *const c_void,
+                s_bytes,
+            );
+            check_cuda_status("aibox_gpu_memcpy_h2d_async (zeros)", st_z)?;
+        }
+        let status = unsafe {
+            (self.symbols.matmul_q4_affine_f16_dev)(
+                x_dev.as_ptr(),
+                stage_w.as_ptr(),
+                stage_s.as_ptr(),
+                stage_z.as_ptr(),
+                out_dev.as_mut_ptr(),
+                m as c_int,
+                n as c_int,
+                k as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_matmul_q4_affine_f16_dev (streaming)", status)
+    }
+
+    pub fn alloc_pinned_bytes(&self, bytes: usize) -> Result<*mut u8, BackendError> {
+        let ptr = unsafe { (self.symbols.alloc_pinned)(bytes) };
+        if ptr.is_null() {
+            return Err(BackendError::UnsupportedFeature("cudaHostAlloc failed".to_string()));
+        }
+        Ok(ptr as *mut u8)
+    }
+
+    /// # Safety
+    /// `ptr` must have been allocated by `alloc_pinned_bytes`.
+    pub unsafe fn free_pinned_bytes(&self, ptr: *mut u8) {
+        if !ptr.is_null() {
+            unsafe { (self.symbols.free_pinned)(ptr as *mut c_void) };
+        }
+    }
+
+    /// # Safety
+    /// `host_src` must be valid for `bytes` and `dev_dst` must have at least `bytes` capacity.
+    pub unsafe fn memcpy_h2d_async(
+        &self,
+        dev_dst: &mut GpuBuffer<'_, u8>,
+        host_src: *const u8,
+        bytes: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.memcpy_h2d_async)(dev_dst.as_mut_ptr() as *mut c_void, host_src as *const c_void, bytes)
+        };
+        check_cuda_status("aibox_gpu_memcpy_h2d_async", status)
+    }
+
+    pub fn upload_u8_slice(&self, dev_dst: &mut GpuBuffer<'_, u8>, src: &[u8]) -> Result<(), BackendError> {
+        if dev_dst.len() < src.len() {
+            return Err(BackendError::BufferLengthMismatch("upload_u8_slice overflow".to_string()));
+        }
+        let status = unsafe {
+            (self.symbols.memcpy_h2d_async)(
+                dev_dst.as_mut_ptr() as *mut c_void,
+                src.as_ptr() as *const c_void,
+                src.len(),
+            )
+        };
+        check_cuda_status("aibox_gpu_memcpy_h2d_async (u8)", status)
+    }
+
+    pub fn upload_u16_slice(&self, dev_dst: &mut GpuBuffer<'_, u16>, src: &[u16]) -> Result<(), BackendError> {
+        if dev_dst.len() < src.len() {
+            return Err(BackendError::BufferLengthMismatch("upload_u16_slice overflow".to_string()));
+        }
+        let status = unsafe {
+            (self.symbols.memcpy_h2d_async)(
+                dev_dst.as_mut_ptr() as *mut c_void,
+                src.as_ptr() as *const c_void,
+                std::mem::size_of_val(src),
+            )
+        };
+        check_cuda_status("aibox_gpu_memcpy_h2d_async (u16)", status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q4_affine_buffers_dev(
+        &self,
+        x_dev: &GpuBuffer<'_, u16>,
+        w_dev: &GpuBuffer<'_, u8>,
+        s_dev: &GpuBuffer<'_, u16>,
+        z_dev: &GpuBuffer<'_, u16>,
+        out_dev: &mut GpuBuffer<'_, u16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.matmul_q4_affine_f16_dev)(
+                x_dev.as_ptr(),
+                w_dev.as_ptr(),
+                s_dev.as_ptr(),
+                z_dev.as_ptr(),
+                out_dev.as_mut_ptr(),
+                m as c_int,
+                n as c_int,
+                k as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_matmul_q4_affine_f16_dev (buffers)", status)
+    }
+
     fn get_or_upload_raw_bytes(&self, host_ptr: *const c_void, byte_len: usize) -> Result<*mut c_void, BackendError> {
         let key = (host_ptr as usize, byte_len);
         let mut guard = self.raw_cache.lock().map_err(|_| {
@@ -1197,6 +1471,57 @@ impl GpuBackend {
     pub fn graph_launch(&self, _hidden: &mut GpuBuffer<'_, u16>, _emb: &[f32], _pos: usize) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q2_affine_f16_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _zr: &[u16], _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn alloc_u8(&self, _len: usize) -> Result<GpuBuffer<'_, u8>, BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn alloc_u16(&self, _len: usize) -> Result<GpuBuffer<'_, u16>, BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q4_affine_f16_dev(&self, _x: &GpuBuffer<'_, u16>, _pw: &[u8], _sc: &[u16], _zr: &[u16], _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    /// # Safety
+    /// Linux-only CUDA streaming q4_affine stub.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matmul_q4_affine_f16_streaming_dev(&self, _x: &GpuBuffer<'_, u16>, _ph: *const u8, _pl: usize, _sl: usize, _sw: &mut GpuBuffer<'_, u8>, _ss: &mut GpuBuffer<'_, u16>, _sz: &mut GpuBuffer<'_, u16>, _out: &mut GpuBuffer<'_, u16>, _m: usize, _n: usize, _k: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn alloc_pinned_bytes(&self, _bytes: usize) -> Result<*mut u8, BackendError> {
+        Err(linux_only_err())
+    }
+    /// # Safety
+    /// Linux-only CUDA pinned memory free stub.
+    pub unsafe fn free_pinned_bytes(&self, _ptr: *mut u8) {}
+    /// # Safety
+    /// Linux-only CUDA async H2D copy stub.
+    pub unsafe fn memcpy_h2d_async(&self, _dev_dst: &mut GpuBuffer<'_, u8>, _host_src: *const u8, _bytes: usize) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn upload_u8_slice(&self, _dev_dst: &mut GpuBuffer<'_, u8>, _src: &[u8]) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn upload_u16_slice(&self, _dev_dst: &mut GpuBuffer<'_, u16>, _src: &[u16]) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q4_affine_buffers_dev(
+        &self,
+        _x: &GpuBuffer<'_, u16>,
+        _w: &GpuBuffer<'_, u8>,
+        _s: &GpuBuffer<'_, u16>,
+        _z: &GpuBuffer<'_, u16>,
+        _out: &mut GpuBuffer<'_, u16>,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1288,5 +1613,97 @@ mod tests {
         }
         let err = GpuBackend::try_new().err().expect("expected error without CUDA lib");
         assert!(matches!(err, BackendError::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn gpu_q2_affine_matches_scalar_when_available() {
+        use crate::scalar::matmul_q2_affine;
+        use crate::tensor::quantize_q2_affine_f32;
+
+        let Ok(gpu) = GpuBackend::try_new() else {
+            return;
+        };
+        let m = 1usize;
+        let n = 4usize;
+        let k = 192usize;
+        let x: Vec<f32> = (0..k).map(|i| ((i % 15) as f32 - 7.0) * 0.1).collect();
+        let w: Vec<f32> = (0..(n * k)).map(|i| ((i % 19) as f32 - 9.0) * 0.1).collect();
+        let q2 = quantize_q2_affine_f32(&w, n, k).unwrap();
+        let expected = matmul_q2_affine(
+            &x,
+            &q2.packed_weights,
+            &q2.scales_fp16,
+            &q2.zeros_fp16,
+            m,
+            n,
+            k,
+        )
+        .unwrap();
+
+        let mut x_dev = gpu.alloc_f16(k).unwrap();
+        x_dev.upload_f32_as_f16(&x).unwrap();
+        let mut out_dev = gpu.alloc_f16(m * n).unwrap();
+        gpu.matmul_q2_affine_f16_dev(
+            &x_dev,
+            &q2.packed_weights,
+            &q2.scales_fp16,
+            &q2.zeros_fp16,
+            &mut out_dev,
+            m,
+            n,
+            k,
+        )
+        .unwrap();
+        let mut got = vec![0.0f32; m * n];
+        out_dev.download_as_f32(&mut got).unwrap();
+        for (i, (&exp, &g)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!((exp - g).abs() < 0.05, "idx={i} expected={exp} got={g}");
+        }
+    }
+
+    #[test]
+    fn gpu_q4_affine_matches_scalar_when_available() {
+        use crate::scalar::matmul_q4_affine;
+        use crate::tensor::quantize_q4_affine_f32;
+
+        let Ok(gpu) = GpuBackend::try_new() else {
+            return;
+        };
+        let m = 1usize;
+        let n = 4usize;
+        let k = 192usize;
+        let x: Vec<f32> = (0..k).map(|i| ((i % 15) as f32 - 7.0) * 0.1).collect();
+        let w: Vec<f32> = (0..(n * k)).map(|i| ((i % 19) as f32 - 9.0) * 0.1).collect();
+        let q4 = quantize_q4_affine_f32(&w, n, k).unwrap();
+        let expected = matmul_q4_affine(
+            &x,
+            &q4.packed_weights,
+            &q4.scales_fp16,
+            &q4.zeros_fp16,
+            m,
+            n,
+            k,
+        )
+        .unwrap();
+
+        let mut x_dev = gpu.alloc_f16(k).unwrap();
+        x_dev.upload_f32_as_f16(&x).unwrap();
+        let mut out_dev = gpu.alloc_f16(m * n).unwrap();
+        gpu.matmul_q4_affine_f16_dev(
+            &x_dev,
+            &q4.packed_weights,
+            &q4.scales_fp16,
+            &q4.zeros_fp16,
+            &mut out_dev,
+            m,
+            n,
+            k,
+        )
+        .unwrap();
+        let mut got = vec![0.0f32; m * n];
+        out_dev.download_as_f32(&mut got).unwrap();
+        for (i, (&exp, &g)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!((exp - g).abs() < 0.05, "q4 idx={i} expected={exp} got={g}");
+        }
     }
 }

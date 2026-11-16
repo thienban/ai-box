@@ -11,6 +11,7 @@ pub struct SimpleTokenizer {
     piece_to_id: HashMap<String, usize>,
     max_piece_chars: usize,
     eos_id: Option<usize>,
+    is_sentencepiece: bool,
 }
 
 impl SimpleTokenizer {
@@ -66,14 +67,20 @@ impl SimpleTokenizer {
 
         let eos_id = piece_to_id
             .get("<|im_end|>")
+            .or_else(|| piece_to_id.get("<turn|>"))
             .or_else(|| piece_to_id.get("<|endoftext|>"))
+            .or_else(|| piece_to_id.get("<eos>"))
             .copied();
+
+        let is_sentencepiece = !piece_to_id.contains_key("Ġthe")
+            && (piece_to_id.contains_key("<bos>") || piece_to_id.keys().any(|k| k.starts_with('▁')));
 
         Ok(Self {
             id_to_piece,
             piece_to_id,
             max_piece_chars: max_piece_chars.min(64),
             eos_id,
+            is_sentencepiece,
         })
     }
 
@@ -81,9 +88,13 @@ impl SimpleTokenizer {
         self.eos_id
     }
 
-    /// Encode un texte par longest-match glouton avec mapping GPT-2 byte-level UTF-8.
+    /// Encode un texte par longest-match glouton (GPT-2 byte-level ou SentencePiece `▁`).
     pub fn encode(&self, text: &str) -> Vec<usize> {
-        let chars: Vec<char> = text.as_bytes().iter().copied().map(byte_to_gpt2_char).collect();
+        let chars: Vec<char> = if self.is_sentencepiece {
+            text.chars().map(|c| if c == ' ' { '▁' } else { c }).collect()
+        } else {
+            text.as_bytes().iter().copied().map(byte_to_gpt2_char).collect()
+        };
         let mut ids = Vec::new();
         let mut idx = 0usize;
 
@@ -124,6 +135,19 @@ impl SimpleTokenizer {
             ids.extend(self.encode("\n"));
             ids.push(im_start);
             ids.extend(self.encode("assistant\n"));
+        } else if let Some(&turn_start) = self.piece_to_id.get("<|turn>") {
+            if let Some(&bos) = self.piece_to_id.get("<bos>") {
+                ids.push(bos);
+            }
+            ids.push(turn_start);
+            ids.extend(self.encode("user\n"));
+            ids.extend(self.encode(user_prompt));
+            if let Some(&turn_end) = self.piece_to_id.get("<turn|>") {
+                ids.push(turn_end);
+            }
+            ids.extend(self.encode("\n"));
+            ids.push(turn_start);
+            ids.extend(self.encode("model\n"));
         } else {
             ids = self.encode(user_prompt);
         }
@@ -161,8 +185,14 @@ impl<'a> TokenStreamDecoder<'a> {
 
     pub fn push(&mut self, token_id: usize) -> String {
         let piece = self.tokenizer.raw_piece(token_id);
-        if piece == "<|im_end|>" || piece == "<|endoftext|>" || piece == "<|im_start|>" {
+        if matches!(
+            piece,
+            "<|im_end|>" | "<|endoftext|>" | "<|im_start|>" | "<bos>" | "<eos>" | "<|turn>" | "<turn|>"
+        ) {
             return String::new();
+        }
+        if self.tokenizer.is_sentencepiece {
+            return piece.replace('▁', " ");
         }
         for ch in piece.chars() {
             if let Some(byte) = gpt2_unicode_to_byte(ch) {

@@ -2015,4 +2015,248 @@ int aibox_gpu_matmul_dense_f16_dev(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
+__global__ void q2_affine_gemv_f16_kernel(
+    const __half* __restrict__ x,
+    const uint8_t* __restrict__ w_packed,
+    const uint16_t* __restrict__ scales,
+    const uint16_t* __restrict__ zeros,
+    __half* __restrict__ out,
+    int m,
+    int n,
+    int k
+) {
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int row_n = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    int row_m = blockIdx.y;
+    if (row_n >= n || row_m >= m) {
+        return;
+    }
+
+    int groups_per_row = k / 64;
+    const int bytes_per_group = 16;
+    const __half* x_row = x + (size_t)row_m * k;
+    const uint8_t* w_row = w_packed + (size_t)row_n * groups_per_row * bytes_per_group;
+    const uint16_t* s_row = scales + (size_t)row_n * groups_per_row;
+    const uint16_t* z_row = zeros + (size_t)row_n * groups_per_row;
+
+    float total = 0.0f;
+    int sub_g = lane >> 4;
+    int sub_lane = lane & 15;
+    int g = 0;
+    for (; g + 2 <= groups_per_row; g += 2) {
+        int cur_g = g + sub_g;
+        uint2 x_u2 = *reinterpret_cast<const uint2*>(&x_row[cur_g * 64 + sub_lane * 4]);
+        const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+        float2 f0 = __half22float2(h2[0]);
+        float2 f1 = __half22float2(h2[1]);
+
+        uint8_t packed = w_row[cur_g * bytes_per_group + sub_lane];
+        float q0 = static_cast<float>(packed & 0x03);
+        float q1 = static_cast<float>((packed >> 2) & 0x03);
+        float q2 = static_cast<float>((packed >> 4) & 0x03);
+        float q3 = static_cast<float>((packed >> 6) & 0x03);
+
+        float sum_q = f0.x * q0 + f0.y * q1 + f1.x * q2 + f1.y * q3;
+        float sum_x = f0.x + f0.y + f1.x + f1.y;
+
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            sum_q += __shfl_down_sync(0xFFFFFFFF, sum_q, offset);
+            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+        }
+        if (sub_lane == 0) {
+            float s = __half2float(*reinterpret_cast<const __half*>(&s_row[cur_g]));
+            float z = __half2float(*reinterpret_cast<const __half*>(&z_row[cur_g]));
+            total += sum_q * s + sum_x * z;
+        }
+    }
+    if (g < groups_per_row) {
+        float sum_q = 0.0f;
+        float sum_x = 0.0f;
+        if (lane < 16) {
+            uint2 x_u2 = *reinterpret_cast<const uint2*>(&x_row[g * 64 + lane * 4]);
+            const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+            float2 f0 = __half22float2(h2[0]);
+            float2 f1 = __half22float2(h2[1]);
+            uint8_t packed = w_row[g * bytes_per_group + lane];
+            sum_q = f0.x * static_cast<float>(packed & 0x03)
+                  + f0.y * static_cast<float>((packed >> 2) & 0x03)
+                  + f1.x * static_cast<float>((packed >> 4) & 0x03)
+                  + f1.y * static_cast<float>((packed >> 6) & 0x03);
+            sum_x = f0.x + f0.y + f1.x + f1.y;
+        }
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            sum_q += __shfl_down_sync(0xFFFFFFFF, sum_q, offset);
+            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+        }
+        if (lane == 0) {
+            float s = __half2float(*reinterpret_cast<const __half*>(&s_row[g]));
+            float z = __half2float(*reinterpret_cast<const __half*>(&z_row[g]));
+            total += sum_q * s + sum_x * z;
+        }
+    }
+    total += __shfl_down_sync(0xFFFFFFFF, total, 16);
+
+    if (lane == 0) {
+        out[(size_t)row_m * n + row_n] = __float2half(total);
+    }
+}
+
+int aibox_gpu_matmul_q2_affine_f16_dev(
+    const uint16_t* dev_x,
+    const uint8_t* dev_w,
+    const uint16_t* dev_scales,
+    const uint16_t* dev_zeros,
+    uint16_t* dev_out,
+    int m,
+    int n,
+    int k
+) {
+    if (m <= 0 || n <= 0 || k <= 0 || (k % 64) != 0) {
+        return -1;
+    }
+    dim3 grid((n + 3) / 4, m);
+    q2_affine_gemv_f16_kernel<<<grid, 128, 0, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_x),
+        dev_w,
+        dev_scales,
+        dev_zeros,
+        reinterpret_cast<__half*>(dev_out),
+        m,
+        n,
+        k
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+void* aibox_gpu_alloc_pinned(size_t bytes) {
+    void* host_ptr = nullptr;
+    if (cudaHostAlloc(&host_ptr, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        return nullptr;
+    }
+    return host_ptr;
+}
+
+void aibox_gpu_free_pinned(void* host_ptr) {
+    if (host_ptr != nullptr) {
+        cudaFreeHost(host_ptr);
+    }
+}
+
+int aibox_gpu_memcpy_h2d_async(void* dev_dst, const void* host_src, size_t bytes) {
+    return (cudaMemcpyAsync(dev_dst, host_src, bytes, cudaMemcpyHostToDevice, g_active_stream) == cudaSuccess) ? 0 : -1;
+}
+
+__global__ void q4_affine_gemv_f16_kernel(
+    const __half* __restrict__ x,
+    const uint8_t* __restrict__ w_packed,
+    const uint16_t* __restrict__ scales,
+    const uint16_t* __restrict__ zeros,
+    __half* __restrict__ out,
+    int m,
+    int n,
+    int k
+) {
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int row_n = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    int row_m = blockIdx.y;
+    if (row_n >= n || row_m >= m) {
+        return;
+    }
+
+    int groups_per_row = k / 64;
+    const int bytes_per_group = 32;
+    const __half* x_row = x + (size_t)row_m * k;
+    const uint8_t* w_row = w_packed + (size_t)row_n * groups_per_row * bytes_per_group;
+    const uint16_t* s_row = scales + (size_t)row_n * groups_per_row;
+    const uint16_t* z_row = zeros + (size_t)row_n * groups_per_row;
+
+    float total = 0.0f;
+    int sub_g = lane >> 4;
+    int sub_lane = lane & 15;
+    int g = 0;
+    for (; g + 2 <= groups_per_row; g += 2) {
+        int cur_g = g + sub_g;
+        uint2 x_u2 = *reinterpret_cast<const uint2*>(&x_row[cur_g * 64 + sub_lane * 4]);
+        const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+        float2 f0 = __half22float2(h2[0]);
+        float2 f1 = __half22float2(h2[1]);
+
+        uint16_t packed = *reinterpret_cast<const uint16_t*>(&w_row[cur_g * bytes_per_group + sub_lane * 2]);
+        float q0 = static_cast<float>(packed & 0x0F);
+        float q1 = static_cast<float>((packed >> 4) & 0x0F);
+        float q2 = static_cast<float>((packed >> 8) & 0x0F);
+        float q3 = static_cast<float>((packed >> 12) & 0x0F);
+
+        float sum_q = f0.x * q0 + f0.y * q1 + f1.x * q2 + f1.y * q3;
+        float sum_x = f0.x + f0.y + f1.x + f1.y;
+
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            sum_q += __shfl_down_sync(0xFFFFFFFF, sum_q, offset);
+            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+        }
+        if (sub_lane == 0) {
+            float s = __half2float(*reinterpret_cast<const __half*>(&s_row[cur_g]));
+            float z = __half2float(*reinterpret_cast<const __half*>(&z_row[cur_g]));
+            total += sum_q * s + sum_x * z;
+        }
+    }
+    if (g < groups_per_row) {
+        float sum_q = 0.0f;
+        float sum_x = 0.0f;
+        if (lane < 16) {
+            uint2 x_u2 = *reinterpret_cast<const uint2*>(&x_row[g * 64 + lane * 4]);
+            const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+            float2 f0 = __half22float2(h2[0]);
+            float2 f1 = __half22float2(h2[1]);
+            uint16_t packed = *reinterpret_cast<const uint16_t*>(&w_row[g * bytes_per_group + lane * 2]);
+            sum_q = f0.x * static_cast<float>(packed & 0x0F)
+                  + f0.y * static_cast<float>((packed >> 4) & 0x0F)
+                  + f1.x * static_cast<float>((packed >> 8) & 0x0F)
+                  + f1.y * static_cast<float>((packed >> 12) & 0x0F);
+            sum_x = f0.x + f0.y + f1.x + f1.y;
+        }
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            sum_q += __shfl_down_sync(0xFFFFFFFF, sum_q, offset);
+            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+        }
+        if (lane == 0) {
+            float s = __half2float(*reinterpret_cast<const __half*>(&s_row[g]));
+            float z = __half2float(*reinterpret_cast<const __half*>(&z_row[g]));
+            total += sum_q * s + sum_x * z;
+        }
+    }
+    total += __shfl_down_sync(0xFFFFFFFF, total, 16);
+
+    if (lane == 0) {
+        out[(size_t)row_m * n + row_n] = __float2half(total);
+    }
+}
+
+int aibox_gpu_matmul_q4_affine_f16_dev(
+    const uint16_t* dev_x,
+    const uint8_t* dev_w,
+    const uint16_t* dev_scales,
+    const uint16_t* dev_zeros,
+    uint16_t* dev_out,
+    int m,
+    int n,
+    int k
+) {
+    if (m <= 0 || n <= 0 || k <= 0 || (k % 64) != 0) {
+        return -1;
+    }
+    dim3 grid((n + 3) / 4, m);
+    q4_affine_gemv_f16_kernel<<<grid, 128, 0, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_x),
+        dev_w,
+        dev_scales,
+        dev_zeros,
+        reinterpret_cast<__half*>(dev_out),
+        m,
+        n,
+        k
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
 }
