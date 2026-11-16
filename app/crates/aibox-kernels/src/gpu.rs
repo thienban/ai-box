@@ -152,6 +152,10 @@ type FnAllocPinned = unsafe extern "C" fn(usize) -> *mut c_void;
 type FnFreePinned = unsafe extern "C" fn(*mut c_void);
 #[cfg(target_os = "linux")]
 type FnMemcpyH2DAsync = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
+#[cfg(target_os = "linux")]
+type FnGegluInplaceF16 = unsafe extern "C" fn(*mut u16, *const u16, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnWeightedAccF16ToF32 = unsafe extern "C" fn(*mut f32, *const u16, f32, c_int, c_int) -> c_int;
 
 #[cfg(target_os = "linux")]
 struct GpuWeightPair {
@@ -209,6 +213,8 @@ struct CudaSymbols {
     alloc_pinned: FnAllocPinned,
     free_pinned: FnFreePinned,
     memcpy_h2d_async: FnMemcpyH2DAsync,
+    geglu_inplace_f16: FnGegluInplaceF16,
+    weighted_acc_f16_to_f32: FnWeightedAccF16ToF32,
 }
 
 #[cfg(target_os = "linux")]
@@ -520,6 +526,8 @@ impl GpuBackend {
                 alloc_pinned: load_symbol(handle, "aibox_gpu_alloc_pinned")?,
                 free_pinned: load_symbol(handle, "aibox_gpu_free_pinned")?,
                 memcpy_h2d_async: load_symbol(handle, "aibox_gpu_memcpy_h2d_async")?,
+                geglu_inplace_f16: load_symbol(handle, "aibox_gpu_geglu_inplace_f16")?,
+                weighted_acc_f16_to_f32: load_symbol(handle, "aibox_gpu_weighted_acc_f16_to_f32")?,
             })
         })();
 
@@ -1302,6 +1310,38 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_matmul_q4_affine_f16_dev (buffers)", status)
     }
 
+    pub fn geglu_inplace_f16(
+        &self,
+        gate_dev: &mut GpuBuffer<'_, u16>,
+        up_dev: &GpuBuffer<'_, u16>,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.geglu_inplace_f16)(gate_dev.as_mut_ptr(), up_dev.as_ptr(), len as c_int)
+        };
+        check_cuda_status("aibox_gpu_geglu_inplace_f16", status)
+    }
+
+    pub fn weighted_acc_f16_to_f32(
+        &self,
+        acc_dev: &mut GpuBuffer<'_, f32>,
+        x_dev: &GpuBuffer<'_, u16>,
+        weight: f32,
+        len: usize,
+        reset: bool,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.weighted_acc_f16_to_f32)(
+                acc_dev.as_mut_ptr(),
+                x_dev.as_ptr(),
+                weight,
+                len as c_int,
+                i32::from(reset),
+            )
+        };
+        check_cuda_status("aibox_gpu_weighted_acc_f16_to_f32", status)
+    }
+
     fn get_or_upload_raw_bytes(&self, host_ptr: *const c_void, byte_len: usize) -> Result<*mut c_void, BackendError> {
         let key = (host_ptr as usize, byte_len);
         let mut guard = self.raw_cache.lock().map_err(|_| {
@@ -1519,6 +1559,24 @@ impl GpuBackend {
         _m: usize,
         _n: usize,
         _k: usize,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn geglu_inplace_f16(
+        &self,
+        _gate: &mut GpuBuffer<'_, u16>,
+        _up: &GpuBuffer<'_, u16>,
+        _len: usize,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn weighted_acc_f16_to_f32(
+        &self,
+        _acc: &mut GpuBuffer<'_, f32>,
+        _x: &GpuBuffer<'_, u16>,
+        _weight: f32,
+        _len: usize,
+        _reset: bool,
     ) -> Result<(), BackendError> {
         Err(linux_only_err())
     }

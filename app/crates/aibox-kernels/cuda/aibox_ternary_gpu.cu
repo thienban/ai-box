@@ -2259,4 +2259,75 @@ int aibox_gpu_matmul_q4_affine_f16_dev(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
+__global__ void geglu_inplace_f16_kernel(
+    __half* __restrict__ gate,
+    const __half* __restrict__ up,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    float g = __half2float(gate[idx]);
+    float u = __half2float(up[idx]);
+    const float sqrt_2_over_pi = 0.7978845608f;
+    const float coeff = 0.044715f;
+    float inner = sqrt_2_over_pi * (g + coeff * g * g * g);
+    float gelu = 0.5f * g * (1.0f + tanhf(inner));
+    gate[idx] = __float2half(gelu * u);
+}
+
+int aibox_gpu_geglu_inplace_f16(
+    uint16_t* dev_gate,
+    const uint16_t* dev_up,
+    int n
+) {
+    if (n <= 0) {
+        return -1;
+    }
+    int blocks = (n + 255) / 256;
+    geglu_inplace_f16_kernel<<<blocks, 256, 0, g_active_stream>>>(
+        reinterpret_cast<__half*>(dev_gate),
+        reinterpret_cast<const __half*>(dev_up),
+        n
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+__global__ void weighted_acc_f16_to_f32_kernel(
+    float* __restrict__ acc,
+    const __half* __restrict__ x,
+    float weight,
+    int n,
+    int reset
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    float val = weight * __half2float(x[idx]);
+    acc[idx] = reset ? val : (acc[idx] + val);
+}
+
+int aibox_gpu_weighted_acc_f16_to_f32(
+    float* dev_acc,
+    const uint16_t* dev_x,
+    float weight,
+    int n,
+    int reset
+) {
+    if (n <= 0) {
+        return -1;
+    }
+    int blocks = (n + 255) / 256;
+    weighted_acc_f16_to_f32_kernel<<<blocks, 256, 0, g_active_stream>>>(
+        dev_acc,
+        reinterpret_cast<const __half*>(dev_x),
+        weight,
+        n,
+        reset
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
 }

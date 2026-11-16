@@ -532,17 +532,14 @@ impl<'a> VramLinearBufs<'a> {
         Ok(())
     }
 
-    fn forward(
+    fn forward_into_dev(
         &self,
         gpu: &GpuBackend,
         x_dev: &aibox_kernels::GpuBuffer<'_, u16>,
         out_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<(), String> {
         gpu.matmul_q4_affine_buffers_dev(x_dev, &self.w, &self.s, &self.z, out_dev, 1, self.n_rows, self.k_cols)
-            .map_err(|e| e.to_string())?;
-        let mut out = vec![0.0f32; self.n_rows];
-        out_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
-        Ok(out)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -585,6 +582,9 @@ struct Gemma4GpuScratch<'a> {
     gpu: &'a GpuBackend,
     x_dev: aibox_kernels::GpuBuffer<'a, u16>,
     out_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    gate_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    up_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    moe_acc_dev: aibox_kernels::GpuBuffer<'a, f32>,
     logits_dev: aibox_kernels::GpuBuffer<'a, f32>,
     stage_w: aibox_kernels::GpuBuffer<'a, u8>,
     stage_s: aibox_kernels::GpuBuffer<'a, u16>,
@@ -592,6 +592,9 @@ struct Gemma4GpuScratch<'a> {
     pinned_stage: *mut u8,
     pinned_cap: usize,
     vram_experts: LruMap<(usize, usize), VramExpertEntry<'a>>,
+    vram_hits: usize,
+    ram_hits: usize,
+    disk_misses: usize,
 }
 
 impl Drop for Gemma4GpuScratch<'_> {
@@ -618,13 +621,19 @@ impl<'a> Gemma4GpuScratch<'a> {
             gpu,
             x_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
             out_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
+            gate_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
+            up_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
+            moe_acc_dev: gpu.alloc_f32(cfg.base.hidden_size).map_err(|e| e.to_string())?,
             logits_dev: gpu.alloc_f32(cfg.base.vocab_size).map_err(|e| e.to_string())?,
             stage_w: gpu.alloc_u8(stage_w_bytes).map_err(|e| e.to_string())?,
             stage_s: gpu.alloc_u16(stage_s_elems).map_err(|e| e.to_string())?,
             stage_z: gpu.alloc_u16(stage_s_elems).map_err(|e| e.to_string())?,
             pinned_stage,
             pinned_cap,
-            vram_experts: LruMap::new(900),
+            vram_experts: LruMap::new(1050),
+            vram_hits: 0,
+            ram_hits: 0,
+            disk_misses: 0,
         })
     }
 }
@@ -774,23 +783,21 @@ fn forward_geglu_expert(
     expert.down.forward_with_scratch(&hidden, scratch, backend, resident)
 }
 
-fn forward_vram_geglu_expert(
-    normed: &[f32],
+fn forward_vram_geglu_expert_into_acc(
     entry: &VramExpertEntry<'_>,
-    gpu: &GpuBackend,
-    x_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
-    out_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
-) -> Result<Vec<f32>, String> {
-    x_dev.upload_f32_as_f16(normed).map_err(|e| e.to_string())?;
-    let gate = entry.gate.forward(gpu, x_dev, out_dev)?;
-    let up = entry.up.forward(gpu, x_dev, out_dev)?;
-    let hidden: Vec<f32> = gate
-        .iter()
-        .zip(up.iter())
-        .map(|(&g, &u)| gelu_tanh(g) * u)
-        .collect();
-    x_dev.upload_f32_as_f16(&hidden).map_err(|e| e.to_string())?;
-    entry.down.forward(gpu, x_dev, out_dev)
+    sc: &mut Gemma4GpuScratch<'_>,
+    weight: f32,
+    reset: bool,
+) -> Result<(), String> {
+    entry.gate.forward_into_dev(sc.gpu, &sc.x_dev, &mut sc.gate_dev)?;
+    entry.up.forward_into_dev(sc.gpu, &sc.x_dev, &mut sc.up_dev)?;
+    sc.gpu
+        .geglu_inplace_f16(&mut sc.gate_dev, &sc.up_dev, entry.gate.n_rows)
+        .map_err(|e| e.to_string())?;
+    entry.down.forward_into_dev(sc.gpu, &sc.gate_dev, &mut sc.out_dev)?;
+    sc.gpu
+        .weighted_acc_f16_to_f32(&mut sc.moe_acc_dev, &sc.out_dev, weight, entry.down.n_rows, reset)
+        .map_err(|e| e.to_string())
 }
 
 fn slice_q4_affine_expert(
@@ -1040,7 +1047,7 @@ impl Gemma4Model {
             lm_head,
             rope_freqs,
             safetensors: Some(Mutex::new(st)),
-            expert_ram_cache: Mutex::new(LruMap::new(1280)),
+            expert_ram_cache: Mutex::new(LruMap::new(1500)),
         })
     }
 
@@ -1095,6 +1102,17 @@ impl Gemma4Model {
             cur_pos += 1;
         }
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(sc) = scratch.as_ref() {
+            if std::env::var("AIBOX_MOE_STATS").is_ok() {
+                let total = sc.vram_hits + sc.ram_hits + sc.disk_misses;
+                let vram_pct = if total > 0 { 100.0 * sc.vram_hits as f64 / total as f64 } else { 0.0 };
+                let ram_pct = if total > 0 { 100.0 * sc.ram_hits as f64 / total as f64 } else { 0.0 };
+                eprintln!(
+                    "[MoE Cache] total={total} vram_hits={} ({vram_pct:.1}%) ram_hits={} ({ram_pct:.1}%) disk_misses={}",
+                    sc.vram_hits, sc.ram_hits, sc.disk_misses
+                );
+            }
+        }
         Ok(GenerationStats {
             tokens: generated,
             prefill_ms,
@@ -1116,7 +1134,7 @@ impl Gemma4Model {
         &self,
         lazy: &LazyMoeExperts,
         expert_idx: usize,
-    ) -> Result<Arc<Gemma4ExpertWeights>, String> {
+    ) -> Result<(Arc<Gemma4ExpertWeights>, bool), String> {
         let key = (lazy.layer_idx, expert_idx);
         {
             let mut guard = self
@@ -1124,7 +1142,7 @@ impl Gemma4Model {
                 .lock()
                 .map_err(|_| "expert_ram_cache poisoned".to_string())?;
             if let Some(exp) = guard.get(&key) {
-                return Ok(Arc::clone(exp));
+                return Ok((Arc::clone(exp), true));
             }
         }
         let st_mutex = self
@@ -1166,30 +1184,40 @@ impl Gemma4Model {
             .lock()
             .map_err(|_| "expert_ram_cache poisoned".to_string())?;
         guard.insert(key, Arc::clone(&exp));
-        Ok(exp)
+        Ok((exp, false))
     }
 
-    fn forward_lazy_expert(
+    fn forward_moe_lazy_vram(
         &self,
         lazy: &LazyMoeExperts,
-        expert_idx: usize,
+        selected: &[(usize, f32)],
+        expert_scales: Option<&[f32]>,
         moe_in: &[f32],
-        mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
-        backend: &dyn TernaryHadamardBackend,
+        sc: &mut Gemma4GpuScratch<'_>,
     ) -> Result<Vec<f32>, String> {
-        let key = (lazy.layer_idx, expert_idx);
-        if lazy.is_q4 {
-            if let Some(sc) = scratch.as_deref_mut() {
-                if let Some(entry) = sc.vram_experts.get(&key) {
-                    return forward_vram_geglu_expert(moe_in, entry, sc.gpu, &mut sc.x_dev, &mut sc.out_dev);
-                }
-                let expert = self.load_or_cache_ram_expert(lazy, expert_idx)?;
-                let entry = insert_or_reuse_vram_expert(&mut sc.vram_experts, sc.gpu, key, &expert)?;
-                return forward_vram_geglu_expert(moe_in, entry, sc.gpu, &mut sc.x_dev, &mut sc.out_dev);
+        sc.x_dev.upload_f32_as_f16(moe_in).map_err(|e| e.to_string())?;
+        for (idx, &(expert_idx, weight)) in selected.iter().enumerate() {
+            let key = (lazy.layer_idx, expert_idx);
+            let exp_scale = expert_scales.and_then(|es| es.get(expert_idx).copied()).unwrap_or(1.0);
+            let w = weight * exp_scale;
+            if let Some(entry) = sc.vram_experts.get(&key) {
+                let ptr: *const VramExpertEntry<'_> = entry;
+                sc.vram_hits += 1;
+                forward_vram_geglu_expert_into_acc(unsafe { &*ptr }, sc, w, idx == 0)?;
+                continue;
             }
+            let (expert, from_ram) = self.load_or_cache_ram_expert(lazy, expert_idx)?;
+            if from_ram {
+                sc.ram_hits += 1;
+            } else {
+                sc.disk_misses += 1;
+            }
+            let entry = insert_or_reuse_vram_expert(&mut sc.vram_experts, sc.gpu, key, &expert)?;
+            forward_vram_geglu_expert_into_acc(entry, sc, w, idx == 0)?;
         }
-        let expert = self.load_or_cache_ram_expert(lazy, expert_idx)?;
-        forward_geglu_expert(moe_in, &expert, scratch, backend, false)
+        let mut moe_out = vec![0.0f32; lazy.down_rows];
+        sc.moe_acc_dev.download(&mut moe_out).map_err(|e| e.to_string())?;
+        Ok(moe_out)
     }
 
     fn forward_token_with_scratch(
@@ -1315,34 +1343,49 @@ impl Gemma4Model {
                     } else {
                         normed_ffn.clone()
                     };
-                    let mut moe_out = vec![0.0f32; hidden_size];
-                    for (expert_idx, weight) in selected {
-                        let exp_vec = match &moe.experts {
-                            Gemma4Experts::InMemory(list) => forward_geglu_expert(
-                                &moe_in,
-                                &list[expert_idx],
-                                scratch.as_deref_mut(),
-                                backend,
-                                false,
-                            )?,
-                            Gemma4Experts::LazyDisk(lazy) => self.forward_lazy_expert(
-                                lazy,
-                                expert_idx,
-                                &moe_in,
-                                scratch.as_deref_mut(),
-                                backend,
-                            )?,
-                        };
-                        let exp_scale = moe
-                            .expert_scales
-                            .as_ref()
-                            .and_then(|es| es.get(expert_idx).copied())
-                            .unwrap_or(1.0);
-                        let w = weight * exp_scale;
-                        for (acc, &val) in moe_out.iter_mut().zip(exp_vec.iter()) {
-                            *acc += w * val;
+                    let moe_out = match (&moe.experts, scratch.as_deref_mut()) {
+                        (Gemma4Experts::LazyDisk(lazy), Some(sc)) if lazy.is_q4 => self.forward_moe_lazy_vram(
+                            lazy,
+                            &selected,
+                            moe.expert_scales.as_deref(),
+                            &moe_in,
+                            sc,
+                        )?,
+                        _ => {
+                            let mut acc_out = vec![0.0f32; hidden_size];
+                            for (expert_idx, weight) in selected {
+                                let exp_vec = match &moe.experts {
+                                    Gemma4Experts::InMemory(list) => forward_geglu_expert(
+                                        &moe_in,
+                                        &list[expert_idx],
+                                        scratch.as_deref_mut(),
+                                        backend,
+                                        false,
+                                    )?,
+                                    Gemma4Experts::LazyDisk(lazy) => {
+                                        let (expert, _) = self.load_or_cache_ram_expert(lazy, expert_idx)?;
+                                        forward_geglu_expert(
+                                            &moe_in,
+                                            &expert,
+                                            scratch.as_deref_mut(),
+                                            backend,
+                                            false,
+                                        )?
+                                    }
+                                };
+                                let exp_scale = moe
+                                    .expert_scales
+                                    .as_ref()
+                                    .and_then(|es| es.get(expert_idx).copied())
+                                    .unwrap_or(1.0);
+                                let w = weight * exp_scale;
+                                for (acc, &val) in acc_out.iter_mut().zip(exp_vec.iter()) {
+                                    *acc += w * val;
+                                }
+                            }
+                            acc_out
                         }
-                    }
+                    };
                     let mut out = if let Some(ref norm_w) = layer.post_ffw_norm_2 {
                         rms_norm(&moe_out, norm_w, cfg.rms_norm_eps)
                     } else {
