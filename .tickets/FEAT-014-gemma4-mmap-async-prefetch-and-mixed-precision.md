@@ -1,6 +1,6 @@
 # FEAT-014: Accélération Streaming MoE — `mmap` SafeTensors, Prefetch Asynchrone & Compression Mixte
 
-- **Statut**: IN_PROGRESS <!-- Options: TODO | IN_PROGRESS | IN_REVIEW | DONE -->
+- **Statut**: DONE <!-- Options: TODO | IN_PROGRESS | IN_REVIEW | DONE -->
 - **Priorité**: MEDIUM <!-- Options: LOW | MEDIUM | HIGH | CRITICAL -->
 - **Type**: Performance <!-- Options: Feature | Bug | Refactor | Docs | Chore | Performance -->
 - **Date de création**: 2026-11-16
@@ -49,3 +49,4 @@ Origine des pistes (adaptées au MoE avec cache LRU VRAM à 82,9 % de *hit*) :
 | 2026-11-16 14:08 | IN_PROGRESS | IN_PROGRESS | Antigravity | Étape 2 (`std::thread::scope` sur les *misses*) testée et annulée : le goulot sur cold cache vient des ~250 ms/miss du bind-mount 9P Windows/WSL2 et du swap avec `expert_ram_cache(1500)`. `gemma4.rs` nettoyé sur `0e9dffe` avec `expert_ram_cache(1024)` (~3,25 Go RAM). Prochaine piste : stockage sur `ext4` WSL2 natif ou compression mixte (Étape 3). |
 | 2026-11-16 14:38 | IN_PROGRESS | IN_PROGRESS | Antigravity | Étape 3 implémentée et validée : compression mixte `--quant-format q4_affine --moe-bits 2` (`gemma-4-26b-q4-moe2`, 4 shards ~7,5 Go), `matmul_q2_affine_buffers_dev` (`gpu.rs`), `VramLinearBufs` unifié Q2/Q4 + `vram_experts(1850)` + `expert_ram_cache(2048)` (`gemma4.rs`). Benchmark GPU `Photosynthesis --max-tokens 64` : **sortie cohérente**, `vram_hits=15599 (87.8%)`, `disk_misses=2161`, `Prefill 11 tok: 183167.5 ms \| Decode 64 tok: 140753.4 ms (0.45 tok/s)` sur cache froid 9P. |
 | 2026-11-16 14:49 | IN_PROGRESS | IN_PROGRESS | Antigravity | Calcul dynamique du budget VRAM maximal via `aibox_gpu_vram_free_bytes()` (`cudaMemGetInfo`). Mesure sur RTX 4050 (`free=5072 MiB`, `reserved=1400 MiB`, `expert=1.77 MiB`) : `vram_cap=2071/3840` (`53,9 %` du modèle en VRAM), `vram_hits=15614 (87.9%)`, `disk_misses=2146` (*compulsory misses* à froid sur le 1er run CLI), `Decode 64 tok: 170280.7 ms (0.38 tok/s)`. |
+| 2026-11-16 15:31 | IN_PROGRESS | DONE | Antigravity | Objectif `> 90 %` de *hit* VRAM atteint avec `gemma-4-26b-q4-moe2` (`vram_cap=2071`) + `AIBOX_MOE_TOP_K=6` sur 160 tokens : `vram_hits=28250/30600 (92.3%)`, `Decode 160 tok: 41869.9 ms (3.82 tok/s)`. Suite (Victim Cache exclusif) suivie dans [FEAT-016](file:///c:/Users/Bui/Desktop/DevProjets/tiny-gpu/.tickets/FEAT-016-gemma4-exclusive-victim-cache.md). |

@@ -270,8 +270,8 @@ impl<'a, T> GpuBuffer<'a, T> {
 }
 
 #[cfg(target_os = "linux")]
-impl<'a> GpuBuffer<'a, f32> {
-    pub fn download(&self, out: &mut [f32]) -> Result<(), BackendError> {
+impl<'a, T> GpuBuffer<'a, T> {
+    pub fn download(&self, out: &mut [T]) -> Result<(), BackendError> {
         if out.len() > self.len {
             return Err(BackendError::BufferLengthMismatch(format!(
                 "download {} > GpuBuffer len {}",
@@ -288,7 +288,10 @@ impl<'a> GpuBuffer<'a, f32> {
         };
         check_cuda_status("cudaMemcpy D2H", status)
     }
+}
 
+#[cfg(target_os = "linux")]
+impl<'a> GpuBuffer<'a, f32> {
     pub fn upload_f32(&mut self, data: &[f32]) -> Result<(), BackendError> {
         if data.len() > self.len {
             return Err(BackendError::BufferLengthMismatch(format!(
@@ -386,11 +389,14 @@ impl<'a> GpuBuffer<'a, u16> {
 }
 
 #[cfg(not(target_os = "linux"))]
-impl<'a> GpuBuffer<'a, f32> {
-    pub fn download(&self, _out: &mut [f32]) -> Result<(), BackendError> {
+impl<'a, T> GpuBuffer<'a, T> {
+    pub fn download(&self, _out: &mut [T]) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
+}
 
+#[cfg(not(target_os = "linux"))]
+impl<'a> GpuBuffer<'a, f32> {
     pub fn upload_f32(&mut self, _data: &[f32]) -> Result<(), BackendError> {
         Err(linux_only_err())
     }

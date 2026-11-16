@@ -456,12 +456,24 @@ impl<K: Copy + Eq + std::hash::Hash, V> LruMap<K, V> {
         self.map.get(key)
     }
 
-    pub fn pop_oldest_if_full(&mut self) -> Option<V> {
+    pub fn pop_oldest_entry_if_full(&mut self) -> Option<(K, V)> {
         if self.order.len() < self.capacity {
             return None;
         }
         let oldest = self.order.pop_front()?;
-        self.map.remove(&oldest)
+        self.map.remove(&oldest).map(|v| (oldest, v))
+    }
+
+    pub fn pop_oldest_if_full(&mut self) -> Option<V> {
+        self.pop_oldest_entry_if_full().map(|(_, v)| v)
+    }
+
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let val = self.map.remove(key)?;
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        Some(val)
     }
 
     pub fn insert(&mut self, key: K, val: V) {
@@ -581,6 +593,24 @@ impl<'a> VramLinearBufs<'a> {
         }
         .map_err(|e| e.to_string())
     }
+
+    fn to_linear(&self) -> Result<Gemma4Linear, String> {
+        let mut pw = vec![0u8; self.w.len()];
+        let mut sf = vec![0u16; self.s.len()];
+        let mut zf = vec![0u16; self.z.len()];
+        self.w.download(&mut pw).map_err(|e| e.to_string())?;
+        self.s.download(&mut sf).map_err(|e| e.to_string())?;
+        self.z.download(&mut zf).map_err(|e| e.to_string())?;
+        if self.is_q4 {
+            Ok(Gemma4Linear::Q4Affine(
+                Q4AffineTensor::from_raw(self.n_rows, self.k_cols, pw, sf, zf).map_err(|e| e.to_string())?,
+            ))
+        } else {
+            Ok(Gemma4Linear::Q2Affine(
+                Q2AffineTensor::from_raw(self.n_rows, self.k_cols, pw, sf, zf).map_err(|e| e.to_string())?,
+            ))
+        }
+    }
 }
 
 struct VramExpertEntry<'a> {
@@ -589,13 +619,29 @@ struct VramExpertEntry<'a> {
     down: VramLinearBufs<'a>,
 }
 
+impl<'a> VramExpertEntry<'a> {
+    fn to_expert_weights(&self) -> Result<Gemma4ExpertWeights, String> {
+        Ok(Gemma4ExpertWeights {
+            gate: self.gate.to_linear()?,
+            up: self.up.to_linear()?,
+            down: self.down.to_linear()?,
+        })
+    }
+}
+
 fn insert_or_reuse_vram_expert<'a>(
     cache: &mut LruMap<(usize, usize), VramExpertEntry<'a>>,
+    ram_victim_cache: &Mutex<LruMap<(usize, usize), Arc<Gemma4ExpertWeights>>>,
     gpu: &'a GpuBackend,
     key: (usize, usize),
     exp: &Gemma4ExpertWeights,
 ) -> Result<&'a VramExpertEntry<'a>, String> {
-    let slot = if let Some(mut reused) = cache.pop_oldest_if_full() {
+    let slot = if let Some((evicted_key, mut reused)) = cache.pop_oldest_entry_if_full() {
+        if let Ok(victim) = reused.to_expert_weights() {
+            if let Ok(mut guard) = ram_victim_cache.lock() {
+                guard.insert(evicted_key, Arc::new(victim));
+            }
+        }
         reused.gate.overwrite_linear(gpu, &exp.gate)?;
         reused.up.overwrite_linear(gpu, &exp.up)?;
         reused.down.overwrite_linear(gpu, &exp.down)?;
@@ -607,6 +653,9 @@ fn insert_or_reuse_vram_expert<'a>(
             down: VramLinearBufs::from_linear(gpu, &exp.down)?,
         }
     };
+    if let Ok(mut guard) = ram_victim_cache.lock() {
+        guard.remove(&key);
+    }
     cache.insert(key, slot);
     // Safety: caller borrows `cache` mutably and only reads the returned entry before mutating `cache` again.
     let ptr: *const VramExpertEntry<'a> = &cache.map[&key];
@@ -1318,7 +1367,13 @@ impl Gemma4Model {
             } else {
                 sc.disk_misses += 1;
             }
-            let entry = insert_or_reuse_vram_expert(&mut sc.vram_experts, sc.gpu, key, &expert)?;
+            let entry = insert_or_reuse_vram_expert(
+                &mut sc.vram_experts,
+                &self.expert_ram_cache,
+                sc.gpu,
+                key,
+                &expert,
+            )?;
             forward_vram_geglu_expert_into_acc(entry, sc, w, idx == 0)?;
         }
         let mut moe_out = vec![0.0f32; lazy.down_rows];
