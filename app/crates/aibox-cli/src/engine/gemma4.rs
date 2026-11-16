@@ -1438,11 +1438,19 @@ impl Gemma4Model {
                     } else {
                         hidden.iter().map(|&x| x * inv_rms * scalar_root_size).collect()
                     };
+                    let top_k = {
+                        static OVERRIDE_K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+                        let ov = *OVERRIDE_K.get_or_init(|| {
+                            std::env::var("AIBOX_MOE_TOP_K").ok().and_then(|s| s.parse::<usize>().ok())
+                        });
+                        ov.unwrap_or(self.config.num_experts_per_tok)
+                            .clamp(1, self.config.num_experts_per_tok)
+                    };
                     let selected = route_top_k(
                         &router_in,
                         &moe.router,
                         self.config.num_experts,
-                        self.config.num_experts_per_tok,
+                        top_k,
                     )?;
                     let moe_in = if let Some(ref norm_w) = layer.pre_ffw_norm_2 {
                         rms_norm(&hidden, norm_w, cfg.rms_norm_eps)
