@@ -156,6 +156,8 @@ type FnMemcpyH2DAsync = unsafe extern "C" fn(*mut c_void, *const c_void, usize) 
 type FnGegluInplaceF16 = unsafe extern "C" fn(*mut u16, *const u16, c_int) -> c_int;
 #[cfg(target_os = "linux")]
 type FnWeightedAccF16ToF32 = unsafe extern "C" fn(*mut f32, *const u16, f32, c_int, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type FnVramFreeBytes = unsafe extern "C" fn() -> usize;
 
 #[cfg(target_os = "linux")]
 struct GpuWeightPair {
@@ -215,6 +217,7 @@ struct CudaSymbols {
     memcpy_h2d_async: FnMemcpyH2DAsync,
     geglu_inplace_f16: FnGegluInplaceF16,
     weighted_acc_f16_to_f32: FnWeightedAccF16ToF32,
+    vram_free_bytes: FnVramFreeBytes,
 }
 
 #[cfg(target_os = "linux")]
@@ -528,6 +531,7 @@ impl GpuBackend {
                 memcpy_h2d_async: load_symbol(handle, "aibox_gpu_memcpy_h2d_async")?,
                 geglu_inplace_f16: load_symbol(handle, "aibox_gpu_geglu_inplace_f16")?,
                 weighted_acc_f16_to_f32: load_symbol(handle, "aibox_gpu_weighted_acc_f16_to_f32")?,
+                vram_free_bytes: load_symbol(handle, "aibox_gpu_vram_free_bytes")?,
             })
         })();
 
@@ -1310,6 +1314,33 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_matmul_q4_affine_f16_dev (buffers)", status)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q2_affine_buffers_dev(
+        &self,
+        x_dev: &GpuBuffer<'_, u16>,
+        w_dev: &GpuBuffer<'_, u8>,
+        s_dev: &GpuBuffer<'_, u16>,
+        z_dev: &GpuBuffer<'_, u16>,
+        out_dev: &mut GpuBuffer<'_, u16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.matmul_q2_affine_f16_dev)(
+                x_dev.as_ptr(),
+                w_dev.as_ptr(),
+                s_dev.as_ptr(),
+                z_dev.as_ptr(),
+                out_dev.as_mut_ptr(),
+                m as c_int,
+                n as c_int,
+                k as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_matmul_q2_affine_f16_dev (buffers)", status)
+    }
+
     pub fn geglu_inplace_f16(
         &self,
         gate_dev: &mut GpuBuffer<'_, u16>,
@@ -1340,6 +1371,10 @@ impl GpuBackend {
             )
         };
         check_cuda_status("aibox_gpu_weighted_acc_f16_to_f32", status)
+    }
+
+    pub fn vram_free_bytes(&self) -> usize {
+        unsafe { (self.symbols.vram_free_bytes)() }
     }
 
     fn get_or_upload_raw_bytes(&self, host_ptr: *const c_void, byte_len: usize) -> Result<*mut c_void, BackendError> {
@@ -1562,6 +1597,20 @@ impl GpuBackend {
     ) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q2_affine_buffers_dev(
+        &self,
+        _x: &GpuBuffer<'_, u16>,
+        _w: &GpuBuffer<'_, u8>,
+        _s: &GpuBuffer<'_, u16>,
+        _z: &GpuBuffer<'_, u16>,
+        _out: &mut GpuBuffer<'_, u16>,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
     pub fn geglu_inplace_f16(
         &self,
         _gate: &mut GpuBuffer<'_, u16>,
@@ -1579,6 +1628,9 @@ impl GpuBackend {
         _reset: bool,
     ) -> Result<(), BackendError> {
         Err(linux_only_err())
+    }
+    pub fn vram_free_bytes(&self) -> usize {
+        0
     }
 }
 

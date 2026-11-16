@@ -2330,4 +2330,13 @@ int aibox_gpu_weighted_acc_f16_to_f32(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
+size_t aibox_gpu_vram_free_bytes() {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        return 0;
+    }
+    return free_bytes;
+}
+
 }

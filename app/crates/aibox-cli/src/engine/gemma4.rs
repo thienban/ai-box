@@ -527,31 +527,44 @@ struct VramLinearBufs<'a> {
     z: aibox_kernels::GpuBuffer<'a, u16>,
     n_rows: usize,
     k_cols: usize,
+    is_q4: bool,
 }
 
 impl<'a> VramLinearBufs<'a> {
-    fn from_q4(gpu: &'a GpuBackend, t: &Q4AffineTensor) -> Result<Self, String> {
-        let mut w = gpu.alloc_u8(t.packed_weights.len()).map_err(|e| e.to_string())?;
-        let mut s = gpu.alloc_u16(t.scales_fp16.len()).map_err(|e| e.to_string())?;
-        let mut z = gpu.alloc_u16(t.zeros_fp16.len()).map_err(|e| e.to_string())?;
-        gpu.upload_u8_slice(&mut w, &t.packed_weights).map_err(|e| e.to_string())?;
-        gpu.upload_u16_slice(&mut s, &t.scales_fp16).map_err(|e| e.to_string())?;
-        gpu.upload_u16_slice(&mut z, &t.zeros_fp16).map_err(|e| e.to_string())?;
+    fn extract_affine_parts(lin: &Gemma4Linear) -> Result<(usize, usize, &[u8], &[u16], &[u16], bool), String> {
+        match lin {
+            Gemma4Linear::Q4Affine(t) => Ok((t.n_rows, t.k_cols, &t.packed_weights, &t.scales_fp16, &t.zeros_fp16, true)),
+            Gemma4Linear::Q2Affine(t) => Ok((t.n_rows, t.k_cols, &t.packed_weights, &t.scales_fp16, &t.zeros_fp16, false)),
+            Gemma4Linear::Dense { .. } => Err("VramExpertLru requires Q2Affine or Q4Affine".to_string()),
+        }
+    }
+
+    fn from_linear(gpu: &'a GpuBackend, lin: &Gemma4Linear) -> Result<Self, String> {
+        let (n_rows, k_cols, pw, sf, zf, is_q4) = Self::extract_affine_parts(lin)?;
+        let mut w = gpu.alloc_u8(pw.len()).map_err(|e| e.to_string())?;
+        let mut s = gpu.alloc_u16(sf.len()).map_err(|e| e.to_string())?;
+        let mut z = gpu.alloc_u16(zf.len()).map_err(|e| e.to_string())?;
+        gpu.upload_u8_slice(&mut w, pw).map_err(|e| e.to_string())?;
+        gpu.upload_u16_slice(&mut s, sf).map_err(|e| e.to_string())?;
+        gpu.upload_u16_slice(&mut z, zf).map_err(|e| e.to_string())?;
         Ok(Self {
             w,
             s,
             z,
-            n_rows: t.n_rows,
-            k_cols: t.k_cols,
+            n_rows,
+            k_cols,
+            is_q4,
         })
     }
 
-    fn overwrite_q4(&mut self, gpu: &'a GpuBackend, t: &Q4AffineTensor) -> Result<(), String> {
-        gpu.upload_u8_slice(&mut self.w, &t.packed_weights).map_err(|e| e.to_string())?;
-        gpu.upload_u16_slice(&mut self.s, &t.scales_fp16).map_err(|e| e.to_string())?;
-        gpu.upload_u16_slice(&mut self.z, &t.zeros_fp16).map_err(|e| e.to_string())?;
-        self.n_rows = t.n_rows;
-        self.k_cols = t.k_cols;
+    fn overwrite_linear(&mut self, gpu: &'a GpuBackend, lin: &Gemma4Linear) -> Result<(), String> {
+        let (n_rows, k_cols, pw, sf, zf, is_q4) = Self::extract_affine_parts(lin)?;
+        gpu.upload_u8_slice(&mut self.w, pw).map_err(|e| e.to_string())?;
+        gpu.upload_u16_slice(&mut self.s, sf).map_err(|e| e.to_string())?;
+        gpu.upload_u16_slice(&mut self.z, zf).map_err(|e| e.to_string())?;
+        self.n_rows = n_rows;
+        self.k_cols = k_cols;
+        self.is_q4 = is_q4;
         Ok(())
     }
 
@@ -561,8 +574,12 @@ impl<'a> VramLinearBufs<'a> {
         x_dev: &aibox_kernels::GpuBuffer<'_, u16>,
         out_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
     ) -> Result<(), String> {
-        gpu.matmul_q4_affine_buffers_dev(x_dev, &self.w, &self.s, &self.z, out_dev, 1, self.n_rows, self.k_cols)
-            .map_err(|e| e.to_string())
+        if self.is_q4 {
+            gpu.matmul_q4_affine_buffers_dev(x_dev, &self.w, &self.s, &self.z, out_dev, 1, self.n_rows, self.k_cols)
+        } else {
+            gpu.matmul_q2_affine_buffers_dev(x_dev, &self.w, &self.s, &self.z, out_dev, 1, self.n_rows, self.k_cols)
+        }
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -578,21 +595,16 @@ fn insert_or_reuse_vram_expert<'a>(
     key: (usize, usize),
     exp: &Gemma4ExpertWeights,
 ) -> Result<&'a VramExpertEntry<'a>, String> {
-    let (Gemma4Linear::Q4Affine(g), Gemma4Linear::Q4Affine(u), Gemma4Linear::Q4Affine(d)) =
-        (&exp.gate, &exp.up, &exp.down)
-    else {
-        return Err("VramExpertLru expects Q4Affine experts".to_string());
-    };
     let slot = if let Some(mut reused) = cache.pop_oldest_if_full() {
-        reused.gate.overwrite_q4(gpu, g)?;
-        reused.up.overwrite_q4(gpu, u)?;
-        reused.down.overwrite_q4(gpu, d)?;
+        reused.gate.overwrite_linear(gpu, &exp.gate)?;
+        reused.up.overwrite_linear(gpu, &exp.up)?;
+        reused.down.overwrite_linear(gpu, &exp.down)?;
         reused
     } else {
         VramExpertEntry {
-            gate: VramLinearBufs::from_q4(gpu, g)?,
-            up: VramLinearBufs::from_q4(gpu, u)?,
-            down: VramLinearBufs::from_q4(gpu, d)?,
+            gate: VramLinearBufs::from_linear(gpu, &exp.gate)?,
+            up: VramLinearBufs::from_linear(gpu, &exp.up)?,
+            down: VramLinearBufs::from_linear(gpu, &exp.down)?,
         }
     };
     cache.insert(key, slot);
@@ -629,7 +641,7 @@ impl Drop for Gemma4GpuScratch<'_> {
 }
 
 impl<'a> Gemma4GpuScratch<'a> {
-    fn new(gpu: &'a GpuBackend, cfg: &Gemma4Config) -> Result<Self, String> {
+    fn new(gpu: &'a GpuBackend, cfg: &Gemma4Config, vram_expert_cap: usize) -> Result<Self, String> {
         let max_dim = cfg
             .base
             .intermediate_size
@@ -653,7 +665,7 @@ impl<'a> Gemma4GpuScratch<'a> {
             stage_z: gpu.alloc_u16(stage_s_elems).map_err(|e| e.to_string())?,
             pinned_stage,
             pinned_cap,
-            vram_experts: LruMap::new(1050),
+            vram_experts: LruMap::new(vram_expert_cap),
             vram_hits: 0,
             ram_hits: 0,
             disk_misses: 0,
@@ -880,9 +892,11 @@ impl Gemma4Model {
         let cfg_raw = fs::read_to_string(model_dir.join("config.json"))
             .map_err(|e| format!("Failed to read config.json: {e}"))?;
         let config = Gemma4Config::from_json(&parse_json(&cfg_raw)?)?;
-        let is_q4 = fs::read_to_string(model_dir.join("quant_config.json"))
+        let quant_json = fs::read_to_string(model_dir.join("quant_config.json"))
             .ok()
-            .and_then(|s| parse_json(&s).ok())
+            .and_then(|s| parse_json(&s).ok());
+        let is_q4 = quant_json
+            .as_ref()
             .and_then(|v| {
                 v.as_object()
                     .and_then(|o| o.get("format"))
@@ -890,6 +904,15 @@ impl Gemma4Model {
                     .map(|f| f == "q4_affine")
             })
             .unwrap_or(false);
+        let is_moe_q4 = quant_json
+            .as_ref()
+            .and_then(|v| {
+                v.as_object()
+                    .and_then(|o| o.get("moe_format").or_else(|| o.get("format")))
+                    .and_then(JsonValue::as_str)
+                    .map(|f| f == "q4_affine")
+            })
+            .unwrap_or(is_q4);
         let mut st = SafeTensorsFile::open_dir(model_dir)?;
 
         let load_q2 = |st: &mut SafeTensorsFile, prefix: &str| -> Result<Gemma4Linear, String> {
@@ -975,7 +998,7 @@ impl Gemma4Model {
                         inter_rows,
                         down_rows: config.base.hidden_size,
                         hidden_size: config.base.hidden_size,
-                        is_q4,
+                        is_q4: is_moe_q4,
                     })
                 } else {
                     let mut list = Vec::with_capacity(config.num_experts);
@@ -1100,7 +1123,7 @@ impl Gemma4Model {
             lm_head,
             rope_freqs,
             safetensors: Some(Mutex::new(st)),
-            expert_ram_cache: Mutex::new(LruMap::new(1500)),
+            expert_ram_cache: Mutex::new(LruMap::new(if is_moe_q4 { 1024 } else { 2048 })),
         })
     }
 
@@ -1116,8 +1139,38 @@ impl Gemma4Model {
             return Err("prompt_tokens must not be empty".to_string());
         }
         let mut kv_cache = KvCache::new(self.layers.len());
+        let is_moe_q4 = self.layers.iter().any(|l| match &l.ffn {
+            Gemma4Ffn::Moe(m) => matches!(&m.experts, Gemma4Experts::LazyDisk(lazy) if lazy.is_q4),
+            Gemma4Ffn::Dense(_) => false,
+        });
+        let total_experts = self.layers.len() * self.config.num_experts.max(1);
         let mut scratch = match backend.as_gpu() {
-            Some(gpu) => Some(Gemma4GpuScratch::new(gpu, &self.config)?),
+            Some(gpu) => {
+                let free_bytes = gpu.vram_free_bytes();
+                let reserved_bytes = 1400usize * 1024 * 1024;
+                let weights_per_exp = 3 * self.config.moe_intermediate_size * self.config.base.hidden_size;
+                let bytes_per_exp = if is_moe_q4 {
+                    (weights_per_exp * 9) / 16
+                } else {
+                    (weights_per_exp * 5) / 16
+                }
+                .max(1);
+                let vram_cap = if free_bytes > reserved_bytes {
+                    ((free_bytes - reserved_bytes) / bytes_per_exp).clamp(256, total_experts)
+                } else if is_moe_q4 {
+                    1050
+                } else {
+                    1850
+                };
+                if std::env::var("AIBOX_MOE_STATS").is_ok() {
+                    eprintln!(
+                        "[VRAM Budget] free={:.0} MiB reserved=1400 MiB expert={:.2} MiB -> vram_cap={vram_cap}/{total_experts}",
+                        free_bytes as f64 / (1024.0 * 1024.0),
+                        bytes_per_exp as f64 / (1024.0 * 1024.0)
+                    );
+                }
+                Some(Gemma4GpuScratch::new(gpu, &self.config, vram_cap)?)
+            }
             None => None,
         };
 
@@ -1397,7 +1450,7 @@ impl Gemma4Model {
                         normed_ffn.clone()
                     };
                     let moe_out = match (&moe.experts, scratch.as_deref_mut()) {
-                        (Gemma4Experts::LazyDisk(lazy), Some(sc)) if lazy.is_q4 => self.forward_moe_lazy_vram(
+                        (Gemma4Experts::LazyDisk(lazy), Some(sc)) => self.forward_moe_lazy_vram(
                             lazy,
                             &selected,
                             moe.expert_scales.as_deref(),

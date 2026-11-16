@@ -317,6 +317,7 @@ def convert_gguf(
     quant_format: str = "auto",
     embed_bits: int = 16,
     shard_mb: int = 0,
+    moe_bits: int | None = None,
 ) -> None:
     import gguf
     from safetensors.numpy import save_file
@@ -337,10 +338,13 @@ def convert_gguf(
     with open(out_dir / "quant_config.json", "w", encoding="utf-8") as f:
         is_affine = quant_format in ("q2_affine", "q4_affine")
         fmt = quant_format if is_affine else ("binary_1bit" if bits == 1 else "ternary_2bit")
+        eff_moe_bits = moe_bits if moe_bits is not None else (4 if quant_format == "q4_affine" else 2)
+        moe_fmt = f"q{eff_moe_bits}_affine" if is_affine else fmt
         json.dump(
             {
                 "bits": 4 if quant_format == "q4_affine" else bits,
                 "format": fmt,
+                "moe_format": moe_fmt,
                 "group_size": Q2_GROUP_SIZE if is_affine else GROUP_SIZE,
                 "hadamard": False if is_affine else use_hadamard,
             },
@@ -401,7 +405,7 @@ def convert_gguf(
                 tensors_out[scale_name] = scales_f16
                 print(f"  [{bits}-bit] {target_name:32s} -> {packed_u8.shape} + scales {scales_f16.shape}", flush=True)
         elif quant_format in ("q2_affine", "q4_affine") and len(tensor.shape) == 3 and tensor.name.endswith("ffn_gate_up_exps.weight"):
-            affine_bits = 4 if quant_format == "q4_affine" else 2
+            affine_bits = moe_bits if moe_bits is not None else (4 if quant_format == "q4_affine" else 2)
             dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
             num_e, two_inter, hidden = dequant.shape
             inter = two_inter // 2
@@ -415,7 +419,7 @@ def convert_gguf(
                 tensors_out[f"{base_prefix}{tag}.zeros"] = zeros_f16
                 print(f"  [Q{affine_bits}_EX] {base_prefix}{tag}.weight -> {packed_u8.shape}", flush=True)
         elif quant_format in ("q2_affine", "q4_affine") and len(tensor.shape) == 3 and tensor.name.endswith("ffn_down_exps.weight"):
-            affine_bits = 4 if quant_format == "q4_affine" else 2
+            affine_bits = moe_bits if moe_bits is not None else (4 if quant_format == "q4_affine" else 2)
             dequant = dequantize_tensor(tensor, gguf, target_dtype=np.float32)
             num_e, hidden, inter = dequant.shape
             packed_u8, scales_f16, zeros_f16 = quantize_affine(dequant.reshape(num_e * hidden, inter), bits=affine_bits)
@@ -503,6 +507,13 @@ def main() -> None:
         default=0,
         help="Taille max par shard SafeTensors en Mo (0=fichier unique model.safetensors)",
     )
+    parser.add_argument(
+        "--moe-bits",
+        type=int,
+        choices=[2, 4],
+        default=None,
+        help="Largeur affine spécifique des experts MoE (ex: 2 pour mixte Q4 attention + Q2 experts)",
+    )
     args = parser.parse_args()
     convert_gguf(
         args.gguf,
@@ -514,6 +525,7 @@ def main() -> None:
         quant_format=args.quant_format,
         embed_bits=args.embed_bits,
         shard_mb=args.shard_mb,
+        moe_bits=args.moe_bits,
     )
 
 
