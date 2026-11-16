@@ -2339,4 +2339,393 @@ size_t aibox_gpu_vram_free_bytes() {
     return free_bytes;
 }
 
+__global__ void q2_affine_gemv_geglu_f16_kernel(
+    const __half* __restrict__ x,
+    const uint8_t* __restrict__ wg,
+    const uint16_t* __restrict__ sg,
+    const uint16_t* __restrict__ zg,
+    const uint8_t* __restrict__ wu,
+    const uint16_t* __restrict__ su,
+    const uint16_t* __restrict__ zu,
+    __half* __restrict__ out,
+    int n,
+    int k
+) {
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int row_n = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    if (row_n >= n) {
+        return;
+    }
+
+    int groups_per_row = k / 64;
+    const int bytes_per_group = 16;
+    size_t w_off = (size_t)row_n * groups_per_row * bytes_per_group;
+    size_t s_off = (size_t)row_n * groups_per_row;
+    const uint8_t* wg_row = wg + w_off;
+    const uint16_t* sg_row = sg + s_off;
+    const uint16_t* zg_row = zg + s_off;
+    const uint8_t* wu_row = wu + w_off;
+    const uint16_t* su_row = su + s_off;
+    const uint16_t* zu_row = zu + s_off;
+
+    float total_g = 0.0f;
+    float total_u = 0.0f;
+    int sub_g = lane >> 4;
+    int sub_lane = lane & 15;
+    int g = 0;
+    for (; g + 2 <= groups_per_row; g += 2) {
+        int cur_g = g + sub_g;
+        uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[cur_g * 64 + sub_lane * 4]);
+        const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+        float2 f0 = __half22float2(h2[0]);
+        float2 f1 = __half22float2(h2[1]);
+        float sum_x = f0.x + f0.y + f1.x + f1.y;
+
+        uint8_t pg = wg_row[cur_g * bytes_per_group + sub_lane];
+        float sum_qg = f0.x * static_cast<float>(pg & 0x03)
+                     + f0.y * static_cast<float>((pg >> 2) & 0x03)
+                     + f1.x * static_cast<float>((pg >> 4) & 0x03)
+                     + f1.y * static_cast<float>((pg >> 6) & 0x03);
+
+        uint8_t pu = wu_row[cur_g * bytes_per_group + sub_lane];
+        float sum_qu = f0.x * static_cast<float>(pu & 0x03)
+                     + f0.y * static_cast<float>((pu >> 2) & 0x03)
+                     + f1.x * static_cast<float>((pu >> 4) & 0x03)
+                     + f1.y * static_cast<float>((pu >> 6) & 0x03);
+
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            sum_qg += __shfl_down_sync(0xFFFFFFFF, sum_qg, offset);
+            sum_qu += __shfl_down_sync(0xFFFFFFFF, sum_qu, offset);
+            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+        }
+        if (sub_lane == 0) {
+            float sc_g = __half2float(*reinterpret_cast<const __half*>(&sg_row[cur_g]));
+            float zr_g = __half2float(*reinterpret_cast<const __half*>(&zg_row[cur_g]));
+            float sc_u = __half2float(*reinterpret_cast<const __half*>(&su_row[cur_g]));
+            float zr_u = __half2float(*reinterpret_cast<const __half*>(&zu_row[cur_g]));
+            total_g += sum_qg * sc_g + sum_x * zr_g;
+            total_u += sum_qu * sc_u + sum_x * zr_u;
+        }
+    }
+    if (g < groups_per_row) {
+        float sum_qg = 0.0f;
+        float sum_qu = 0.0f;
+        float sum_x = 0.0f;
+        if (lane < 16) {
+            uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[g * 64 + lane * 4]);
+            const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+            float2 f0 = __half22float2(h2[0]);
+            float2 f1 = __half22float2(h2[1]);
+            sum_x = f0.x + f0.y + f1.x + f1.y;
+            uint8_t pg = wg_row[g * bytes_per_group + lane];
+            sum_qg = f0.x * static_cast<float>(pg & 0x03)
+                   + f0.y * static_cast<float>((pg >> 2) & 0x03)
+                   + f1.x * static_cast<float>((pg >> 4) & 0x03)
+                   + f1.y * static_cast<float>((pg >> 6) & 0x03);
+            uint8_t pu = wu_row[g * bytes_per_group + lane];
+            sum_qu = f0.x * static_cast<float>(pu & 0x03)
+                   + f0.y * static_cast<float>((pu >> 2) & 0x03)
+                   + f1.x * static_cast<float>((pu >> 4) & 0x03)
+                   + f1.y * static_cast<float>((pu >> 6) & 0x03);
+        }
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            sum_qg += __shfl_down_sync(0xFFFFFFFF, sum_qg, offset);
+            sum_qu += __shfl_down_sync(0xFFFFFFFF, sum_qu, offset);
+            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+        }
+        if (lane == 0) {
+            float sc_g = __half2float(*reinterpret_cast<const __half*>(&sg_row[g]));
+            float zr_g = __half2float(*reinterpret_cast<const __half*>(&zg_row[g]));
+            float sc_u = __half2float(*reinterpret_cast<const __half*>(&su_row[g]));
+            float zr_u = __half2float(*reinterpret_cast<const __half*>(&zu_row[g]));
+            total_g += sum_qg * sc_g + sum_x * zr_g;
+            total_u += sum_qu * sc_u + sum_x * zr_u;
+        }
+    }
+    total_g += __shfl_down_sync(0xFFFFFFFF, total_g, 16);
+    total_u += __shfl_down_sync(0xFFFFFFFF, total_u, 16);
+
+    if (lane == 0) {
+        const float sqrt_2_over_pi = 0.7978845608f;
+        const float coeff = 0.044715f;
+        float inner = sqrt_2_over_pi * (total_g + coeff * total_g * total_g * total_g);
+        float gelu = 0.5f * total_g * (1.0f + tanhf(inner));
+        out[row_n] = __float2half(gelu * total_u);
+    }
+}
+
+int aibox_gpu_matmul_q2_affine_geglu_f16_dev(
+    const uint16_t* dev_x,
+    const uint8_t* dev_wg,
+    const uint16_t* dev_sg,
+    const uint16_t* dev_zg,
+    const uint8_t* dev_wu,
+    const uint16_t* dev_su,
+    const uint16_t* dev_zu,
+    uint16_t* dev_out,
+    int n,
+    int k
+) {
+    if (n <= 0 || k <= 0 || (k % 64) != 0) {
+        return -1;
+    }
+    int grid_x = (n + 3) / 4;
+    q2_affine_gemv_geglu_f16_kernel<<<grid_x, 128, 0, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_x),
+        dev_wg, dev_sg, dev_zg,
+        dev_wu, dev_su, dev_zu,
+        reinterpret_cast<__half*>(dev_out),
+        n, k
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+__global__ void gemma4_norm_rope_f16_kernel(
+    __half* __restrict__ vec,
+    const float* __restrict__ norm_w,
+    const float* __restrict__ rope_freqs,
+    int num_heads,
+    int head_dim,
+    int rope_dim,
+    int pos,
+    float theta,
+    float eps
+) {
+    int head = blockIdx.x;
+    if (head >= num_heads) {
+        return;
+    }
+    __shared__ float s_partial[8];
+    __shared__ float s_inv_rms;
+
+    __half* head_ptr = vec + (size_t)head * head_dim;
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = __half2float(head_ptr[i]);
+        sum_sq += v * v;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    int lane = threadIdx.x & 31;
+    int warp_id = threadIdx.x >> 5;
+    if (lane == 0) {
+        s_partial[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        int n_warps = blockDim.x >> 5;
+        for (int w = 0; w < n_warps; ++w) {
+            total += s_partial[w];
+        }
+        s_inv_rms = rsqrtf(total / static_cast<float>(head_dim) + eps);
+    }
+    __syncthreads();
+
+    float inv_rms = s_inv_rms;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = __half2float(head_ptr[i]) * inv_rms;
+        if (norm_w != nullptr) {
+            v *= norm_w[i];
+        }
+        head_ptr[i] = __float2half(v);
+    }
+    __syncthreads();
+
+    int half_rope = rope_dim >> 1;
+    if (half_rope > 0) {
+        float pos_f = static_cast<float>(pos);
+        for (int i = threadIdx.x; i < half_rope; i += blockDim.x) {
+            float freq;
+            if (rope_freqs != nullptr) {
+                float rf = rope_freqs[i];
+                freq = (isinf(rf) || fabsf(rf) > 1e20f)
+                    ? 0.0f
+                    : (1.0f / (powf(theta, static_cast<float>(2 * i) / static_cast<float>(rope_dim)) * rf));
+            } else {
+                freq = 1.0f / powf(theta, static_cast<float>(2 * i) / static_cast<float>(rope_dim));
+            }
+            float angle = pos_f * freq;
+            float sin_a, cos_a;
+            __sincosf(angle, &sin_a, &cos_a);
+            float x0 = __half2float(head_ptr[i]);
+            float x1 = __half2float(head_ptr[i + half_rope]);
+            head_ptr[i] = __float2half(x0 * cos_a - x1 * sin_a);
+            head_ptr[i + half_rope] = __float2half(x0 * sin_a + x1 * cos_a);
+        }
+    }
+}
+
+__global__ void gemma4_kv_append_f16_kernel(
+    __half* __restrict__ k_cache,
+    __half* __restrict__ v_cache,
+    const __half* __restrict__ k_new,
+    const __half* __restrict__ v_new,
+    int pos,
+    int kv_stride
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < kv_stride) {
+        size_t dst = (size_t)pos * kv_stride + idx;
+        k_cache[dst] = k_new[idx];
+        v_cache[dst] = v_new[idx];
+    }
+}
+
+__global__ void gemma4_gqa_attention_f16_kernel(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    __half* __restrict__ out,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int total_seq,
+    int start_pos
+) {
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) {
+        return;
+    }
+    int kvh = qh / (num_q_heads / num_kv_heads);
+    int kv_stride = num_kv_heads * head_dim;
+    const __half* q_head = q + (size_t)qh * head_dim;
+    __half* out_head = out + (size_t)qh * head_dim;
+
+    extern __shared__ float s_scores[];
+    __shared__ float s_partial[8];
+    __shared__ float s_max;
+    __shared__ float s_inv_sum;
+
+    int lane = threadIdx.x & 31;
+    int warp_id = threadIdx.x >> 5;
+    int n_warps = blockDim.x >> 5;
+
+    float local_max = -1e30f;
+    for (int t = start_pos; t < total_seq; ++t) {
+        const __half* k_vec = k_cache + (size_t)t * kv_stride + (size_t)kvh * head_dim;
+        float dot = 0.0f;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            dot += __half2float(q_head[d]) * __half2float(k_vec[d]);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_down_sync(0xFFFFFFFF, dot, offset);
+        }
+        if (lane == 0) {
+            s_partial[warp_id] = dot;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float total = 0.0f;
+            for (int w = 0; w < n_warps; ++w) {
+                total += s_partial[w];
+            }
+            s_scores[t - start_pos] = total;
+            if (total > local_max) {
+                local_max = total;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        s_max = local_max;
+        float sum_exp = 0.0f;
+        int len = total_seq - start_pos;
+        for (int i = 0; i < len; ++i) {
+            float e = expf(s_scores[i] - s_max);
+            s_scores[i] = e;
+            sum_exp += e;
+        }
+        s_inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    }
+    __syncthreads();
+
+    float inv_sum = s_inv_sum;
+    int len = total_seq - start_pos;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < len; ++i) {
+            const __half* v_vec = v_cache + (size_t)(start_pos + i) * kv_stride + (size_t)kvh * head_dim;
+            acc += (s_scores[i] * inv_sum) * __half2float(v_vec[d]);
+        }
+        out_head[d] = __float2half(acc);
+    }
+}
+
+int aibox_gpu_gemma4_norm_rope_f16(
+    uint16_t* dev_vec,
+    const float* dev_norm_w,
+    const float* dev_rope_freqs,
+    int num_heads,
+    int head_dim,
+    int rope_dim,
+    int pos,
+    float theta,
+    float eps
+) {
+    if (num_heads <= 0 || head_dim <= 0) {
+        return -1;
+    }
+    gemma4_norm_rope_f16_kernel<<<num_heads, 256, 0, g_active_stream>>>(
+        reinterpret_cast<__half*>(dev_vec),
+        dev_norm_w,
+        dev_rope_freqs,
+        num_heads,
+        head_dim,
+        rope_dim,
+        pos,
+        theta,
+        eps
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_gemma4_attention_f16(
+    const uint16_t* dev_q,
+    const uint16_t* dev_k_new,
+    const uint16_t* dev_v_new,
+    uint16_t* dev_k_cache,
+    uint16_t* dev_v_cache,
+    uint16_t* dev_out,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int pos,
+    int window_size
+) {
+    if (num_q_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || pos < 0) {
+        return -1;
+    }
+    int kv_stride = num_kv_heads * head_dim;
+    int app_blocks = (kv_stride + 255) / 256;
+    gemma4_kv_append_f16_kernel<<<app_blocks, 256, 0, g_active_stream>>>(
+        reinterpret_cast<__half*>(dev_k_cache),
+        reinterpret_cast<__half*>(dev_v_cache),
+        reinterpret_cast<const __half*>(dev_k_new),
+        reinterpret_cast<const __half*>(dev_v_new),
+        pos,
+        kv_stride
+    );
+    int total_seq = pos + 1;
+    int start_pos = (window_size > 0 && total_seq > window_size) ? (total_seq - window_size) : 0;
+    size_t smem = (size_t)(total_seq - start_pos) * sizeof(float);
+    gemma4_gqa_attention_f16_kernel<<<num_q_heads, 256, smem, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_q),
+        reinterpret_cast<const __half*>(dev_k_cache),
+        reinterpret_cast<const __half*>(dev_v_cache),
+        reinterpret_cast<__half*>(dev_out),
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        total_seq,
+        start_pos
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+int aibox_gpu_copy_d2d_bytes(void* dev_dst, const void* dev_src, size_t bytes) {
+    return (cudaMemcpyAsync(dev_dst, dev_src, bytes, cudaMemcpyDeviceToDevice, g_active_stream) == cudaSuccess) ? 0 : -1;
+}
+
 }

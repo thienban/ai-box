@@ -158,6 +158,47 @@ type FnGegluInplaceF16 = unsafe extern "C" fn(*mut u16, *const u16, c_int) -> c_
 type FnWeightedAccF16ToF32 = unsafe extern "C" fn(*mut f32, *const u16, f32, c_int, c_int) -> c_int;
 #[cfg(target_os = "linux")]
 type FnVramFreeBytes = unsafe extern "C" fn() -> usize;
+#[cfg(target_os = "linux")]
+type FnMatmulQ2AffineGegluF16Dev = unsafe extern "C" fn(
+    *const u16,
+    *const u8,
+    *const u16,
+    *const u16,
+    *const u8,
+    *const u16,
+    *const u16,
+    *mut u16,
+    c_int,
+    c_int,
+) -> c_int;
+#[cfg(target_os = "linux")]
+type FnGemma4NormRopeF16 = unsafe extern "C" fn(
+    *mut u16,
+    *const f32,
+    *const f32,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    f32,
+    f32,
+) -> c_int;
+#[cfg(target_os = "linux")]
+type FnGemma4AttentionF16 = unsafe extern "C" fn(
+    *const u16,
+    *const u16,
+    *const u16,
+    *mut u16,
+    *mut u16,
+    *mut u16,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+) -> c_int;
+#[cfg(target_os = "linux")]
+type FnCopyD2DBytes = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
 
 #[cfg(target_os = "linux")]
 struct GpuWeightPair {
@@ -218,6 +259,10 @@ struct CudaSymbols {
     geglu_inplace_f16: FnGegluInplaceF16,
     weighted_acc_f16_to_f32: FnWeightedAccF16ToF32,
     vram_free_bytes: FnVramFreeBytes,
+    matmul_q2_affine_geglu_f16_dev: FnMatmulQ2AffineGegluF16Dev,
+    gemma4_norm_rope_f16: FnGemma4NormRopeF16,
+    gemma4_attention_f16: FnGemma4AttentionF16,
+    copy_d2d_bytes: FnCopyD2DBytes,
 }
 
 #[cfg(target_os = "linux")]
@@ -538,6 +583,10 @@ impl GpuBackend {
                 geglu_inplace_f16: load_symbol(handle, "aibox_gpu_geglu_inplace_f16")?,
                 weighted_acc_f16_to_f32: load_symbol(handle, "aibox_gpu_weighted_acc_f16_to_f32")?,
                 vram_free_bytes: load_symbol(handle, "aibox_gpu_vram_free_bytes")?,
+                matmul_q2_affine_geglu_f16_dev: load_symbol(handle, "aibox_gpu_matmul_q2_affine_geglu_f16_dev")?,
+                gemma4_norm_rope_f16: load_symbol(handle, "aibox_gpu_gemma4_norm_rope_f16")?,
+                gemma4_attention_f16: load_symbol(handle, "aibox_gpu_gemma4_attention_f16")?,
+                copy_d2d_bytes: load_symbol(handle, "aibox_gpu_copy_d2d_bytes")?,
             })
         })();
 
@@ -1383,6 +1432,123 @@ impl GpuBackend {
         unsafe { (self.symbols.vram_free_bytes)() }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q2_affine_geglu_buffers_dev(
+        &self,
+        x_dev: &GpuBuffer<'_, u16>,
+        wg_dev: &GpuBuffer<'_, u8>,
+        sg_dev: &GpuBuffer<'_, u16>,
+        zg_dev: &GpuBuffer<'_, u16>,
+        wu_dev: &GpuBuffer<'_, u8>,
+        su_dev: &GpuBuffer<'_, u16>,
+        zu_dev: &GpuBuffer<'_, u16>,
+        out_dev: &mut GpuBuffer<'_, u16>,
+        n: usize,
+        k: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.matmul_q2_affine_geglu_f16_dev)(
+                x_dev.as_ptr(),
+                wg_dev.as_ptr(),
+                sg_dev.as_ptr(),
+                zg_dev.as_ptr(),
+                wu_dev.as_ptr(),
+                su_dev.as_ptr(),
+                zu_dev.as_ptr(),
+                out_dev.as_mut_ptr(),
+                n as c_int,
+                k as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_matmul_q2_affine_geglu_f16_dev", status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma4_norm_rope_f16(
+        &self,
+        vec_dev: &mut GpuBuffer<'_, u16>,
+        norm_w: Option<&[f32]>,
+        rope_freqs: Option<&[f32]>,
+        num_heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        pos: usize,
+        theta: f32,
+        eps: f32,
+    ) -> Result<(), BackendError> {
+        let dev_norm = match norm_w {
+            Some(w) => self.get_or_upload_raw_bytes(w.as_ptr() as *const c_void, std::mem::size_of_val(w))? as *const f32,
+            None => std::ptr::null(),
+        };
+        let dev_freqs = match rope_freqs {
+            Some(rf) => self.get_or_upload_raw_bytes(rf.as_ptr() as *const c_void, std::mem::size_of_val(rf))? as *const f32,
+            None => std::ptr::null(),
+        };
+        let status = unsafe {
+            (self.symbols.gemma4_norm_rope_f16)(
+                vec_dev.as_mut_ptr(),
+                dev_norm,
+                dev_freqs,
+                num_heads as c_int,
+                head_dim as c_int,
+                rope_dim as c_int,
+                pos as c_int,
+                theta,
+                eps,
+            )
+        };
+        check_cuda_status("aibox_gpu_gemma4_norm_rope_f16", status)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma4_attention_f16(
+        &self,
+        q_dev: &GpuBuffer<'_, u16>,
+        k_new_dev: &GpuBuffer<'_, u16>,
+        v_new_dev: &GpuBuffer<'_, u16>,
+        k_cache_dev: &mut GpuBuffer<'_, u16>,
+        v_cache_dev: &mut GpuBuffer<'_, u16>,
+        out_dev: &mut GpuBuffer<'_, u16>,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        pos: usize,
+        window_size: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.gemma4_attention_f16)(
+                q_dev.as_ptr(),
+                k_new_dev.as_ptr(),
+                v_new_dev.as_ptr(),
+                k_cache_dev.as_mut_ptr(),
+                v_cache_dev.as_mut_ptr(),
+                out_dev.as_mut_ptr(),
+                num_q_heads as c_int,
+                num_kv_heads as c_int,
+                head_dim as c_int,
+                pos as c_int,
+                window_size as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_gemma4_attention_f16", status)
+    }
+
+    pub fn copy_d2d_u16(
+        &self,
+        dst_dev: &mut GpuBuffer<'_, u16>,
+        src_dev: &GpuBuffer<'_, u16>,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.copy_d2d_bytes)(
+                dst_dev.as_mut_ptr() as *mut c_void,
+                src_dev.as_ptr() as *const c_void,
+                len * std::mem::size_of::<u16>(),
+            )
+        };
+        check_cuda_status("aibox_gpu_copy_d2d_bytes", status)
+    }
+
     fn get_or_upload_raw_bytes(&self, host_ptr: *const c_void, byte_len: usize) -> Result<*mut c_void, BackendError> {
         let key = (host_ptr as usize, byte_len);
         let mut guard = self.raw_cache.lock().map_err(|_| {
@@ -1637,6 +1803,62 @@ impl GpuBackend {
     }
     pub fn vram_free_bytes(&self) -> usize {
         0
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q2_affine_geglu_buffers_dev(
+        &self,
+        _x: &GpuBuffer<'_, u16>,
+        _wg: &GpuBuffer<'_, u8>,
+        _sg: &GpuBuffer<'_, u16>,
+        _zg: &GpuBuffer<'_, u16>,
+        _wu: &GpuBuffer<'_, u8>,
+        _su: &GpuBuffer<'_, u16>,
+        _zu: &GpuBuffer<'_, u16>,
+        _out: &mut GpuBuffer<'_, u16>,
+        _n: usize,
+        _k: usize,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma4_norm_rope_f16(
+        &self,
+        _vec: &mut GpuBuffer<'_, u16>,
+        _norm_w: Option<&[f32]>,
+        _rope_freqs: Option<&[f32]>,
+        _num_heads: usize,
+        _head_dim: usize,
+        _rope_dim: usize,
+        _pos: usize,
+        _theta: f32,
+        _eps: f32,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma4_attention_f16(
+        &self,
+        _q: &GpuBuffer<'_, u16>,
+        _k_new: &GpuBuffer<'_, u16>,
+        _v_new: &GpuBuffer<'_, u16>,
+        _k_cache: &mut GpuBuffer<'_, u16>,
+        _v_cache: &mut GpuBuffer<'_, u16>,
+        _out: &mut GpuBuffer<'_, u16>,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _pos: usize,
+        _window_size: usize,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn copy_d2d_u16(
+        &self,
+        _dst: &mut GpuBuffer<'_, u16>,
+        _src: &GpuBuffer<'_, u16>,
+        _len: usize,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
     }
 }
 

@@ -668,6 +668,13 @@ struct Gemma4GpuScratch<'a> {
     out_dev: aibox_kernels::GpuBuffer<'a, u16>,
     gate_dev: aibox_kernels::GpuBuffer<'a, u16>,
     up_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    q_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    k_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    v_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    ctx_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    kv_k_dev: Vec<aibox_kernels::GpuBuffer<'a, u16>>,
+    kv_v_dev: Vec<aibox_kernels::GpuBuffer<'a, u16>>,
+    max_kv_seq: usize,
     moe_acc_dev: aibox_kernels::GpuBuffer<'a, f32>,
     logits_dev: aibox_kernels::GpuBuffer<'a, f32>,
     stage_w: aibox_kernels::GpuBuffer<'a, u8>,
@@ -690,13 +697,36 @@ impl Drop for Gemma4GpuScratch<'_> {
 }
 
 impl<'a> Gemma4GpuScratch<'a> {
-    fn new(gpu: &'a GpuBackend, cfg: &Gemma4Config, vram_expert_cap: usize) -> Result<Self, String> {
+    fn new(
+        gpu: &'a GpuBackend,
+        cfg: &Gemma4Config,
+        layers: &[Gemma4Layer],
+        vram_expert_cap: usize,
+    ) -> Result<Self, String> {
         let max_dim = cfg
             .base
             .intermediate_size
             .max(cfg.moe_intermediate_size)
             .max(cfg.base.hidden_size * 4)
             .max(8192);
+        let max_q_dim = layers
+            .iter()
+            .map(|l| cfg.base.num_attention_heads * l.head_dim)
+            .max()
+            .unwrap_or(max_dim);
+        let max_kv_dim = layers
+            .iter()
+            .map(|l| l.num_kv_heads * l.head_dim)
+            .max()
+            .unwrap_or(max_dim);
+        let max_kv_seq = 512usize;
+        let mut kv_k_dev = Vec::with_capacity(layers.len());
+        let mut kv_v_dev = Vec::with_capacity(layers.len());
+        for l in layers {
+            let kv_stride = l.num_kv_heads * l.head_dim;
+            kv_k_dev.push(gpu.alloc_f16(max_kv_seq * kv_stride).map_err(|e| e.to_string())?);
+            kv_v_dev.push(gpu.alloc_f16(max_kv_seq * kv_stride).map_err(|e| e.to_string())?);
+        }
         let stage_w_bytes = 16 * 1024 * 1024;
         let stage_s_elems = 512 * 1024;
         let pinned_cap = stage_w_bytes + 2 * stage_s_elems * std::mem::size_of::<u16>();
@@ -707,6 +737,13 @@ impl<'a> Gemma4GpuScratch<'a> {
             out_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
             gate_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
             up_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
+            q_dev: gpu.alloc_f16(max_q_dim).map_err(|e| e.to_string())?,
+            k_dev: gpu.alloc_f16(max_kv_dim).map_err(|e| e.to_string())?,
+            v_dev: gpu.alloc_f16(max_kv_dim).map_err(|e| e.to_string())?,
+            ctx_dev: gpu.alloc_f16(max_q_dim).map_err(|e| e.to_string())?,
+            kv_k_dev,
+            kv_v_dev,
+            max_kv_seq,
             moe_acc_dev: gpu.alloc_f32(cfg.base.hidden_size).map_err(|e| e.to_string())?,
             logits_dev: gpu.alloc_f32(cfg.base.vocab_size).map_err(|e| e.to_string())?,
             stage_w: gpu.alloc_u8(stage_w_bytes).map_err(|e| e.to_string())?,
@@ -903,11 +940,28 @@ fn forward_vram_geglu_expert_into_acc(
     weight: f32,
     reset: bool,
 ) -> Result<(), String> {
-    entry.gate.forward_into_dev(sc.gpu, &sc.x_dev, &mut sc.gate_dev)?;
-    entry.up.forward_into_dev(sc.gpu, &sc.x_dev, &mut sc.up_dev)?;
-    sc.gpu
-        .geglu_inplace_f16(&mut sc.gate_dev, &sc.up_dev, entry.gate.n_rows)
-        .map_err(|e| e.to_string())?;
+    if !entry.gate.is_q4 && !entry.up.is_q4 {
+        sc.gpu
+            .matmul_q2_affine_geglu_buffers_dev(
+                &sc.x_dev,
+                &entry.gate.w,
+                &entry.gate.s,
+                &entry.gate.z,
+                &entry.up.w,
+                &entry.up.s,
+                &entry.up.z,
+                &mut sc.gate_dev,
+                entry.gate.n_rows,
+                entry.gate.k_cols,
+            )
+            .map_err(|e| e.to_string())?;
+    } else {
+        entry.gate.forward_into_dev(sc.gpu, &sc.x_dev, &mut sc.gate_dev)?;
+        entry.up.forward_into_dev(sc.gpu, &sc.x_dev, &mut sc.up_dev)?;
+        sc.gpu
+            .geglu_inplace_f16(&mut sc.gate_dev, &sc.up_dev, entry.gate.n_rows)
+            .map_err(|e| e.to_string())?;
+    }
     entry.down.forward_into_dev(sc.gpu, &sc.gate_dev, &mut sc.out_dev)?;
     sc.gpu
         .weighted_acc_f16_to_f32(&mut sc.moe_acc_dev, &sc.out_dev, weight, entry.down.n_rows, reset)
@@ -1196,7 +1250,7 @@ impl Gemma4Model {
         let mut scratch = match backend.as_gpu() {
             Some(gpu) => {
                 let free_bytes = gpu.vram_free_bytes();
-                let reserved_bytes = 1400usize * 1024 * 1024;
+                let reserved_bytes = 1520usize * 1024 * 1024;
                 let weights_per_exp = 3 * self.config.moe_intermediate_size * self.config.base.hidden_size;
                 let bytes_per_exp = if is_moe_q4 {
                     (weights_per_exp * 9) / 16
@@ -1218,7 +1272,7 @@ impl Gemma4Model {
                         bytes_per_exp as f64 / (1024.0 * 1024.0)
                     );
                 }
-                Some(Gemma4GpuScratch::new(gpu, &self.config, vram_cap)?)
+                Some(Gemma4GpuScratch::new(gpu, &self.config, &self.layers, vram_cap)?)
             }
             None => None,
         };
@@ -1381,6 +1435,157 @@ impl Gemma4Model {
         Ok(moe_out)
     }
 
+    fn try_forward_attention_vram(
+        &self,
+        layer_idx: usize,
+        layer: &Gemma4Layer,
+        normed_attn: &[f32],
+        pos: usize,
+        sc: &mut Gemma4GpuScratch<'_>,
+    ) -> Result<Option<Vec<f32>>, String> {
+        if pos >= sc.max_kv_seq
+            || !matches!(
+                (&layer.attn_q, &layer.attn_k, &layer.attn_o),
+                (Gemma4Linear::Q4Affine(_), Gemma4Linear::Q4Affine(_), Gemma4Linear::Q4Affine(_))
+            )
+        {
+            return Ok(None);
+        }
+        if let Some(ref v_proj) = layer.attn_v {
+            if !matches!(v_proj, Gemma4Linear::Q4Affine(_)) {
+                return Ok(None);
+            }
+        }
+        let cfg = &self.config.base;
+        sc.x_dev.upload_f32_as_f16(normed_attn).map_err(|e| e.to_string())?;
+        let _ = layer.attn_q.forward_q4_into_dev(sc.gpu, &sc.x_dev, &mut sc.q_dev)?;
+        let _ = layer.attn_k.forward_q4_into_dev(sc.gpu, &sc.x_dev, &mut sc.k_dev)?;
+        match &layer.attn_v {
+            Some(v_proj) => {
+                let _ = v_proj.forward_q4_into_dev(sc.gpu, &sc.x_dev, &mut sc.v_dev)?;
+            }
+            None => {
+                sc.gpu
+                    .copy_d2d_u16(&mut sc.v_dev, &sc.k_dev, layer.num_kv_heads * layer.head_dim)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        let global_freqs = if layer.is_global_attn {
+            self.rope_freqs.as_deref()
+        } else {
+            None
+        };
+        sc.gpu
+            .gemma4_norm_rope_f16(
+                &mut sc.q_dev,
+                layer.attn_q_norm.as_deref(),
+                global_freqs,
+                cfg.num_attention_heads,
+                layer.head_dim,
+                layer.rope_dim,
+                pos,
+                layer.rope_theta,
+                cfg.rms_norm_eps,
+            )
+            .map_err(|e| e.to_string())?;
+        sc.gpu
+            .gemma4_norm_rope_f16(
+                &mut sc.k_dev,
+                layer.attn_k_norm.as_deref(),
+                global_freqs,
+                layer.num_kv_heads,
+                layer.head_dim,
+                layer.rope_dim,
+                pos,
+                layer.rope_theta,
+                cfg.rms_norm_eps,
+            )
+            .map_err(|e| e.to_string())?;
+        sc.gpu
+            .gemma4_norm_rope_f16(
+                &mut sc.v_dev,
+                None,
+                None,
+                layer.num_kv_heads,
+                layer.head_dim,
+                0,
+                pos,
+                layer.rope_theta,
+                cfg.rms_norm_eps,
+            )
+            .map_err(|e| e.to_string())?;
+        let window_size = if layer.is_global_attn {
+            0
+        } else {
+            self.config.sliding_window
+        };
+        sc.gpu
+            .gemma4_attention_f16(
+                &sc.q_dev,
+                &sc.k_dev,
+                &sc.v_dev,
+                &mut sc.kv_k_dev[layer_idx],
+                &mut sc.kv_v_dev[layer_idx],
+                &mut sc.ctx_dev,
+                cfg.num_attention_heads,
+                layer.num_kv_heads,
+                layer.head_dim,
+                pos,
+                window_size,
+            )
+            .map_err(|e| e.to_string())?;
+        let out_rows = layer.attn_o.forward_q4_into_dev(sc.gpu, &sc.ctx_dev, &mut sc.out_dev)?;
+        let mut attn_out = vec![0.0f32; out_rows];
+        sc.out_dev.download_as_f32(&mut attn_out).map_err(|e| e.to_string())?;
+        Ok(Some(attn_out))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attention_cpu_fallback(
+        &self,
+        layer_idx: usize,
+        layer: &Gemma4Layer,
+        normed_attn: &[f32],
+        pos: usize,
+        kv_cache: &mut KvCache,
+        mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
+        backend: &dyn TernaryHadamardBackend,
+    ) -> Result<Vec<f32>, String> {
+        let cfg = &self.config.base;
+        let mut q = layer.attn_q.forward_with_scratch(normed_attn, scratch.as_deref_mut(), backend, true)?;
+        let mut k = layer.attn_k.forward_with_scratch(normed_attn, scratch.as_deref_mut(), backend, true)?;
+        let mut v = match &layer.attn_v {
+            Some(v_proj) => v_proj.forward_with_scratch(normed_attn, scratch.as_deref_mut(), backend, true)?,
+            None => k.clone(),
+        };
+        if let Some(ref q_norm) = layer.attn_q_norm {
+            rms_norm_heads_inplace(&mut q, cfg.num_attention_heads, layer.head_dim, q_norm, cfg.rms_norm_eps);
+        }
+        if let Some(ref k_norm) = layer.attn_k_norm {
+            rms_norm_heads_inplace(&mut k, layer.num_kv_heads, layer.head_dim, k_norm, cfg.rms_norm_eps);
+        }
+        for h in 0..layer.num_kv_heads {
+            let slice = &mut v[h * layer.head_dim..(h + 1) * layer.head_dim];
+            let mean_sq: f32 = slice.iter().map(|&x| x * x).sum::<f32>() / (layer.head_dim as f32);
+            let inv = 1.0 / (mean_sq + cfg.rms_norm_eps).sqrt();
+            for val in slice {
+                *val *= inv;
+            }
+        }
+        let global_freqs = if layer.is_global_attn {
+            self.rope_freqs.as_deref()
+        } else {
+            None
+        };
+        apply_rope_with_freqs_inplace(&mut q, cfg.num_attention_heads, layer.head_dim, layer.rope_dim, pos, layer.rope_theta, global_freqs);
+        apply_rope_with_freqs_inplace(&mut k, layer.num_kv_heads, layer.head_dim, layer.rope_dim, pos, layer.rope_theta, global_freqs);
+        kv_cache.keys[layer_idx].extend_from_slice(&k);
+        kv_cache.values[layer_idx].extend_from_slice(&v);
+        let window = if layer.is_global_attn { None } else { Some(self.config.sliding_window) };
+        let ctx = attention_gqa_windowed(&q, &kv_cache.keys[layer_idx], &kv_cache.values[layer_idx], cfg.num_attention_heads, layer.num_kv_heads, layer.head_dim, window);
+        layer.attn_o.forward_with_scratch(&ctx, scratch, backend, true)
+    }
+
     fn forward_token_with_scratch(
         &self,
         token_id: usize,
@@ -1402,71 +1607,15 @@ impl Gemma4Model {
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let normed_attn = rms_norm(&hidden, &layer.attn_norm, cfg.rms_norm_eps);
-            let mut q = layer.attn_q.forward_with_scratch(&normed_attn, scratch.as_deref_mut(), backend, true)?;
-            let mut k = layer.attn_k.forward_with_scratch(&normed_attn, scratch.as_deref_mut(), backend, true)?;
-            let mut v = match &layer.attn_v {
-                Some(v_proj) => v_proj.forward_with_scratch(&normed_attn, scratch.as_deref_mut(), backend, true)?,
-                None => k.clone(),
-            };
-
-            if let Some(ref q_norm) = layer.attn_q_norm {
-                rms_norm_heads_inplace(&mut q, cfg.num_attention_heads, layer.head_dim, q_norm, cfg.rms_norm_eps);
-            }
-            if let Some(ref k_norm) = layer.attn_k_norm {
-                rms_norm_heads_inplace(&mut k, layer.num_kv_heads, layer.head_dim, k_norm, cfg.rms_norm_eps);
-            }
-            // Gemma 4 applique une RMSNorm unitaire (sans poids) sur les têtes V.
-            for h in 0..layer.num_kv_heads {
-                let slice = &mut v[h * layer.head_dim..(h + 1) * layer.head_dim];
-                let mean_sq: f32 = slice.iter().map(|&x| x * x).sum::<f32>() / (layer.head_dim as f32);
-                let inv = 1.0 / (mean_sq + cfg.rms_norm_eps).sqrt();
-                for val in slice {
-                    *val *= inv;
+            let attn_out = if let Some(sc) = scratch.as_deref_mut() {
+                if let Some(vram_out) = self.try_forward_attention_vram(layer_idx, layer, &normed_attn, pos, sc)? {
+                    vram_out
+                } else {
+                    self.forward_attention_cpu_fallback(layer_idx, layer, &normed_attn, pos, kv_cache, None, backend)?
                 }
-            }
-
-            let global_freqs = if layer.is_global_attn {
-                self.rope_freqs.as_deref()
             } else {
-                None
+                self.forward_attention_cpu_fallback(layer_idx, layer, &normed_attn, pos, kv_cache, None, backend)?
             };
-            apply_rope_with_freqs_inplace(
-                &mut q,
-                cfg.num_attention_heads,
-                layer.head_dim,
-                layer.rope_dim,
-                pos,
-                layer.rope_theta,
-                global_freqs,
-            );
-            apply_rope_with_freqs_inplace(
-                &mut k,
-                layer.num_kv_heads,
-                layer.head_dim,
-                layer.rope_dim,
-                pos,
-                layer.rope_theta,
-                global_freqs,
-            );
-
-            kv_cache.keys[layer_idx].extend_from_slice(&k);
-            kv_cache.values[layer_idx].extend_from_slice(&v);
-
-            let window = if layer.is_global_attn {
-                None
-            } else {
-                Some(self.config.sliding_window)
-            };
-            let ctx = attention_gqa_windowed(
-                &q,
-                &kv_cache.keys[layer_idx],
-                &kv_cache.values[layer_idx],
-                cfg.num_attention_heads,
-                layer.num_kv_heads,
-                layer.head_dim,
-                window,
-            );
-            let attn_out = layer.attn_o.forward_with_scratch(&ctx, scratch.as_deref_mut(), backend, true)?;
             let attn_out = if let Some(ref norm_w) = layer.post_attention_norm {
                 rms_norm(&attn_out, norm_w, cfg.rms_norm_eps)
             } else {
