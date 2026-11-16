@@ -197,8 +197,50 @@ type FnGemma4AttentionF16 = unsafe extern "C" fn(
     c_int,
     c_int,
 ) -> c_int;
+#[repr(C)]
+pub struct Gemma4MoeBatchArgs {
+    pub wg: [*const u8; 8],
+    pub sg: [*const u16; 8],
+    pub zg: [*const u16; 8],
+    pub wu: [*const u8; 8],
+    pub su: [*const u16; 8],
+    pub zu: [*const u16; 8],
+    pub wd: [*const u8; 8],
+    pub sd: [*const u16; 8],
+    pub zd: [*const u16; 8],
+    pub weights: [f32; 8],
+    pub k_count: i32,
+}
+
+impl Default for Gemma4MoeBatchArgs {
+    fn default() -> Self {
+        Self {
+            wg: [std::ptr::null(); 8],
+            sg: [std::ptr::null(); 8],
+            zg: [std::ptr::null(); 8],
+            wu: [std::ptr::null(); 8],
+            su: [std::ptr::null(); 8],
+            zu: [std::ptr::null(); 8],
+            wd: [std::ptr::null(); 8],
+            sd: [std::ptr::null(); 8],
+            zd: [std::ptr::null(); 8],
+            weights: [0.0; 8],
+            k_count: 0,
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 type FnCopyD2DBytes = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
+#[cfg(target_os = "linux")]
+type FnGemma4MoeQ2Batch = unsafe extern "C" fn(
+    *const u16,
+    *const Gemma4MoeBatchArgs,
+    *mut u16,
+    *mut f32,
+    c_int,
+    c_int,
+) -> c_int;
 
 #[cfg(target_os = "linux")]
 struct GpuWeightPair {
@@ -263,6 +305,7 @@ struct CudaSymbols {
     gemma4_norm_rope_f16: FnGemma4NormRopeF16,
     gemma4_attention_f16: FnGemma4AttentionF16,
     copy_d2d_bytes: FnCopyD2DBytes,
+    gemma4_moe_q2_batch: FnGemma4MoeQ2Batch,
 }
 
 #[cfg(target_os = "linux")]
@@ -435,6 +478,10 @@ impl<'a> GpuBuffer<'a, u16> {
 
 #[cfg(not(target_os = "linux"))]
 impl<'a, T> GpuBuffer<'a, T> {
+    pub fn as_ptr(&self) -> *const T {
+        std::ptr::null()
+    }
+
     pub fn download(&self, _out: &mut [T]) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
@@ -587,6 +634,7 @@ impl GpuBackend {
                 gemma4_norm_rope_f16: load_symbol(handle, "aibox_gpu_gemma4_norm_rope_f16")?,
                 gemma4_attention_f16: load_symbol(handle, "aibox_gpu_gemma4_attention_f16")?,
                 copy_d2d_bytes: load_symbol(handle, "aibox_gpu_copy_d2d_bytes")?,
+                gemma4_moe_q2_batch: load_symbol(handle, "aibox_gpu_gemma4_moe_q2_batch")?,
             })
         })();
 
@@ -1549,6 +1597,28 @@ impl GpuBackend {
         check_cuda_status("aibox_gpu_copy_d2d_bytes", status)
     }
 
+    pub fn gemma4_moe_q2_batch(
+        &self,
+        x_dev: &GpuBuffer<'_, u16>,
+        batch: &Gemma4MoeBatchArgs,
+        gate_scratch_dev: &mut GpuBuffer<'_, u16>,
+        acc_out_dev: &mut GpuBuffer<'_, f32>,
+        inter_dim: usize,
+        hidden_dim: usize,
+    ) -> Result<(), BackendError> {
+        let status = unsafe {
+            (self.symbols.gemma4_moe_q2_batch)(
+                x_dev.as_ptr(),
+                batch as *const Gemma4MoeBatchArgs,
+                gate_scratch_dev.as_mut_ptr(),
+                acc_out_dev.as_mut_ptr(),
+                inter_dim as c_int,
+                hidden_dim as c_int,
+            )
+        };
+        check_cuda_status("aibox_gpu_gemma4_moe_q2_batch", status)
+    }
+
     fn get_or_upload_raw_bytes(&self, host_ptr: *const c_void, byte_len: usize) -> Result<*mut c_void, BackendError> {
         let key = (host_ptr as usize, byte_len);
         let mut guard = self.raw_cache.lock().map_err(|_| {
@@ -1857,6 +1927,17 @@ impl GpuBackend {
         _dst: &mut GpuBuffer<'_, u16>,
         _src: &GpuBuffer<'_, u16>,
         _len: usize,
+    ) -> Result<(), BackendError> {
+        Err(linux_only_err())
+    }
+    pub fn gemma4_moe_q2_batch(
+        &self,
+        _x: &GpuBuffer<'_, u16>,
+        _batch: &Gemma4MoeBatchArgs,
+        _gate_scratch: &mut GpuBuffer<'_, u16>,
+        _acc_out: &mut GpuBuffer<'_, f32>,
+        _inter_dim: usize,
+        _hidden_dim: usize,
     ) -> Result<(), BackendError> {
         Err(linux_only_err())
     }

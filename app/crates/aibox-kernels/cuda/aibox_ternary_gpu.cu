@@ -2728,4 +2728,249 @@ int aibox_gpu_copy_d2d_bytes(void* dev_dst, const void* dev_src, size_t bytes) {
     return (cudaMemcpyAsync(dev_dst, dev_src, bytes, cudaMemcpyDeviceToDevice, g_active_stream) == cudaSuccess) ? 0 : -1;
 }
 
+struct Gemma4MoeBatchArgs {
+    const uint8_t* wg[8];
+    const uint16_t* sg[8];
+    const uint16_t* zg[8];
+    const uint8_t* wu[8];
+    const uint16_t* su[8];
+    const uint16_t* zu[8];
+    const uint8_t* wd[8];
+    const uint16_t* sd[8];
+    const uint16_t* zd[8];
+    float weights[8];
+    int k_count;
+};
+
+__global__ void grouped_q2_affine_gemv_geglu_f16_kernel(
+    const __half* __restrict__ x,
+    Gemma4MoeBatchArgs batch,
+    __half* __restrict__ gate_out,
+    int n,
+    int k
+) {
+    int e = blockIdx.y;
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int row_n = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    if (e >= batch.k_count || row_n >= n) {
+        return;
+    }
+
+    int groups_per_row = k / 64;
+    const int bytes_per_group = 16;
+    size_t w_off = (size_t)row_n * groups_per_row * bytes_per_group;
+    size_t s_off = (size_t)row_n * groups_per_row;
+    const uint8_t* wg_row = batch.wg[e] + w_off;
+    const uint16_t* sg_row = batch.sg[e] + s_off;
+    const uint16_t* zg_row = batch.zg[e] + s_off;
+    const uint8_t* wu_row = batch.wu[e] + w_off;
+    const uint16_t* su_row = batch.su[e] + s_off;
+    const uint16_t* zu_row = batch.zu[e] + s_off;
+
+    float total_g = 0.0f;
+    float total_u = 0.0f;
+    int sub_g = lane >> 4;
+    int sub_lane = lane & 15;
+    int g = 0;
+    for (; g + 2 <= groups_per_row; g += 2) {
+        int cur_g = g + sub_g;
+        uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[cur_g * 64 + sub_lane * 4]);
+        const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+        float2 f0 = __half22float2(h2[0]);
+        float2 f1 = __half22float2(h2[1]);
+        float sum_x = f0.x + f0.y + f1.x + f1.y;
+
+        uint8_t pg = wg_row[cur_g * bytes_per_group + sub_lane];
+        float sum_qg = f0.x * static_cast<float>(pg & 0x03)
+                     + f0.y * static_cast<float>((pg >> 2) & 0x03)
+                     + f1.x * static_cast<float>((pg >> 4) & 0x03)
+                     + f1.y * static_cast<float>((pg >> 6) & 0x03);
+
+        uint8_t pu = wu_row[cur_g * bytes_per_group + sub_lane];
+        float sum_qu = f0.x * static_cast<float>(pu & 0x03)
+                     + f0.y * static_cast<float>((pu >> 2) & 0x03)
+                     + f1.x * static_cast<float>((pu >> 4) & 0x03)
+                     + f1.y * static_cast<float>((pu >> 6) & 0x03);
+
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            sum_qg += __shfl_down_sync(0xFFFFFFFF, sum_qg, offset);
+            sum_qu += __shfl_down_sync(0xFFFFFFFF, sum_qu, offset);
+            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+        }
+        if (sub_lane == 0) {
+            float sc_g = __half2float(*reinterpret_cast<const __half*>(&sg_row[cur_g]));
+            float zr_g = __half2float(*reinterpret_cast<const __half*>(&zg_row[cur_g]));
+            float sc_u = __half2float(*reinterpret_cast<const __half*>(&su_row[cur_g]));
+            float zr_u = __half2float(*reinterpret_cast<const __half*>(&zu_row[cur_g]));
+            total_g += sum_qg * sc_g + sum_x * zr_g;
+            total_u += sum_qu * sc_u + sum_x * zr_u;
+        }
+    }
+    if (g < groups_per_row) {
+        float sum_qg = 0.0f;
+        float sum_qu = 0.0f;
+        float sum_x = 0.0f;
+        if (lane < 16) {
+            uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[g * 64 + lane * 4]);
+            const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+            float2 f0 = __half22float2(h2[0]);
+            float2 f1 = __half22float2(h2[1]);
+            sum_x = f0.x + f0.y + f1.x + f1.y;
+            uint8_t pg = wg_row[g * bytes_per_group + lane];
+            sum_qg = f0.x * static_cast<float>(pg & 0x03)
+                   + f0.y * static_cast<float>((pg >> 2) & 0x03)
+                   + f1.x * static_cast<float>((pg >> 4) & 0x03)
+                   + f1.y * static_cast<float>((pg >> 6) & 0x03);
+            uint8_t pu = wu_row[g * bytes_per_group + lane];
+            sum_qu = f0.x * static_cast<float>(pu & 0x03)
+                   + f0.y * static_cast<float>((pu >> 2) & 0x03)
+                   + f1.x * static_cast<float>((pu >> 4) & 0x03)
+                   + f1.y * static_cast<float>((pu >> 6) & 0x03);
+        }
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            sum_qg += __shfl_down_sync(0xFFFFFFFF, sum_qg, offset);
+            sum_qu += __shfl_down_sync(0xFFFFFFFF, sum_qu, offset);
+            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+        }
+        if (lane == 0) {
+            float sc_g = __half2float(*reinterpret_cast<const __half*>(&sg_row[g]));
+            float zr_g = __half2float(*reinterpret_cast<const __half*>(&zg_row[g]));
+            float sc_u = __half2float(*reinterpret_cast<const __half*>(&su_row[g]));
+            float zr_u = __half2float(*reinterpret_cast<const __half*>(&zu_row[g]));
+            total_g += sum_qg * sc_g + sum_x * zr_g;
+            total_u += sum_qu * sc_u + sum_x * zr_u;
+        }
+    }
+    total_g += __shfl_down_sync(0xFFFFFFFF, total_g, 16);
+    total_u += __shfl_down_sync(0xFFFFFFFF, total_u, 16);
+
+    if (lane == 0) {
+        const float sqrt_2_over_pi = 0.7978845608f;
+        const float coeff = 0.044715f;
+        float inner = sqrt_2_over_pi * (total_g + coeff * total_g * total_g * total_g);
+        float gelu = 0.5f * total_g * (1.0f + tanhf(inner));
+        gate_out[(size_t)e * n + row_n] = __float2half(gelu * total_u);
+    }
+}
+
+__global__ void grouped_q2_affine_down_acc_f16_kernel(
+    const __half* __restrict__ gate_in,
+    Gemma4MoeBatchArgs batch,
+    float* __restrict__ acc_out,
+    int n_down,
+    int k_down
+) {
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int row_n = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
+    if (row_n >= n_down) {
+        return;
+    }
+
+    int groups_per_row = k_down / 64;
+    const int bytes_per_group = 16;
+    size_t w_off = (size_t)row_n * groups_per_row * bytes_per_group;
+    size_t s_off = (size_t)row_n * groups_per_row;
+    int sub_g = lane >> 4;
+    int sub_lane = lane & 15;
+
+    float acc = 0.0f;
+    for (int e = 0; e < batch.k_count; ++e) {
+        const __half* x = gate_in + (size_t)e * k_down;
+        const uint8_t* w_row = batch.wd[e] + w_off;
+        const uint16_t* s_row = batch.sd[e] + s_off;
+        const uint16_t* z_row = batch.zd[e] + s_off;
+
+        float total = 0.0f;
+        int g = 0;
+        for (; g + 2 <= groups_per_row; g += 2) {
+            int cur_g = g + sub_g;
+            uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[cur_g * 64 + sub_lane * 4]);
+            const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+            float2 f0 = __half22float2(h2[0]);
+            float2 f1 = __half22float2(h2[1]);
+            uint8_t packed = w_row[cur_g * bytes_per_group + sub_lane];
+            float sum_q = f0.x * static_cast<float>(packed & 0x03)
+                        + f0.y * static_cast<float>((packed >> 2) & 0x03)
+                        + f1.x * static_cast<float>((packed >> 4) & 0x03)
+                        + f1.y * static_cast<float>((packed >> 6) & 0x03);
+            float sum_x = f0.x + f0.y + f1.x + f1.y;
+            for (int offset = 8; offset > 0; offset >>= 1) {
+                sum_q += __shfl_down_sync(0xFFFFFFFF, sum_q, offset);
+                sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+            }
+            if (sub_lane == 0) {
+                float s = __half2float(*reinterpret_cast<const __half*>(&s_row[cur_g]));
+                float z = __half2float(*reinterpret_cast<const __half*>(&z_row[cur_g]));
+                total += sum_q * s + sum_x * z;
+            }
+        }
+        if (g < groups_per_row) {
+            float sum_q = 0.0f;
+            float sum_x = 0.0f;
+            if (lane < 16) {
+                uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[g * 64 + lane * 4]);
+                const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+                float2 f0 = __half22float2(h2[0]);
+                float2 f1 = __half22float2(h2[1]);
+                uint8_t packed = w_row[g * bytes_per_group + lane];
+                sum_q = f0.x * static_cast<float>(packed & 0x03)
+                      + f0.y * static_cast<float>((packed >> 2) & 0x03)
+                      + f1.x * static_cast<float>((packed >> 4) & 0x03)
+                      + f1.y * static_cast<float>((packed >> 6) & 0x03);
+                sum_x = f0.x + f0.y + f1.x + f1.y;
+            }
+            for (int offset = 8; offset > 0; offset >>= 1) {
+                sum_q += __shfl_down_sync(0xFFFFFFFF, sum_q, offset);
+                sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+            }
+            if (lane == 0) {
+                float s = __half2float(*reinterpret_cast<const __half*>(&s_row[g]));
+                float z = __half2float(*reinterpret_cast<const __half*>(&z_row[g]));
+                total += sum_q * s + sum_x * z;
+            }
+        }
+        total += __shfl_down_sync(0xFFFFFFFF, total, 16);
+        if (lane == 0) {
+            acc += batch.weights[e] * total;
+        }
+    }
+    if (lane == 0) {
+        acc_out[row_n] = acc;
+    }
+}
+
+int aibox_gpu_gemma4_moe_q2_batch(
+    const uint16_t* dev_x,
+    const Gemma4MoeBatchArgs* batch_ptr,
+    uint16_t* dev_gate_scratch,
+    float* dev_acc_out,
+    int inter_dim,
+    int hidden_dim
+) {
+    if (batch_ptr == nullptr || batch_ptr->k_count <= 0 || batch_ptr->k_count > 8) {
+        return -1;
+    }
+    if (inter_dim <= 0 || hidden_dim <= 0 || (inter_dim % 64) != 0 || (hidden_dim % 64) != 0) {
+        return -1;
+    }
+    Gemma4MoeBatchArgs batch = *batch_ptr;
+    dim3 grid_g((inter_dim + 3) / 4, batch.k_count);
+    grouped_q2_affine_gemv_geglu_f16_kernel<<<grid_g, 128, 0, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_x),
+        batch,
+        reinterpret_cast<__half*>(dev_gate_scratch),
+        inter_dim,
+        hidden_dim
+    );
+    int grid_d = (hidden_dim + 3) / 4;
+    grouped_q2_affine_down_acc_f16_kernel<<<grid_d, 128, 0, g_active_stream>>>(
+        reinterpret_cast<const __half*>(dev_gate_scratch),
+        batch,
+        dev_acc_out,
+        hidden_dim,
+        inter_dim
+    );
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
 }

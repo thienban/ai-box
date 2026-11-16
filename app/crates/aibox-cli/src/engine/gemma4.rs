@@ -1405,6 +1405,57 @@ impl Gemma4Model {
         sc: &mut Gemma4GpuScratch<'_>,
     ) -> Result<Vec<f32>, String> {
         sc.x_dev.upload_f32_as_f16(moe_in).map_err(|e| e.to_string())?;
+        if !lazy.is_q4 && selected.len() <= 8 && sc.gate_dev.len() >= selected.len() * lazy.inter_rows {
+            let mut batch = aibox_kernels::gpu::Gemma4MoeBatchArgs::default();
+            batch.k_count = selected.len() as i32;
+            for (idx, &(expert_idx, weight)) in selected.iter().enumerate() {
+                let key = (lazy.layer_idx, expert_idx);
+                let exp_scale = expert_scales.and_then(|es| es.get(expert_idx).copied()).unwrap_or(1.0);
+                batch.weights[idx] = weight * exp_scale;
+                if sc.vram_experts.get(&key).is_some() {
+                    sc.vram_hits += 1;
+                } else {
+                    let (expert, from_ram) = self.load_or_cache_ram_expert(lazy, expert_idx)?;
+                    if from_ram {
+                        sc.ram_hits += 1;
+                    } else {
+                        sc.disk_misses += 1;
+                    }
+                    let _ = insert_or_reuse_vram_expert(
+                        &mut sc.vram_experts,
+                        &self.expert_ram_cache,
+                        sc.gpu,
+                        key,
+                        &expert,
+                    )?;
+                }
+            }
+            for (idx, &(expert_idx, _)) in selected.iter().enumerate() {
+                let entry = &sc.vram_experts.map[&(lazy.layer_idx, expert_idx)];
+                batch.wg[idx] = entry.gate.w.as_ptr();
+                batch.sg[idx] = entry.gate.s.as_ptr();
+                batch.zg[idx] = entry.gate.z.as_ptr();
+                batch.wu[idx] = entry.up.w.as_ptr();
+                batch.su[idx] = entry.up.s.as_ptr();
+                batch.zu[idx] = entry.up.z.as_ptr();
+                batch.wd[idx] = entry.down.w.as_ptr();
+                batch.sd[idx] = entry.down.s.as_ptr();
+                batch.zd[idx] = entry.down.z.as_ptr();
+            }
+            sc.gpu
+                .gemma4_moe_q2_batch(
+                    &sc.x_dev,
+                    &batch,
+                    &mut sc.gate_dev,
+                    &mut sc.moe_acc_dev,
+                    lazy.inter_rows,
+                    lazy.down_rows,
+                )
+                .map_err(|e| e.to_string())?;
+            let mut moe_out = vec![0.0f32; lazy.down_rows];
+            sc.moe_acc_dev.download(&mut moe_out).map_err(|e| e.to_string())?;
+            return Ok(moe_out);
+        }
         for (idx, &(expert_idx, weight)) in selected.iter().enumerate() {
             let key = (lazy.layer_idx, expert_idx);
             let exp_scale = expert_scales.and_then(|es| es.get(expert_idx).copied()).unwrap_or(1.0);
