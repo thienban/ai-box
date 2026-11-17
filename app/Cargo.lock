@@ -6,6 +6,14 @@ version = 4
 name = "aibox"
 version = "0.1.0"
 dependencies = [
+ "aibox-core",
+ "aibox-kernels",
+]
+
+[[package]]
+name = "aibox-core"
+version = "0.1.0"
+dependencies = [
  "aibox-kernels",
 ]
 

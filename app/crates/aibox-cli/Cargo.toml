@@ -6,4 +6,5 @@ license.workspace = true
 description = "CLI et moteur d'inférence local AI Box (SafeTensors + T-MAC)"
 
 [dependencies]
+aibox-core = { path = "../aibox-core" }
 aibox-kernels = { path = "../aibox-kernels" }

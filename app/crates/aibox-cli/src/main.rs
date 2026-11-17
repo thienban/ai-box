@@ -1,23 +1,19 @@
 //! Point d'entrée CLI du binaire `aibox` (SERV-01 / SERV-02).
 
-mod engine;
-mod json;
-mod models;
-mod safetensors;
-mod sampling;
 mod server;
-mod tokenizer;
 
 use std::env;
 use std::process::ExitCode;
 
+use aibox_core::engine::{
+    build_synthetic_tensor, load_model_from_dir, EmbeddingTable, LmHead, ModelConfig,
+    TernaryLayerWeights, TransformerModel,
+};
+use aibox_core::models;
+use aibox_core::sampling::SamplingParams;
+use aibox_core::tokenizer::SimpleTokenizer;
 use aibox_kernels::tensor::{f32_to_f16, pack_ternary_2bit_rows};
 use aibox_kernels::{select_backend, ComputeBackend, TmacCpuBackend, GROUP_SIZE};
-use engine::{
-    build_synthetic_tensor, EmbeddingTable, LmHead, ModelConfig, TernaryLayerWeights,
-    TransformerModel,
-};
-use sampling::SamplingParams;
 
 fn print_usage() {
     println!(
@@ -85,7 +81,7 @@ fn run_bench_forward() -> Result<(), String> {
     for layer_idx in 0..config.num_hidden_layers {
         layers.push(TernaryLayerWeights {
             attn_norm: vec![1.0; config.hidden_size],
-            block: engine::LayerBlock::Attention(engine::AttentionBlockWeights {
+            block: aibox_core::engine::LayerBlock::Attention(aibox_core::engine::AttentionBlockWeights {
                 attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, layer_idx + 1)?,
                 attn_k: build_synthetic_tensor(kv_dim, config.hidden_size, layer_idx + 2)?,
                 attn_v: build_synthetic_tensor(kv_dim, config.hidden_size, layer_idx + 3)?,
@@ -175,12 +171,13 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
         idx += 1;
     }
 
+    if !use_gpu && try_run_via_daemon(target, prompt, max_tokens, temperature)? {
+        return Ok(());
+    }
+
     let model_dir = resolve_model_path(target)?;
     println!("Chargement du modèle depuis {}...", model_dir.display());
-    let cfg_raw = std::fs::read_to_string(model_dir.join("config.json"))
-        .map_err(|e| format!("Failed to read config.json: {e}"))?;
-    let cfg_json = json::parse_json(&cfg_raw)?;
-    let tok = tokenizer::SimpleTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
+    let tok = SimpleTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
     let prompt_ids = tok.encode_chat(prompt);
 
     let backend = select_backend(use_gpu);
@@ -190,13 +187,8 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
         top_p: if temperature > 0.0 { 0.95 } else { 1.0 },
         seed: 42,
     };
-    let stats = if engine::gemma4::Gemma4Config::is_gemma4_json(&cfg_json) {
-        let model = engine::gemma4::Gemma4Model::load_from_dir(&model_dir)?;
-        model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &*backend)?
-    } else {
-        let model = TransformerModel::load_from_dir(&model_dir)?;
-        model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &*backend)?
-    };
+    let model = load_model_from_dir(&model_dir)?;
+    let stats = model.generate_tokens(&prompt_ids, max_tokens, tok.eos_token_id(), params, &*backend)?;
     let text = tok.decode(&stats.tokens);
     let decode_tok_s = (stats.tokens.len() as f64) / (stats.decode_ms / 1000.0).max(1e-6);
 
@@ -210,6 +202,62 @@ fn run_inference_cli(args: &[String]) -> Result<(), String> {
         decode_tok_s
     );
     Ok(())
+}
+
+fn try_run_via_daemon(
+    target: &str,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+) -> Result<bool, String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let addr = format!("{}:{}", server::DEFAULT_HOST, server::DEFAULT_PORT);
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &addr.parse().map_err(|e: std::net::AddrParseError| e.to_string())?,
+        std::time::Duration::from_millis(150),
+    ) else {
+        return Ok(false);
+    };
+
+    let model_name = aibox_core::json::escape_json_string(target);
+    let prompt_esc = aibox_core::json::escape_json_string(prompt);
+    let body = format!(
+        "{{\"model\":{model_name},\"messages\":[{{\"role\":\"user\",\"content\":{prompt_esc}}}],\"max_tokens\":{max_tokens},\"temperature\":{temperature},\"stream\":false}}"
+    );
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return Ok(false);
+    }
+    let mut resp = String::new();
+    if stream.read_to_string(&mut resp).is_err() || !resp.starts_with("HTTP/1.1 200 OK") {
+        return Ok(false);
+    }
+    let Some(json_start) = resp.find("\r\n\r\n") else {
+        return Ok(false);
+    };
+    let json_body = &resp[json_start + 4..];
+    let Ok(val) = aibox_core::json::parse_json(json_body) else {
+        return Ok(false);
+    };
+    let content = val
+        .as_object()
+        .and_then(|o| o.get("choices"))
+        .and_then(aibox_core::json::JsonValue::as_array)
+        .and_then(|c| c.first())
+        .and_then(aibox_core::json::JsonValue::as_object)
+        .and_then(|c| c.get("message"))
+        .and_then(aibox_core::json::JsonValue::as_object)
+        .and_then(|m| m.get("content"))
+        .and_then(aibox_core::json::JsonValue::as_str)
+        .unwrap_or("");
+    println!("[aibox daemon actif @ {addr}]");
+    println!("\n{content}");
+    Ok(true)
 }
 
 fn run_serve(args: &[String]) -> Result<(), String> {
@@ -228,6 +276,14 @@ fn run_serve(args: &[String]) -> Result<(), String> {
                 config.port = port_str
                     .parse::<u16>()
                     .map_err(|_| format!("Port invalide '{port_str}'"))?;
+            }
+            "--keep-alive" => {
+                idx += 1;
+                let val_str = args.get(idx).ok_or_else(|| "Valeur manquante pour --keep-alive".to_string())?;
+                let secs = val_str
+                    .parse::<u64>()
+                    .map_err(|_| format!("keep-alive invalide (secondes requises) : '{val_str}'"))?;
+                config.keep_alive = std::time::Duration::from_secs(secs);
             }
             "--model" => {
                 idx += 1;

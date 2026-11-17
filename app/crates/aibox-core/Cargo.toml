@@ -1,0 +1,9 @@
+[package]
+name = "aibox-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Moteur d'inférence unifié AI Box (SafeTensors, Qwen3/3.5, Gemma4 MoE)"
+
+[dependencies]
+aibox-kernels = { path = "../aibox-kernels" }

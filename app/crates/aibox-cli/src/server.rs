@@ -7,18 +7,18 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aibox_kernels::{select_backend, ComputeBackend};
 
-use crate::engine::{
-    build_synthetic_tensor, EmbeddingTable, LmHead, ModelConfig, TernaryLayerWeights,
-    TransformerModel,
+use aibox_core::engine::{
+    build_synthetic_tensor, load_model_from_dir, EmbeddingTable, LlmEngine, LmHead, ModelConfig,
+    TernaryLayerWeights, TransformerModel,
 };
-use crate::json::{escape_json_string, parse_json, JsonValue};
-use crate::models;
-use crate::sampling::SamplingParams;
-use crate::tokenizer::{SimpleTokenizer, TokenStreamDecoder};
+use aibox_core::json::{escape_json_string, parse_json, JsonValue};
+use aibox_core::models;
+use aibox_core::sampling::SamplingParams;
+use aibox_core::tokenizer::{SimpleTokenizer, TokenStreamDecoder};
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 11434;
@@ -27,6 +27,7 @@ const MAX_GENERATION_TOKENS: usize = 4096;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -34,6 +35,7 @@ pub struct ServerConfig {
     pub port: u16,
     pub model_dir: Option<PathBuf>,
     pub use_gpu: bool,
+    pub keep_alive: Duration,
 }
 
 impl Default for ServerConfig {
@@ -43,15 +45,22 @@ impl Default for ServerConfig {
             port: DEFAULT_PORT,
             model_dir: None,
             use_gpu: false,
+            keep_alive: DEFAULT_KEEP_ALIVE,
         }
     }
 }
 
+struct LoadedModel {
+    name: String,
+    engine: Box<dyn LlmEngine>,
+    tokenizer: Option<SimpleTokenizer>,
+    last_used: Instant,
+    keep_alive: Duration,
+}
+
 struct ServerState {
     backend: Box<dyn ComputeBackend>,
-    model: TransformerModel,
-    tokenizer: Option<SimpleTokenizer>,
-    inference_lock: Mutex<()>,
+    loaded: Mutex<LoadedModel>,
 }
 
 struct HttpRequest {
@@ -81,6 +90,7 @@ struct CompletionRequest {
     stream: bool,
     max_tokens: usize,
     sampling: SamplingParams,
+    keep_alive: Option<Duration>,
 }
 
 struct InferenceOutput {
@@ -143,16 +153,40 @@ pub fn serve_listener_with_config(listener: TcpListener, config: &ServerConfig) 
 fn build_server_state(server_cfg: &ServerConfig) -> Result<ServerState, String> {
     if let Some(ref model_dir) = server_cfg.model_dir {
         println!("Chargement du modèle réel depuis {}...", model_dir.display());
-        let model = TransformerModel::load_from_dir(model_dir)?;
+        let engine = load_model_from_dir(model_dir)?;
         let tokenizer = SimpleTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
+        let name = model_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(DEFAULT_MODEL_NAME)
+            .to_string();
         return Ok(ServerState {
             backend: select_backend(server_cfg.use_gpu),
-            model,
-            tokenizer: Some(tokenizer),
-            inference_lock: Mutex::new(()),
+            loaded: Mutex::new(LoadedModel {
+                name,
+                engine,
+                tokenizer: Some(tokenizer),
+                last_used: Instant::now(),
+                keep_alive: server_cfg.keep_alive,
+            }),
         });
     }
 
+    let demo_model = create_demo_model()?;
+
+    Ok(ServerState {
+        backend: select_backend(server_cfg.use_gpu),
+        loaded: Mutex::new(LoadedModel {
+            name: DEFAULT_MODEL_NAME.to_string(),
+            engine: Box::new(demo_model),
+            tokenizer: None,
+            last_used: Instant::now(),
+            keep_alive: server_cfg.keep_alive,
+        }),
+    })
+}
+
+fn create_demo_model() -> Result<TransformerModel, String> {
     let config = ModelConfig {
         hidden_size: 256,
         intermediate_size: 512,
@@ -171,7 +205,7 @@ fn build_server_state(server_cfg: &ServerConfig) -> Result<ServerState, String> 
     for idx in 0..config.num_hidden_layers {
         layers.push(TernaryLayerWeights {
             attn_norm: vec![1.0; config.hidden_size],
-            block: crate::engine::LayerBlock::Attention(crate::engine::AttentionBlockWeights {
+            block: aibox_core::engine::LayerBlock::Attention(aibox_core::engine::AttentionBlockWeights {
                 attn_q: build_synthetic_tensor(config.hidden_size, config.hidden_size, idx + 1)?,
                 attn_k: build_synthetic_tensor(kv_dim, config.hidden_size, idx + 2)?,
                 attn_v: build_synthetic_tensor(kv_dim, config.hidden_size, idx + 3)?,
@@ -186,20 +220,53 @@ fn build_server_state(server_cfg: &ServerConfig) -> Result<ServerState, String> 
             ffn_down: build_synthetic_tensor(config.hidden_size, config.intermediate_size, idx + 7)?,
         });
     }
-    let demo_model = TransformerModel {
+    Ok(TransformerModel {
         token_embeddings: EmbeddingTable::F32(vec![0.02; config.vocab_size * config.hidden_size]),
         layers,
         final_norm: vec![1.0; config.hidden_size],
         lm_head: LmHead::Ternary(build_synthetic_tensor(config.vocab_size, config.hidden_size, 99)?),
         config,
-    };
-
-    Ok(ServerState {
-        backend: select_backend(server_cfg.use_gpu),
-        model: demo_model,
-        tokenizer: None,
-        inference_lock: Mutex::new(()),
     })
+}
+
+fn ensure_model_loaded(
+    loaded: &mut LoadedModel,
+    requested: &str,
+    override_keep_alive: Option<Duration>,
+) -> Result<(), String> {
+    if let Some(ka) = override_keep_alive {
+        loaded.keep_alive = ka;
+    }
+    if loaded.name != DEFAULT_MODEL_NAME && loaded.last_used.elapsed() > loaded.keep_alive {
+        println!("TTL keep_alive expiré pour '{}', déchargement du modèle...", loaded.name);
+        loaded.engine = Box::new(create_demo_model()?);
+        loaded.tokenizer = None;
+        loaded.name = DEFAULT_MODEL_NAME.to_string();
+    }
+    let req_name = requested.trim();
+    if req_name.is_empty() || req_name == loaded.name || req_name == DEFAULT_MODEL_NAME {
+        loaded.last_used = Instant::now();
+        return Ok(());
+    }
+    let Ok(safe_id) = models::sanitize_repo_id(req_name) else {
+        loaded.last_used = Instant::now();
+        return Ok(());
+    };
+    let Ok(models_dir) = models::resolve_models_dir() else {
+        loaded.last_used = Instant::now();
+        return Ok(());
+    };
+    let candidate = models_dir.join(safe_id);
+    if models::verify_model_files(&candidate).is_err() {
+        loaded.last_used = Instant::now();
+        return Ok(());
+    }
+    println!("Basculement à chaud vers le modèle '{}'...", req_name);
+    loaded.engine = load_model_from_dir(&candidate)?;
+    loaded.tokenizer = Some(SimpleTokenizer::from_file(&candidate.join("tokenizer.json"))?);
+    loaded.name = req_name.to_string();
+    loaded.last_used = Instant::now();
+    Ok(())
 }
 
 fn is_allowed_local_origin(origin: &str) -> bool {
@@ -516,12 +583,17 @@ fn parse_completion_request(
         .unwrap_or(16);
 
     let sampling = parse_sampling_params(obj, options_obj);
+    let keep_alive = obj
+        .get("keep_alive")
+        .and_then(JsonValue::as_u64)
+        .map(Duration::from_secs);
     Ok(CompletionRequest {
         model,
         prompt,
         stream,
         max_tokens,
         sampling,
+        keep_alive,
     })
 }
 
@@ -571,9 +643,9 @@ fn parse_sampling_params(
     params
 }
 
-fn encode_prompt_ids(prompt: &str, state: &ServerState) -> Vec<usize> {
-    let vocab_size = state.model.config.vocab_size;
-    if let Some(ref tok) = state.tokenizer {
+fn encode_prompt_ids(prompt: &str, loaded: &LoadedModel) -> Vec<usize> {
+    let vocab_size = loaded.engine.vocab_size();
+    if let Some(ref tok) = loaded.tokenizer {
         let ids = tok.encode_chat(prompt);
         if ids.is_empty() { vec![1] } else { ids }
     } else if prompt.is_empty() {
@@ -588,13 +660,14 @@ fn encode_prompt_ids(prompt: &str, state: &ServerState) -> Vec<usize> {
 }
 
 fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<InferenceOutput, String> {
-    let _gpu_guard = state
-        .inference_lock
+    let mut loaded = state
+        .loaded
         .lock()
         .map_err(|_| "inference lock poisoned".to_string())?;
-    let prompt_ids = encode_prompt_ids(&req.prompt, state);
-    let eos_id = state.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
-    let stats = state.model.generate_tokens(
+    ensure_model_loaded(&mut loaded, &req.model, req.keep_alive)?;
+    let prompt_ids = encode_prompt_ids(&req.prompt, &loaded);
+    let eos_id = loaded.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
+    let stats = loaded.engine.generate_tokens(
         &prompt_ids,
         req.max_tokens,
         eos_id,
@@ -602,7 +675,7 @@ fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<Inferen
         &*state.backend,
     )?;
 
-    let full_text = if let Some(ref tok) = state.tokenizer {
+    let full_text = if let Some(ref tok) = loaded.tokenizer {
         tok.decode(&stats.tokens)
     } else {
         stats
@@ -635,10 +708,11 @@ fn stream_openai_sse(
     req: &CompletionRequest,
     state: &ServerState,
 ) -> Result<(), String> {
-    let _gpu_guard = state
-        .inference_lock
+    let mut loaded = state
+        .loaded
         .lock()
         .map_err(|_| "inference lock poisoned".to_string())?;
+    ensure_model_loaded(&mut loaded, &req.model, req.keep_alive)?;
     let headers = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/event-stream; charset=utf-8\r\n\
@@ -651,9 +725,9 @@ fn stream_openai_sse(
 
     let created = unix_timestamp_secs();
     let model_json = escape_json_string(&req.model);
-    let prompt_ids = encode_prompt_ids(&req.prompt, state);
-    let eos_id = state.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
-    let mut decoder = state.tokenizer.as_ref().map(TokenStreamDecoder::new);
+    let prompt_ids = encode_prompt_ids(&req.prompt, &loaded);
+    let eos_id = loaded.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
+    let mut decoder = loaded.tokenizer.as_ref().map(TokenStreamDecoder::new);
     let mut tok_idx = 0usize;
 
     let write_sse_delta = |s: &mut TcpStream, text: &str| -> Result<(), String> {
@@ -670,13 +744,13 @@ fn stream_openai_sse(
         s.flush().map_err(|e| e.to_string())
     };
 
-    state.model.generate_tokens_streaming(
+    loaded.engine.generate_tokens_streaming_dyn(
         &prompt_ids,
         req.max_tokens,
         eos_id,
         req.sampling,
         &*state.backend,
-        |tok| {
+        &mut |tok| {
             let chunk = if let Some(ref mut dec) = decoder {
                 dec.push(tok)
             } else if tok_idx == 0 {
@@ -709,10 +783,11 @@ fn stream_ollama_ndjson(
     state: &ServerState,
     is_chat: bool,
 ) -> Result<(), String> {
-    let _gpu_guard = state
-        .inference_lock
+    let mut loaded = state
+        .loaded
         .lock()
         .map_err(|_| "inference lock poisoned".to_string())?;
+    ensure_model_loaded(&mut loaded, &req.model, req.keep_alive)?;
     let headers = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/x-ndjson; charset=utf-8\r\n\
@@ -723,9 +798,9 @@ fn stream_ollama_ndjson(
     stream.flush().map_err(|e| e.to_string())?;
 
     let model_json = escape_json_string(&req.model);
-    let prompt_ids = encode_prompt_ids(&req.prompt, state);
-    let eos_id = state.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
-    let mut decoder = state.tokenizer.as_ref().map(TokenStreamDecoder::new);
+    let prompt_ids = encode_prompt_ids(&req.prompt, &loaded);
+    let eos_id = loaded.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
+    let mut decoder = loaded.tokenizer.as_ref().map(TokenStreamDecoder::new);
     let mut tok_idx = 0usize;
 
     let write_ndjson_chunk = |s: &mut TcpStream, text: &str| -> Result<(), String> {
@@ -748,13 +823,13 @@ fn stream_ollama_ndjson(
         s.flush().map_err(|e| e.to_string())
     };
 
-    let stats = state.model.generate_tokens_streaming(
+    let stats = loaded.engine.generate_tokens_streaming_dyn(
         &prompt_ids,
         req.max_tokens,
         eos_id,
         req.sampling,
         &*state.backend,
-        |tok| {
+        &mut |tok| {
             let chunk = if let Some(ref mut dec) = decoder {
                 dec.push(tok)
             } else if tok_idx == 0 {
@@ -835,6 +910,7 @@ mod tests {
             port: 0,
             model_dir: None,
             use_gpu: false,
+            keep_alive: Duration::from_secs(300),
         })
         .expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local addr");
@@ -928,5 +1004,18 @@ mod tests {
         assert!(!is_authorized(None, Some("secret")));
         assert!(!is_authorized(Some("Bearer wrong"), Some("secret")));
         assert!(is_authorized(Some("Bearer secret"), Some("secret")));
+    }
+
+    #[test]
+    fn keep_alive_unloads_idle_custom_model_back_to_demo() {
+        let mut loaded = LoadedModel {
+            name: "custom/model".to_string(),
+            engine: Box::new(create_demo_model().unwrap()),
+            tokenizer: None,
+            last_used: Instant::now() - Duration::from_secs(10),
+            keep_alive: Duration::from_secs(1),
+        };
+        ensure_model_loaded(&mut loaded, "", None).unwrap();
+        assert_eq!(loaded.name, DEFAULT_MODEL_NAME);
     }
 }

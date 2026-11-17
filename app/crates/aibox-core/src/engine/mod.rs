@@ -17,6 +17,99 @@ use crate::json::{parse_json, JsonValue};
 use crate::safetensors::SafeTensorsFile;
 use crate::sampling::{sample_token, SamplingParams, XorShift64};
 
+pub trait LlmEngine: Send + Sync {
+    fn vocab_size(&self) -> usize;
+
+    fn generate_tokens(
+        &self,
+        prompt_tokens: &[usize],
+        max_new_tokens: usize,
+        eos_token_id: Option<usize>,
+        params: SamplingParams,
+        backend: &dyn ComputeBackend,
+    ) -> Result<GenerationStats, String> {
+        self.generate_tokens_streaming_dyn(
+            prompt_tokens,
+            max_new_tokens,
+            eos_token_id,
+            params,
+            backend,
+            &mut |_| Ok(()),
+        )
+    }
+
+    fn generate_tokens_streaming_dyn(
+        &self,
+        prompt_tokens: &[usize],
+        max_new_tokens: usize,
+        eos_token_id: Option<usize>,
+        params: SamplingParams,
+        backend: &dyn ComputeBackend,
+        on_token: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<GenerationStats, String>;
+}
+
+impl LlmEngine for TransformerModel {
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    fn generate_tokens_streaming_dyn(
+        &self,
+        prompt_tokens: &[usize],
+        max_new_tokens: usize,
+        eos_token_id: Option<usize>,
+        params: SamplingParams,
+        backend: &dyn ComputeBackend,
+        on_token: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<GenerationStats, String> {
+        self.generate_tokens_streaming(
+            prompt_tokens,
+            max_new_tokens,
+            eos_token_id,
+            params,
+            backend,
+            on_token,
+        )
+    }
+}
+
+impl LlmEngine for gemma4::Gemma4Model {
+    fn vocab_size(&self) -> usize {
+        self.config.base.vocab_size
+    }
+
+    fn generate_tokens_streaming_dyn(
+        &self,
+        prompt_tokens: &[usize],
+        max_new_tokens: usize,
+        eos_token_id: Option<usize>,
+        params: SamplingParams,
+        backend: &dyn ComputeBackend,
+        on_token: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<GenerationStats, String> {
+        self.generate_tokens_streaming(
+            prompt_tokens,
+            max_new_tokens,
+            eos_token_id,
+            params,
+            backend,
+            on_token,
+        )
+    }
+}
+
+pub fn load_model_from_dir(model_dir: &Path) -> Result<Box<dyn LlmEngine>, String> {
+    let cfg_raw = fs::read_to_string(model_dir.join("config.json"))
+        .map_err(|e| format!("Failed to read config.json: {e}"))?;
+    let cfg_json = parse_json(&cfg_raw)?;
+    if gemma4::Gemma4Config::is_gemma4_json(&cfg_json) {
+        Ok(Box::new(gemma4::Gemma4Model::load_from_dir(model_dir)?))
+    } else {
+        Ok(Box::new(TransformerModel::load_from_dir(model_dir)?))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ModelConfig {
     pub hidden_size: usize,

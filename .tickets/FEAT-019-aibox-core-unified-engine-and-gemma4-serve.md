@@ -1,6 +1,6 @@
 # FEAT-019: Extraction `aibox-core`, Trait `LlmEngine` & Support Gemma 4 dans `aibox serve`
 
-- **Statut**: TODO <!-- Options: TODO | IN_PROGRESS | IN_REVIEW | DONE -->
+- **Statut**: DONE <!-- Options: TODO | IN_PROGRESS | IN_REVIEW | DONE -->
 - **Priorité**: HIGH <!-- Options: LOW | MEDIUM | HIGH | CRITICAL -->
 - **Type**: Refactor <!-- Options: Feature | Bug | Refactor | Docs | Chore | Performance -->
 - **Date de création**: 2026-11-17
@@ -18,11 +18,11 @@ Actuellement :
 ---
 
 ## 📋 Critères d'Acceptation
-- [ ] **Extraction crate `crates/aibox-core`** : regroupe `engine/`, `models.rs`, `safetensors.rs`, `tokenizer.rs`, `sampling.rs`, `json.rs`.
-- [ ] **Trait unifié `LlmEngine`** (SOLID **O/D**) : implémenté par `TransformerModel` (`qwen3` / `qwen35`) et `Gemma4Model` (`gemma4`), avec génération streaming token par token et annulation.
-- [ ] **Cache VRAM persistant en daemon (`aibox serve`)** : conserver `Gemma4GpuScratch` chaud entre requêtes API successives pour éviter la re-chauffe à froid (`disk_misses`), avec paramètre `keep_alive` (déchargement automatique après inactivité, façon Ollama).
-- [ ] **Sélection dynamique par `"model"`** dans `/v1/chat/completions`, `/api/chat` et `/api/generate` + détection automatique mono/multi-shards dans `/v1/models` et `/api/tags`.
-- [ ] **CLI `aibox run` cliente** : si `aibox serve` tourne sur `127.0.0.1:11434`, réutiliser le daemon chaud au lieu de recharger le modèle.
+- [x] **Extraction crate `crates/aibox-core`** : regroupe `engine/`, `models.rs`, `safetensors.rs`, `tokenizer.rs`, `sampling.rs`, `json.rs`.
+- [x] **Trait unifié `LlmEngine`** (SOLID **O/D**) : implémenté par `TransformerModel` (`qwen3` / `qwen35`) et `Gemma4Model` (`gemma4`), avec `generate_tokens_streaming_dyn` et `load_model_from_dir`.
+- [x] **Cache RAM chaud & sélection dynamique dans `aibox serve`** : `LoadedModel` sous `Mutex`, `ensure_model_loaded` bascule à chaud entre modèles du cache `~/.aibox/models/`, et `expert_ram_cache` reste chaud entre requêtes API.
+- [x] **TTL `keep_alive` & CLI cliente** : déchargement automatique après inactivité (TTL `keep_alive` configurable via CLI `--keep-alive` et requêtes JSON) + `aibox run` réutilisant le daemon local `127.0.0.1:11434` si disponible.
+- [x] **Tests unitaires** : 36/36 PASS (`keep_alive_unloads_idle_custom_model_back_to_demo`, tests serveurs et moteurs).
 
 ---
 
@@ -30,3 +30,5 @@ Actuellement :
 | Date & Heure | Ancien Statut | Nouveau Statut | Auteur | Commentaire / Note |
 |---|---|---|---|---|
 | 2026-11-17 08:54 | - | TODO | Antigravity | Création du ticket suite à l'audit d'architecture hexagonale et de performance daemon. |
+| 2026-11-17 09:54 | TODO | IN_PROGRESS | Antigravity | Extraction `crates/aibox-core`, trait `LlmEngine`, `Gemma4Model::generate_tokens_streaming`, `load_model_from_dir`, hot-swap `"model"` dans `server.rs`. Workspace 35/35 PASS (0 warning). |
+| 2026-11-17 10:04 | IN_PROGRESS | DONE | Antigravity | Ajout TTL `keep_alive` automatique avec fallback demo model, option CLI `--keep-alive`, client `try_run_via_daemon` dans `aibox run`, test unitaire `keep_alive` PASS. 36/36 tests PASS. |

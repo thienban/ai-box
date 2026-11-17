@@ -1332,6 +1332,21 @@ impl Gemma4Model {
         params: SamplingParams,
         backend: &dyn ComputeBackend,
     ) -> Result<GenerationStats, String> {
+        self.generate_tokens_streaming(prompt_tokens, max_new_tokens, eos_token_id, params, backend, |_| Ok(()))
+    }
+
+    pub fn generate_tokens_streaming<F>(
+        &self,
+        prompt_tokens: &[usize],
+        max_new_tokens: usize,
+        eos_token_id: Option<usize>,
+        params: SamplingParams,
+        backend: &dyn ComputeBackend,
+        mut on_token: F,
+    ) -> Result<GenerationStats, String>
+    where
+        F: FnMut(usize) -> Result<(), String>,
+    {
         if prompt_tokens.is_empty() {
             return Err("prompt_tokens must not be empty".to_string());
         }
@@ -1398,7 +1413,11 @@ impl Gemma4Model {
         for step in 0..max_new_tokens {
             let next_tok = sample_token(&logits, params, &mut rng)?;
             generated.push(next_tok);
-            if Some(next_tok) == eos_token_id || step + 1 == max_new_tokens {
+            if Some(next_tok) == eos_token_id {
+                break;
+            }
+            on_token(next_tok)?;
+            if step + 1 == max_new_tokens {
                 break;
             }
             logits = self.forward_token_with_scratch(
