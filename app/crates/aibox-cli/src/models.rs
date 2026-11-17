@@ -56,13 +56,30 @@ pub fn list_cached_models() -> Result<Vec<(String, bool)>, String> {
     Ok(entries)
 }
 
-/// Vérifie la présence des 4 fichiers requis dans un dossier modèle.
+/// Vérifie la présence des fichiers requis (mono-fichier ou multi-shards) dans un dossier modèle.
 pub fn verify_model_files(model_dir: &Path) -> Result<(), String> {
-    for file in REQUIRED_MODEL_FILES {
+    for file in ["quant_config.json", "config.json", "tokenizer.json"] {
         let path = model_dir.join(file);
         if !path.is_file() {
             return Err(format!("Missing required file '{}'", path.display()));
         }
+    }
+    if model_dir.join("model.safetensors").is_file() {
+        return Ok(());
+    }
+    let has_shard = fs::read_dir(model_dir)
+        .map_err(|e| format!("Failed to read '{}': {e}", model_dir.display()))?
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            s.starts_with("model-") && s.ends_with(".safetensors") && entry.path().is_file()
+        });
+    if !has_shard {
+        return Err(format!(
+            "Missing 'model.safetensors' or 'model-*.safetensors' in '{}'",
+            model_dir.display()
+        ));
     }
     Ok(())
 }
@@ -178,5 +195,26 @@ mod tests {
         assert_eq!(sanitize_repo_id("org/bonsai-27b").unwrap(), "org--bonsai-27b");
         assert!(sanitize_repo_id("invalid-repo").is_err());
         assert!(sanitize_repo_id("../escape/repo").is_err());
+    }
+
+    #[test]
+    fn verifies_single_and_sharded_model_layouts() {
+        let base = std::env::temp_dir().join(format!("aibox_models_test_{}", std::process::id()));
+        let single = base.join("single");
+        let sharded = base.join("sharded");
+        fs::create_dir_all(&single).unwrap();
+        fs::create_dir_all(&sharded).unwrap();
+        for dir in [&single, &sharded] {
+            for f in ["quant_config.json", "config.json", "tokenizer.json"] {
+                fs::write(dir.join(f), "{}").unwrap();
+            }
+        }
+        assert!(verify_model_files(&single).is_err());
+        fs::write(single.join("model.safetensors"), "x").unwrap();
+        assert!(verify_model_files(&single).is_ok());
+
+        fs::write(sharded.join("model-00001-of-00002.safetensors"), "x").unwrap();
+        assert!(verify_model_files(&sharded).is_ok());
+        let _ = fs::remove_dir_all(&base);
     }
 }

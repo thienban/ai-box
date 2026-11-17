@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aibox_kernels::{select_backend, ComputeBackend};
 
@@ -23,6 +24,9 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 11434;
 const DEFAULT_MODEL_NAME: &str = "aibox-ternary-demo";
 const MAX_GENERATION_TOKENS: usize = 4096;
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -47,12 +51,28 @@ struct ServerState {
     backend: Box<dyn ComputeBackend>,
     model: TransformerModel,
     tokenizer: Option<SimpleTokenizer>,
+    inference_lock: Mutex<()>,
 }
 
 struct HttpRequest {
     method: String,
     path: String,
+    origin: Option<String>,
+    authorization: Option<String>,
     body: String,
+}
+
+enum HttpReadError {
+    BadRequest(String),
+    PayloadTooLarge,
+}
+
+struct ActiveConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct CompletionRequest {
@@ -93,16 +113,25 @@ pub fn serve_listener(listener: TcpListener) -> Result<(), String> {
 
 pub fn serve_listener_with_config(listener: TcpListener, config: &ServerConfig) -> Result<(), String> {
     let state = Arc::new(build_server_state(config)?);
+    let active_conns = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
-        let stream = match incoming {
+        let mut stream = match incoming {
             Ok(stream) => stream,
             Err(err) => {
                 eprintln!("Erreur connexion TCP : {err}");
                 continue;
             }
         };
+        let prev = active_conns.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_CONCURRENT_CONNECTIONS {
+            active_conns.fetch_sub(1, Ordering::AcqRel);
+            let _ = write_json_error(&mut stream, "503 Service Unavailable", "Too many concurrent connections");
+            continue;
+        }
+        let guard = ActiveConnGuard(Arc::clone(&active_conns));
         let state_ref = Arc::clone(&state);
         thread::spawn(move || {
+            let _conn_guard = guard;
             if let Err(err) = handle_connection(stream, &state_ref) {
                 eprintln!("Erreur traitement requête HTTP : {err}");
             }
@@ -120,6 +149,7 @@ fn build_server_state(server_cfg: &ServerConfig) -> Result<ServerState, String> 
             backend: select_backend(server_cfg.use_gpu),
             model,
             tokenizer: Some(tokenizer),
+            inference_lock: Mutex::new(()),
         });
     }
 
@@ -168,21 +198,91 @@ fn build_server_state(server_cfg: &ServerConfig) -> Result<ServerState, String> 
         backend: select_backend(server_cfg.use_gpu),
         model: demo_model,
         tokenizer: None,
+        inference_lock: Mutex::new(()),
     })
 }
 
+fn is_allowed_local_origin(origin: &str) -> bool {
+    let trimmed = origin.trim();
+    const ALLOWED_PREFIXES: [&str; 6] = [
+        "http://localhost",
+        "https://localhost",
+        "http://127.0.0.1",
+        "https://127.0.0.1",
+        "tauri://localhost",
+        "https://tauri.localhost",
+    ];
+    ALLOWED_PREFIXES.iter().any(|&prefix| {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            rest.is_empty() || rest.starts_with(':')
+        } else {
+            false
+        }
+    })
+}
+
+fn format_cors_headers(origin: Option<&str>) -> String {
+    let allow_origin = origin
+        .filter(|o| is_allowed_local_origin(o))
+        .unwrap_or("http://127.0.0.1");
+    format!(
+        "Access-Control-Allow-Origin: {allow_origin}\r\n\
+         Vary: Origin\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n"
+    )
+}
+
+fn is_authorized(auth_header: Option<&str>, expected_key: Option<&str>) -> bool {
+    let Some(expected) = expected_key.filter(|k| !k.is_empty()) else {
+        return true;
+    };
+    let Some(header) = auth_header else {
+        return false;
+    };
+    header
+        .trim()
+        .strip_prefix("Bearer ")
+        .is_some_and(|token| token.trim() == expected)
+}
+
 fn handle_connection(mut stream: TcpStream, state: &ServerState) -> Result<(), String> {
-    let req = read_http_request(&mut stream)?;
+    let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
+    let req = match read_http_request(&mut stream) {
+        Ok(req) => req,
+        Err(HttpReadError::PayloadTooLarge) => {
+            return write_json_error(&mut stream, "413 Payload Too Large", "Request body exceeds 4 MiB limit");
+        }
+        Err(HttpReadError::BadRequest(msg)) => return Err(msg),
+    };
     let path = req.path.split('?').next().unwrap_or("/");
+    let origin = req.origin.as_deref();
 
     if req.method == "OPTIONS" {
-        return write_http_response(&mut stream, "204 No Content", "text/plain", "");
+        if let Some(o) = origin {
+            if !is_allowed_local_origin(o) {
+                return write_json_error(&mut stream, "403 Forbidden", "Origin not allowed");
+            }
+        }
+        return write_http_response_with_origin(&mut stream, "204 No Content", "text/plain", "", origin);
+    }
+
+    if req.method == "POST" {
+        let api_key = std::env::var("AIBOX_API_KEY").ok();
+        if !is_authorized(req.authorization.as_deref(), api_key.as_deref()) {
+            return write_json_error(&mut stream, "401 Unauthorized", "Invalid or missing Bearer token");
+        }
     }
 
     match (req.method.as_str(), path) {
-        ("GET", "/") | ("GET", "/health") => {
-            write_http_response(&mut stream, "200 OK", "text/plain; charset=utf-8", "aibox is running")
-        }
+        ("GET", "/") | ("GET", "/health") => write_http_response_with_origin(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            "aibox is running",
+            origin,
+        ),
         ("GET", "/v1/models") => handle_openai_models(&mut stream),
         ("GET", "/api/tags") => handle_ollama_tags(&mut stream),
         ("POST", "/v1/chat/completions") => handle_openai_chat(&mut stream, &req.body, state),
@@ -192,40 +292,69 @@ fn handle_connection(mut stream: TcpStream, state: &ServerState) -> Result<(), S
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpReadError> {
+    let cloned = stream.try_clone().map_err(|e| HttpReadError::BadRequest(e.to_string()))?;
+    let mut reader = BufReader::new(cloned);
     let mut request_line = String::new();
-    let bytes = reader.read_line(&mut request_line).map_err(|e| e.to_string())?;
+    let bytes = reader
+        .read_line(&mut request_line)
+        .map_err(|e| HttpReadError::BadRequest(e.to_string()))?;
     if bytes == 0 {
-        return Err("Connexion fermée avant la ligne de requête".to_string());
+        return Err(HttpReadError::BadRequest("Connexion fermée avant la ligne de requête".to_string()));
     }
 
-    let mut parts = request_line.trim_end().split_whitespace();
+    let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("GET").to_uppercase();
     let path = parts.next().unwrap_or("/").to_string();
 
     let mut content_length = 0usize;
+    let mut origin = None;
+    let mut authorization = None;
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| HttpReadError::BadRequest(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
         }
         if let Some((name, value)) = trimmed.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("Content-Length") {
-                content_length = value.trim().parse::<usize>().unwrap_or(0);
+            let key = name.trim();
+            let val = value.trim();
+            if key.eq_ignore_ascii_case("Content-Length") {
+                content_length = val
+                    .parse::<usize>()
+                    .map_err(|_| HttpReadError::BadRequest("Invalid Content-Length".to_string()))?;
+                if content_length > MAX_BODY_BYTES {
+                    return Err(HttpReadError::PayloadTooLarge);
+                }
+            } else if key.eq_ignore_ascii_case("Origin") {
+                origin = Some(val.to_string());
+            } else if key.eq_ignore_ascii_case("Authorization") {
+                authorization = Some(val.to_string());
             }
         }
     }
 
     let mut body_buf = vec![0u8; content_length];
     if content_length > 0 {
-        reader.read_exact(&mut body_buf).map_err(|e| e.to_string())?;
+        reader
+            .read_exact(&mut body_buf)
+            .map_err(|e| HttpReadError::BadRequest(e.to_string()))?;
     }
     let body = String::from_utf8_lossy(&body_buf).to_string();
 
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        origin,
+        authorization,
+        body,
+    })
 }
 
 fn list_available_models() -> Vec<String> {
@@ -459,6 +588,10 @@ fn encode_prompt_ids(prompt: &str, state: &ServerState) -> Vec<usize> {
 }
 
 fn run_inference(req: &CompletionRequest, state: &ServerState) -> Result<InferenceOutput, String> {
+    let _gpu_guard = state
+        .inference_lock
+        .lock()
+        .map_err(|_| "inference lock poisoned".to_string())?;
     let prompt_ids = encode_prompt_ids(&req.prompt, state);
     let eos_id = state.tokenizer.as_ref().and_then(SimpleTokenizer::eos_token_id);
     let stats = state.model.generate_tokens(
@@ -502,14 +635,16 @@ fn stream_openai_sse(
     req: &CompletionRequest,
     state: &ServerState,
 ) -> Result<(), String> {
-    let headers = concat!(
-        "HTTP/1.1 200 OK\r\n",
-        "Content-Type: text/event-stream; charset=utf-8\r\n",
-        "Cache-Control: no-cache\r\n",
-        "Connection: close\r\n",
-        "Access-Control-Allow-Origin: *\r\n",
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n",
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n"
+    let _gpu_guard = state
+        .inference_lock
+        .lock()
+        .map_err(|_| "inference lock poisoned".to_string())?;
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream; charset=utf-8\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: close\r\n{}",
+        format_cors_headers(None)
     );
     stream.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
@@ -574,13 +709,15 @@ fn stream_ollama_ndjson(
     state: &ServerState,
     is_chat: bool,
 ) -> Result<(), String> {
-    let headers = concat!(
-        "HTTP/1.1 200 OK\r\n",
-        "Content-Type: application/x-ndjson; charset=utf-8\r\n",
-        "Connection: close\r\n",
-        "Access-Control-Allow-Origin: *\r\n",
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n",
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n"
+    let _gpu_guard = state
+        .inference_lock
+        .lock()
+        .map_err(|_| "inference lock poisoned".to_string())?;
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/x-ndjson; charset=utf-8\r\n\
+         Connection: close\r\n{}",
+        format_cors_headers(None)
     );
     stream.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
@@ -665,16 +802,23 @@ fn write_http_response(
     content_type: &str,
     body: &str,
 ) -> Result<(), String> {
+    write_http_response_with_origin(stream, status, content_type, body, None)
+}
+
+fn write_http_response_with_origin(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+    origin: Option<&str>,
+) -> Result<(), String> {
     let response = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n\
-         {body}",
-        body.len()
+         Connection: close\r\n{}{body}",
+        body.len(),
+        format_cors_headers(origin)
     );
     stream.write_all(response.as_bytes()).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())
@@ -759,5 +903,30 @@ mod tests {
         assert!(gen_resp.starts_with("HTTP/1.1 200 OK"));
         assert!(gen_resp.contains("\"response\":\"[tmac:"));
         assert!(gen_resp.contains("\"eval_count\":2"));
+    }
+
+    #[test]
+    fn rejects_oversized_content_length_and_enforces_cors_and_auth() {
+        let addr = spawn_test_server();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        stream.write_all(raw.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 413 Payload Too Large"));
+
+        assert!(is_allowed_local_origin("http://localhost:3000"));
+        assert!(is_allowed_local_origin("http://127.0.0.1:11434"));
+        assert!(is_allowed_local_origin("tauri://localhost"));
+        assert!(!is_allowed_local_origin("https://evil.example.com"));
+        assert!(!is_allowed_local_origin("http://localhost.evil.com"));
+
+        assert!(is_authorized(None, None));
+        assert!(!is_authorized(None, Some("secret")));
+        assert!(!is_authorized(Some("Bearer wrong"), Some("secret")));
+        assert!(is_authorized(Some("Bearer secret"), Some("secret")));
     }
 }
