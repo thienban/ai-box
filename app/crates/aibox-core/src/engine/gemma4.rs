@@ -756,7 +756,7 @@ impl<'a> Gemma4GpuScratch<'a> {
             .map(|l| l.num_kv_heads * l.head_dim)
             .max()
             .unwrap_or(max_dim);
-        let max_kv_seq = 512usize;
+        let max_kv_seq = 2048usize;
         let mut kv_k_dev = Vec::with_capacity(layers.len());
         let mut kv_v_dev = Vec::with_capacity(layers.len());
         for l in layers {
@@ -1372,7 +1372,7 @@ impl Gemma4Model {
                 };
                 if needs_init {
                     let free_bytes = gpu.vram_free_bytes();
-                    let reserved_bytes = 1520usize * 1024 * 1024;
+                    let reserved_bytes = 1850usize * 1024 * 1024;
                     let weights_per_exp = 3 * self.config.moe_intermediate_size * self.config.base.hidden_size;
                     let bytes_per_exp = if is_moe_q4 {
                         (weights_per_exp * 9) / 16
