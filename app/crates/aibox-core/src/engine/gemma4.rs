@@ -112,14 +112,15 @@ impl Gemma4Linear {
         self.forward_batch(input, 1, backend)
     }
 
-    fn forward_q4_into_dev(
+    fn forward_q4_batch_into_dev(
         &self,
         gpu: &GpuBackend,
         x_dev: &aibox_kernels::GpuBuffer<'_, u16>,
         out_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
+        m: usize,
     ) -> Result<usize, String> {
         let Self::Q4Affine(t) = self else {
-            return Err("forward_q4_into_dev requires Q4Affine".to_string());
+            return Err("forward_q4_batch_into_dev requires Q4Affine".to_string());
         };
         gpu.matmul_q4_affine_f16_dev(
             x_dev,
@@ -127,12 +128,21 @@ impl Gemma4Linear {
             &t.scales_fp16,
             &t.zeros_fp16,
             out_dev,
-            1,
+            m,
             t.n_rows,
             t.k_cols,
         )
         .map_err(|e| e.to_string())?;
         Ok(t.n_rows)
+    }
+
+    fn forward_q4_into_dev(
+        &self,
+        gpu: &GpuBackend,
+        x_dev: &aibox_kernels::GpuBuffer<'_, u16>,
+        out_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
+    ) -> Result<usize, String> {
+        self.forward_q4_batch_into_dev(gpu, x_dev, out_dev, 1)
     }
 
     fn forward_with_scratch(
@@ -237,8 +247,67 @@ impl Gemma4Linear {
         m: usize,
         backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
+        self.forward_batch_with_scratch(inputs, m, None, backend)
+    }
+
+    fn forward_batch_with_scratch(
+        &self,
+        inputs: &[f32],
+        m: usize,
+        scratch: Option<&mut Gemma4GpuScratch<'_>>,
+        backend: &dyn ComputeBackend,
+    ) -> Result<Vec<f32>, String> {
         if m == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(sc) = scratch {
+            match self {
+                Self::Q2Affine(t) => {
+                    if inputs.len() != m * t.k_cols {
+                        return Err(format!("Q2Affine batch input len {} != {}", inputs.len(), m * t.k_cols));
+                    }
+                    sc.ensure_batch_cap(m * t.n_rows.max(t.k_cols))?;
+                    sc.batch_x_dev.upload_f32_as_f16(inputs).map_err(|e| e.to_string())?;
+                    sc.gpu
+                        .matmul_q2_affine_f16_dev(
+                            &sc.batch_x_dev,
+                            &t.packed_weights,
+                            &t.scales_fp16,
+                            &t.zeros_fp16,
+                            &mut sc.batch_out_dev,
+                            m,
+                            t.n_rows,
+                            t.k_cols,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let mut out = vec![0.0f32; m * t.n_rows];
+                    sc.batch_out_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
+                    return Ok(out);
+                }
+                Self::Q4Affine(t) => {
+                    if inputs.len() != m * t.k_cols {
+                        return Err(format!("Q4Affine batch input len {} != {}", inputs.len(), m * t.k_cols));
+                    }
+                    sc.ensure_batch_cap(m * t.n_rows.max(t.k_cols))?;
+                    sc.batch_x_dev.upload_f32_as_f16(inputs).map_err(|e| e.to_string())?;
+                    sc.gpu
+                        .matmul_q4_affine_f16_dev(
+                            &sc.batch_x_dev,
+                            &t.packed_weights,
+                            &t.scales_fp16,
+                            &t.zeros_fp16,
+                            &mut sc.batch_out_dev,
+                            m,
+                            t.n_rows,
+                            t.k_cols,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let mut out = vec![0.0f32; m * t.n_rows];
+                    sc.batch_out_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
+                    return Ok(out);
+                }
+                Self::Dense { .. } => {}
+            }
         }
         if let Some(gpu) = backend.as_gpu() {
             match self {
@@ -525,39 +594,67 @@ pub struct Gemma4Model {
 
 unsafe impl Send for Gemma4GpuScratch<'_> {}
 
-fn load_affine_slice_from_st(
-    st: &mut SafeTensorsFile,
-    prefix: &str,
+/// Charge les trois tenseurs (`gate`/`up`/`down`) d'un expert en une seule passe de
+/// lectures disque parallèles (9 tranches : poids + scales + zeros par tenseur).
+fn load_expert_weights_from_st(
+    st: &SafeTensorsFile,
+    layer_idx: usize,
     expert_idx: usize,
-    rows_per_expert: usize,
-    k_cols: usize,
+    inter_rows: usize,
+    hidden_size: usize,
+    down_rows: usize,
     is_q4: bool,
-) -> Result<Gemma4Linear, String> {
+) -> Result<Gemma4ExpertWeights, String> {
     let bytes_per_group = if is_q4 {
         aibox_kernels::Q4_PACKED_BYTES_PER_GROUP
     } else {
         aibox_kernels::Q2_PACKED_BYTES_PER_GROUP
     };
-    let groups_per_row = k_cols / aibox_kernels::Q2_GROUP_SIZE;
-    let w_bytes = rows_per_expert * groups_per_row * bytes_per_group;
-    let s_elems = rows_per_expert * groups_per_row;
-    let s_bytes = s_elems * 2;
-    let w_raw = st.read_tensor_slice(&format!("{prefix}.weight"), expert_idx * w_bytes, w_bytes)?;
-    let s_raw = st.read_tensor_slice(&format!("{prefix}.scales"), expert_idx * s_bytes, s_bytes)?;
-    let z_raw = st.read_tensor_slice(&format!("{prefix}.zeros"), expert_idx * s_bytes, s_bytes)?;
-    let scales_fp16: Vec<u16> = s_raw.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
-    let zeros_fp16: Vec<u16> = z_raw.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
-    if is_q4 {
-        Ok(Gemma4Linear::Q4Affine(
-            Q4AffineTensor::from_raw(rows_per_expert, k_cols, w_raw, scales_fp16, zeros_fp16)
-                .map_err(|e| e.to_string())?,
-        ))
-    } else {
-        Ok(Gemma4Linear::Q2Affine(
-            Q2AffineTensor::from_raw(rows_per_expert, k_cols, w_raw, scales_fp16, zeros_fp16)
-                .map_err(|e| e.to_string())?,
-        ))
+    let p = format!("blk.{layer_idx}");
+    let shapes = [
+        (format!("{p}.ffn_gate_exps"), inter_rows, hidden_size),
+        (format!("{p}.ffn_up_exps"), inter_rows, hidden_size),
+        (format!("{p}.ffn_down_exps"), down_rows, inter_rows),
+    ];
+    let mut pending: Vec<(String, usize, usize)> = Vec::with_capacity(9);
+    let mut dims: Vec<(usize, usize)> = Vec::with_capacity(3);
+    for (base, rows, cols) in &shapes {
+        let groups_per_row = cols / aibox_kernels::Q2_GROUP_SIZE;
+        let w_bytes = rows * groups_per_row * bytes_per_group;
+        let s_bytes = rows * groups_per_row * 2;
+        pending.push((format!("{base}.weight"), expert_idx * w_bytes, w_bytes));
+        pending.push((format!("{base}.scales"), expert_idx * s_bytes, s_bytes));
+        pending.push((format!("{base}.zeros"), expert_idx * s_bytes, s_bytes));
+        dims.push((*rows, *cols));
     }
+    let reqs: Vec<(&str, usize, usize)> = pending
+        .iter()
+        .map(|(name, off, len)| (name.as_str(), *off, *len))
+        .collect();
+    let mut bufs = st.read_tensor_slices_parallel(&reqs)?;
+    let mut linear: Vec<Gemma4Linear> = Vec::with_capacity(3);
+    for (i, (rows, cols)) in dims.into_iter().enumerate() {
+        let w_raw = std::mem::take(&mut bufs[i * 3]);
+        let s_raw = std::mem::take(&mut bufs[i * 3 + 1]);
+        let z_raw = std::mem::take(&mut bufs[i * 3 + 2]);
+        let scales_fp16: Vec<u16> = s_raw.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        let zeros_fp16: Vec<u16> = z_raw.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        linear.push(if is_q4 {
+            Gemma4Linear::Q4Affine(
+                Q4AffineTensor::from_raw(rows, cols, w_raw, scales_fp16, zeros_fp16).map_err(|e| e.to_string())?,
+            )
+        } else {
+            Gemma4Linear::Q2Affine(
+                Q2AffineTensor::from_raw(rows, cols, w_raw, scales_fp16, zeros_fp16).map_err(|e| e.to_string())?,
+            )
+        });
+    }
+    let mut it = linear.into_iter();
+    Ok(Gemma4ExpertWeights {
+        gate: it.next().ok_or_else(|| "missing gate expert tensor".to_string())?,
+        up: it.next().ok_or_else(|| "missing up expert tensor".to_string())?,
+        down: it.next().ok_or_else(|| "missing down expert tensor".to_string())?,
+    })
 }
 
 struct VramLinearBufs<'a> {
@@ -699,12 +796,66 @@ fn insert_or_reuse_vram_expert<'a>(
     Ok(unsafe { &*ptr })
 }
 
+/// Accumulateurs de profilage par étape, activés par `AIBOX_GEMMA4_PROFILE`.
+/// Couvre les appels `forward_token_with_scratch` (décodage) ; les compteurs
+/// `h2d`/`d2h` comptent les transferts hôte<->device du hidden state / logits.
+#[derive(Default)]
+struct Gemma4Prof {
+    attn_ns: u128,
+    resid_ns: u128,
+    ffn_ns: u128,
+    /// Sous-part de `ffn_ns` passée à charger/uploader des experts absents de la VRAM.
+    load_ns: u128,
+    /// Ventilation de `load_ns` : hits RAM (upload seul) vs misses disque (lecture + upload).
+    load_ram_ns: u128,
+    load_disk_ns: u128,
+    logits_ns: u128,
+    h2d: usize,
+    d2h: usize,
+    layers: usize,
+}
+
+impl Gemma4Prof {
+    fn report(&self, tokens: usize) {
+        let total = self.attn_ns + self.resid_ns + self.ffn_ns + self.logits_ns;
+        let ms = |ns: u128| ns as f64 / 1e6;
+        let pct = |ns: u128| if total > 0 { 100.0 * ns as f64 / total as f64 } else { 0.0 };
+        eprintln!(
+            "[Gemma4 Profile] decode: tokens={tokens} layers={} h2d={} d2h={}",
+            self.layers, self.h2d, self.d2h
+        );
+        eprintln!(
+            "[Gemma4 Profile]   attn={:.1}ms ({:.1}%)  resid+glue={:.1}ms ({:.1}%)  ffn/moe={:.1}ms ({:.1}%)  logits={:.1}ms ({:.1}%)",
+            ms(self.attn_ns), pct(self.attn_ns),
+            ms(self.resid_ns), pct(self.resid_ns),
+            ms(self.ffn_ns), pct(self.ffn_ns),
+            ms(self.logits_ns), pct(self.logits_ns),
+        );
+        eprintln!(
+            "[Gemma4 Profile]   dont expert-load={:.1}ms ({:.1}% du total) ; expert-compute={:.1}ms ({:.1}%)",
+            ms(self.load_ns), pct(self.load_ns),
+            ms(self.ffn_ns.saturating_sub(self.load_ns)), pct(self.ffn_ns.saturating_sub(self.load_ns)),
+        );
+        let load_pct = |ns: u128| if self.load_ns > 0 { 100.0 * ns as f64 / self.load_ns as f64 } else { 0.0 };
+        eprintln!(
+            "[Gemma4 Profile]     load-ram={:.1}ms ({:.1}% du load)  load-disk={:.1}ms ({:.1}%)",
+            ms(self.load_ram_ns), load_pct(self.load_ram_ns),
+            ms(self.load_disk_ns), load_pct(self.load_disk_ns),
+        );
+    }
+}
+
 struct Gemma4GpuScratch<'a> {
     gpu: &'a GpuBackend,
+    hidden_dev: aibox_kernels::GpuBuffer<'a, u16>,
     x_dev: aibox_kernels::GpuBuffer<'a, u16>,
     out_dev: aibox_kernels::GpuBuffer<'a, u16>,
     gate_dev: aibox_kernels::GpuBuffer<'a, u16>,
     up_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    batch_x_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    batch_gate_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    batch_up_dev: aibox_kernels::GpuBuffer<'a, u16>,
+    batch_out_dev: aibox_kernels::GpuBuffer<'a, u16>,
     q_dev: aibox_kernels::GpuBuffer<'a, u16>,
     k_dev: aibox_kernels::GpuBuffer<'a, u16>,
     v_dev: aibox_kernels::GpuBuffer<'a, u16>,
@@ -723,6 +874,8 @@ struct Gemma4GpuScratch<'a> {
     vram_hits: usize,
     ram_hits: usize,
     disk_misses: usize,
+    prof_on: bool,
+    prof: Gemma4Prof,
 }
 
 impl Drop for Gemma4GpuScratch<'_> {
@@ -768,12 +921,18 @@ impl<'a> Gemma4GpuScratch<'a> {
         let stage_s_elems = 512 * 1024;
         let pinned_cap = stage_w_bytes + 2 * stage_s_elems * std::mem::size_of::<u16>();
         let pinned_stage = gpu.alloc_pinned_bytes(pinned_cap).map_err(|e| e.to_string())?;
+        let init_batch_cap = 16 * max_dim;
         Ok(Self {
             gpu,
+            hidden_dev: gpu.alloc_f16(cfg.base.hidden_size).map_err(|e| e.to_string())?,
             x_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
             out_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
             gate_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
             up_dev: gpu.alloc_f16(max_dim).map_err(|e| e.to_string())?,
+            batch_x_dev: gpu.alloc_f16(init_batch_cap).map_err(|e| e.to_string())?,
+            batch_gate_dev: gpu.alloc_f16(init_batch_cap).map_err(|e| e.to_string())?,
+            batch_up_dev: gpu.alloc_f16(init_batch_cap).map_err(|e| e.to_string())?,
+            batch_out_dev: gpu.alloc_f16(init_batch_cap).map_err(|e| e.to_string())?,
             q_dev: gpu.alloc_f16(max_q_dim).map_err(|e| e.to_string())?,
             k_dev: gpu.alloc_f16(max_kv_dim).map_err(|e| e.to_string())?,
             v_dev: gpu.alloc_f16(max_kv_dim).map_err(|e| e.to_string())?,
@@ -792,7 +951,20 @@ impl<'a> Gemma4GpuScratch<'a> {
             vram_hits: 0,
             ram_hits: 0,
             disk_misses: 0,
+            prof_on: std::env::var("AIBOX_GEMMA4_PROFILE").is_ok(),
+            prof: Gemma4Prof::default(),
         })
+    }
+
+    fn ensure_batch_cap(&mut self, needed: usize) -> Result<(), String> {
+        if self.batch_x_dev.len() < needed {
+            let cap = needed.max(self.batch_x_dev.len() * 2);
+            self.batch_x_dev = self.gpu.alloc_f16(cap).map_err(|e| e.to_string())?;
+            self.batch_gate_dev = self.gpu.alloc_f16(cap).map_err(|e| e.to_string())?;
+            self.batch_up_dev = self.gpu.alloc_f16(cap).map_err(|e| e.to_string())?;
+            self.batch_out_dev = self.gpu.alloc_f16(cap).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -874,6 +1046,32 @@ pub fn route_top_k(
     Ok(scores)
 }
 
+const MIN_DYNAMIC_EXPERTS: usize = 4;
+
+pub fn truncate_by_cumulative_mass(selected: Vec<(usize, f32)>, top_p: f32) -> Vec<(usize, f32)> {
+    if top_p >= 1.0 || selected.len() <= MIN_DYNAMIC_EXPERTS {
+        return selected;
+    }
+    let mut cumulative = 0.0f32;
+    let mut keep = selected.len();
+    for (idx, &(_, weight)) in selected.iter().enumerate() {
+        cumulative += weight;
+        if cumulative >= top_p && idx + 1 >= MIN_DYNAMIC_EXPERTS {
+            keep = idx + 1;
+            break;
+        }
+    }
+    let mut truncated = selected;
+    truncated.truncate(keep);
+    let kept_mass: f32 = truncated.iter().map(|&(_, weight)| weight).sum();
+    if kept_mass > 0.0 {
+        for (_, weight) in &mut truncated {
+            *weight /= kept_mass;
+        }
+    }
+    truncated
+}
+
 fn attention_gqa_windowed(
     query: &[f32],
     keys_cache: &[f32],
@@ -924,18 +1122,12 @@ fn attention_gqa_windowed(
     out
 }
 
-fn try_forward_resident_geglu_vram(
-    normed: &[f32],
+fn run_resident_geglu_from_x_dev(
     expert: &Gemma4ExpertWeights,
+    post_norm_w: Option<&[f32]>,
+    eps: f32,
     sc: &mut Gemma4GpuScratch<'_>,
-) -> Result<Option<Vec<f32>>, String> {
-    if !matches!(
-        (&expert.gate, &expert.up, &expert.down),
-        (Gemma4Linear::Q4Affine(_), Gemma4Linear::Q4Affine(_), Gemma4Linear::Q4Affine(_))
-    ) {
-        return Ok(None);
-    }
-    sc.x_dev.upload_f32_as_f16(normed).map_err(|e| e.to_string())?;
+) -> Result<Vec<f32>, String> {
     let gate_rows = expert.gate.forward_q4_into_dev(sc.gpu, &sc.x_dev, &mut sc.gate_dev)?;
     let _ = expert.up.forward_q4_into_dev(sc.gpu, &sc.x_dev, &mut sc.up_dev)?;
     sc.gpu
@@ -943,8 +1135,51 @@ fn try_forward_resident_geglu_vram(
         .map_err(|e| e.to_string())?;
     let down_rows = expert.down.forward_q4_into_dev(sc.gpu, &sc.gate_dev, &mut sc.out_dev)?;
     let mut out = vec![0.0f32; down_rows];
-    sc.out_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
-    Ok(Some(out))
+    if let Some(norm_w) = post_norm_w {
+        sc.gpu
+            .rms_norm_f16(&sc.out_dev, norm_w, &mut sc.x_dev, 1, down_rows, eps)
+            .map_err(|e| e.to_string())?;
+        sc.x_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
+    } else {
+        sc.out_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+fn is_q4_expert(expert: &Gemma4ExpertWeights) -> bool {
+    matches!(
+        (&expert.gate, &expert.up, &expert.down),
+        (Gemma4Linear::Q4Affine(_), Gemma4Linear::Q4Affine(_), Gemma4Linear::Q4Affine(_))
+    )
+}
+
+fn try_forward_resident_geglu_vram(
+    normed: &[f32],
+    expert: &Gemma4ExpertWeights,
+    sc: &mut Gemma4GpuScratch<'_>,
+) -> Result<Option<Vec<f32>>, String> {
+    if !is_q4_expert(expert) {
+        return Ok(None);
+    }
+    sc.x_dev.upload_f32_as_f16(normed).map_err(|e| e.to_string())?;
+    run_resident_geglu_from_x_dev(expert, None, 0.0, sc).map(Some)
+}
+
+fn try_forward_resident_geglu_from_hidden_vram(
+    pre_norm_w: &[f32],
+    post_norm_w: Option<&[f32]>,
+    hidden_size: usize,
+    eps: f32,
+    expert: &Gemma4ExpertWeights,
+    sc: &mut Gemma4GpuScratch<'_>,
+) -> Result<Option<Vec<f32>>, String> {
+    if !is_q4_expert(expert) {
+        return Ok(None);
+    }
+    sc.gpu
+        .rms_norm_f16(&sc.hidden_dev, pre_norm_w, &mut sc.x_dev, 1, hidden_size, eps)
+        .map_err(|e| e.to_string())?;
+    run_resident_geglu_from_x_dev(expert, post_norm_w, eps, sc).map(Some)
 }
 
 fn forward_geglu_expert(
@@ -979,6 +1214,13 @@ fn rms_norm_batch(inputs: &[f32], weight: &[f32], m: usize, dim: usize, eps: f32
     out
 }
 
+fn apply_post_norm(values: Vec<f32>, post_norm_w: Option<&[f32]>, eps: f32) -> Vec<f32> {
+    match post_norm_w {
+        Some(w) => rms_norm(&values, w, eps),
+        None => values,
+    }
+}
+
 fn compute_router_input(hidden: &[f32], router_scale: Option<&[f32]>, eps: f32) -> Vec<f32> {
     let mean_sq: f32 = hidden.iter().map(|&x| x * x).sum::<f32>() / (hidden.len() as f32);
     let inv_rms = 1.0 / (mean_sq + eps).sqrt();
@@ -998,36 +1240,65 @@ fn forward_geglu_expert_batch(
     normed: &[f32],
     m: usize,
     expert: &Gemma4ExpertWeights,
+    mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
     backend: &dyn ComputeBackend,
 ) -> Result<Vec<f32>, String> {
-    let gate = expert.gate.forward_batch(normed, m, backend)?;
-    let up = expert.up.forward_batch(normed, m, backend)?;
+    if let Some(sc) = scratch.as_deref_mut() {
+        if let (
+            Gemma4Linear::Q4Affine(g),
+            Gemma4Linear::Q4Affine(_),
+            Gemma4Linear::Q4Affine(d),
+        ) = (&expert.gate, &expert.up, &expert.down)
+        {
+            let max_dim = g.n_rows.max(g.k_cols).max(d.n_rows);
+            sc.ensure_batch_cap(m * max_dim)?;
+            sc.batch_x_dev.upload_f32_as_f16(normed).map_err(|e| e.to_string())?;
+            let gate_rows = expert
+                .gate
+                .forward_q4_batch_into_dev(sc.gpu, &sc.batch_x_dev, &mut sc.batch_gate_dev, m)?;
+            let _ = expert
+                .up
+                .forward_q4_batch_into_dev(sc.gpu, &sc.batch_x_dev, &mut sc.batch_up_dev, m)?;
+            sc.gpu
+                .geglu_inplace_f16(&mut sc.batch_gate_dev, &sc.batch_up_dev, m * gate_rows)
+                .map_err(|e| e.to_string())?;
+            let down_rows = expert
+                .down
+                .forward_q4_batch_into_dev(sc.gpu, &sc.batch_gate_dev, &mut sc.batch_out_dev, m)?;
+            let mut out = vec![0.0f32; m * down_rows];
+            sc.batch_out_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
+            return Ok(out);
+        }
+    }
+    let gate = expert.gate.forward_batch_with_scratch(normed, m, scratch.as_deref_mut(), backend)?;
+    let up = expert.up.forward_batch_with_scratch(normed, m, scratch.as_deref_mut(), backend)?;
     let hidden: Vec<f32> = gate
         .iter()
         .zip(up.iter())
         .map(|(&g, &u)| gelu_tanh(g) * u)
         .collect();
-    expert.down.forward_batch(&hidden, m, backend)
+    expert.down.forward_batch_with_scratch(&hidden, m, scratch, backend)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn forward_vram_expert_batch(
     entry: &VramExpertEntry<'_>,
     gpu: &GpuBackend,
+    batch_x_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
+    batch_gate_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
+    batch_up_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
+    batch_out_dev: &mut aibox_kernels::GpuBuffer<'_, u16>,
     batch_in: &[f32],
     m_e: usize,
 ) -> Result<Vec<f32>, String> {
-    let mut x_dev = gpu.alloc_f16(m_e * entry.gate.k_cols).map_err(|e| e.to_string())?;
-    x_dev.upload_f32_as_f16(batch_in).map_err(|e| e.to_string())?;
-    let mut gate_dev = gpu.alloc_f16(m_e * entry.gate.n_rows).map_err(|e| e.to_string())?;
-    let mut up_dev = gpu.alloc_f16(m_e * entry.up.n_rows).map_err(|e| e.to_string())?;
-    entry.gate.forward_batch_into_dev(gpu, &x_dev, &mut gate_dev, m_e)?;
-    entry.up.forward_batch_into_dev(gpu, &x_dev, &mut up_dev, m_e)?;
-    gpu.geglu_inplace_f16(&mut gate_dev, &up_dev, m_e * entry.gate.n_rows)
+    batch_x_dev.upload_f32_as_f16(batch_in).map_err(|e| e.to_string())?;
+    entry.gate.forward_batch_into_dev(gpu, batch_x_dev, batch_gate_dev, m_e)?;
+    entry.up.forward_batch_into_dev(gpu, batch_x_dev, batch_up_dev, m_e)?;
+    gpu.geglu_inplace_f16(batch_gate_dev, batch_up_dev, m_e * entry.gate.n_rows)
         .map_err(|e| e.to_string())?;
-    let mut out_dev = gpu.alloc_f16(m_e * entry.down.n_rows).map_err(|e| e.to_string())?;
-    entry.down.forward_batch_into_dev(gpu, &gate_dev, &mut out_dev, m_e)?;
+    entry.down.forward_batch_into_dev(gpu, batch_gate_dev, batch_out_dev, m_e)?;
     let mut out = vec![0.0f32; m_e * entry.down.n_rows];
-    out_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
+    batch_out_dev.download_as_f32(&mut out).map_err(|e| e.to_string())?;
     Ok(out)
 }
 
@@ -1372,7 +1643,11 @@ impl Gemma4Model {
                 };
                 if needs_init {
                     let free_bytes = gpu.vram_free_bytes();
-                    let reserved_bytes = 1850usize * 1024 * 1024;
+                    let reserved_mb = std::env::var("AIBOX_MOE_RESERVE_MB")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(1850);
+                    let reserved_bytes = reserved_mb * 1024 * 1024;
                     let weights_per_exp = 3 * self.config.moe_intermediate_size * self.config.base.hidden_size;
                     let bytes_per_exp = if is_moe_q4 {
                         (weights_per_exp * 9) / 16
@@ -1389,8 +1664,9 @@ impl Gemma4Model {
                     };
                     if std::env::var("AIBOX_MOE_STATS").is_ok() {
                         eprintln!(
-                            "[VRAM Budget] free={:.0} MiB reserved=1400 MiB expert={:.2} MiB -> vram_cap={vram_cap}/{total_experts}",
+                            "[VRAM Budget] free={:.0} MiB reserved={} MiB expert={:.2} MiB -> vram_cap={vram_cap}/{total_experts}",
                             free_bytes as f64 / (1024.0 * 1024.0),
+                            reserved_mb,
                             bytes_per_exp as f64 / (1024.0 * 1024.0)
                         );
                     }
@@ -1403,6 +1679,9 @@ impl Gemma4Model {
                     sc.vram_hits = 0;
                     sc.ram_hits = 0;
                     sc.disk_misses = 0;
+                    if sc.prof_on {
+                        sc.prof = Gemma4Prof::default();
+                    }
                     Some(unsafe {
                         std::mem::transmute::<&mut Gemma4GpuScratch<'static>, &mut Gemma4GpuScratch<'_>>(sc)
                     })
@@ -1467,6 +1746,9 @@ impl Gemma4Model {
                     sc.vram_hits, sc.ram_hits, sc.disk_misses
                 );
             }
+            if sc.prof_on {
+                sc.prof.report(generated.len());
+            }
         }
         Ok(GenerationStats {
             tokens: generated,
@@ -1504,36 +1786,19 @@ impl Gemma4Model {
             .safetensors
             .as_ref()
             .ok_or_else(|| "Missing safetensors for LazyDisk expert".to_string())?;
-        let mut st = st_mutex
+        let st = st_mutex
             .lock()
             .map_err(|_| "safetensors mutex poisoned".to_string())?;
-        let p = format!("blk.{}", lazy.layer_idx);
-        let exp = Arc::new(Gemma4ExpertWeights {
-            gate: load_affine_slice_from_st(
-                &mut st,
-                &format!("{p}.ffn_gate_exps"),
-                expert_idx,
-                lazy.inter_rows,
-                lazy.hidden_size,
-                lazy.is_q4,
-            )?,
-            up: load_affine_slice_from_st(
-                &mut st,
-                &format!("{p}.ffn_up_exps"),
-                expert_idx,
-                lazy.inter_rows,
-                lazy.hidden_size,
-                lazy.is_q4,
-            )?,
-            down: load_affine_slice_from_st(
-                &mut st,
-                &format!("{p}.ffn_down_exps"),
-                expert_idx,
-                lazy.down_rows,
-                lazy.inter_rows,
-                lazy.is_q4,
-            )?,
-        });
+        let exp = Arc::new(load_expert_weights_from_st(
+            &st,
+            lazy.layer_idx,
+            expert_idx,
+            lazy.inter_rows,
+            lazy.hidden_size,
+            lazy.down_rows,
+            lazy.is_q4,
+        )?);
+        drop(st);
         let mut guard = self
             .expert_ram_cache
             .lock()
@@ -1547,10 +1812,13 @@ impl Gemma4Model {
         lazy: &LazyMoeExperts,
         selected: &[(usize, f32)],
         expert_scales: Option<&[f32]>,
-        moe_in: &[f32],
+        moe_norm_w: &[f32],
+        eps: f32,
         sc: &mut Gemma4GpuScratch<'_>,
     ) -> Result<Vec<f32>, String> {
-        sc.x_dev.upload_f32_as_f16(moe_in).map_err(|e| e.to_string())?;
+        sc.gpu
+            .rms_norm_f16(&sc.hidden_dev, moe_norm_w, &mut sc.x_dev, 1, lazy.hidden_size, eps)
+            .map_err(|e| e.to_string())?;
         if !lazy.is_q4 && selected.len() <= 8 && sc.gate_dev.len() >= selected.len() * lazy.inter_rows {
             let mut batch = aibox_kernels::gpu::Gemma4MoeBatchArgs::default();
             batch.k_count = selected.len() as i32;
@@ -1561,6 +1829,7 @@ impl Gemma4Model {
                 if sc.vram_experts.get(&key).is_some() {
                     sc.vram_hits += 1;
                 } else {
+                    let t_load = Instant::now();
                     let (expert, from_ram) = self.load_or_cache_ram_expert(lazy, expert_idx)?;
                     if from_ram {
                         sc.ram_hits += 1;
@@ -1574,6 +1843,15 @@ impl Gemma4Model {
                         key,
                         &expert,
                     )?;
+                    if sc.prof_on {
+                        let dt = t_load.elapsed().as_nanos();
+                        sc.prof.load_ns += dt;
+                        if from_ram {
+                            sc.prof.load_ram_ns += dt;
+                        } else {
+                            sc.prof.load_disk_ns += dt;
+                        }
+                    }
                 }
             }
             for (idx, &(expert_idx, _)) in selected.iter().enumerate() {
@@ -1600,6 +1878,9 @@ impl Gemma4Model {
                 .map_err(|e| e.to_string())?;
             let mut moe_out = vec![0.0f32; lazy.down_rows];
             sc.moe_acc_dev.download(&mut moe_out).map_err(|e| e.to_string())?;
+            if sc.prof_on {
+                sc.prof.d2h += 1;
+            }
             return Ok(moe_out);
         }
         for (idx, &(expert_idx, weight)) in selected.iter().enumerate() {
@@ -1612,6 +1893,7 @@ impl Gemma4Model {
                 forward_vram_geglu_expert_into_acc(unsafe { &*ptr }, sc, w, idx == 0)?;
                 continue;
             }
+            let t_load = Instant::now();
             let (expert, from_ram) = self.load_or_cache_ram_expert(lazy, expert_idx)?;
             if from_ram {
                 sc.ram_hits += 1;
@@ -1625,10 +1907,22 @@ impl Gemma4Model {
                 key,
                 &expert,
             )?;
+            if sc.prof_on {
+                let dt = t_load.elapsed().as_nanos();
+                sc.prof.load_ns += dt;
+                if from_ram {
+                    sc.prof.load_ram_ns += dt;
+                } else {
+                    sc.prof.load_disk_ns += dt;
+                }
+            }
             forward_vram_geglu_expert_into_acc(entry, sc, w, idx == 0)?;
         }
         let mut moe_out = vec![0.0f32; lazy.down_rows];
         sc.moe_acc_dev.download(&mut moe_out).map_err(|e| e.to_string())?;
+        if sc.prof_on {
+            sc.prof.d2h += 1;
+        }
         Ok(moe_out)
     }
 
@@ -1636,7 +1930,6 @@ impl Gemma4Model {
         &self,
         layer_idx: usize,
         layer: &Gemma4Layer,
-        normed_attn: &[f32],
         pos: usize,
         sc: &mut Gemma4GpuScratch<'_>,
     ) -> Result<Option<Vec<f32>>, String> {
@@ -1654,7 +1947,16 @@ impl Gemma4Model {
             }
         }
         let cfg = &self.config.base;
-        sc.x_dev.upload_f32_as_f16(normed_attn).map_err(|e| e.to_string())?;
+        sc.gpu
+            .rms_norm_f16(
+                &sc.hidden_dev,
+                &layer.attn_norm,
+                &mut sc.x_dev,
+                1,
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+            )
+            .map_err(|e| e.to_string())?;
         let _ = layer.attn_q.forward_q4_into_dev(sc.gpu, &sc.x_dev, &mut sc.q_dev)?;
         let _ = layer.attn_k.forward_q4_into_dev(sc.gpu, &sc.x_dev, &mut sc.k_dev)?;
         match &layer.attn_v {
@@ -1733,7 +2035,17 @@ impl Gemma4Model {
             .map_err(|e| e.to_string())?;
         let out_rows = layer.attn_o.forward_q4_into_dev(sc.gpu, &sc.ctx_dev, &mut sc.out_dev)?;
         let mut attn_out = vec![0.0f32; out_rows];
-        sc.out_dev.download_as_f32(&mut attn_out).map_err(|e| e.to_string())?;
+        if let Some(ref norm_w) = layer.post_attention_norm {
+            sc.gpu
+                .rms_norm_f16(&sc.out_dev, norm_w, &mut sc.x_dev, 1, out_rows, cfg.rms_norm_eps)
+                .map_err(|e| e.to_string())?;
+            sc.x_dev.download_as_f32(&mut attn_out).map_err(|e| e.to_string())?;
+        } else {
+            sc.out_dev.download_as_f32(&mut attn_out).map_err(|e| e.to_string())?;
+        }
+        if sc.prof_on {
+            sc.prof.d2h += 1;
+        }
         Ok(Some(attn_out))
     }
 
@@ -1783,6 +2095,21 @@ impl Gemma4Model {
         layer.attn_o.forward_with_scratch(&ctx, scratch, backend, true)
     }
 
+    fn forward_attention_cpu_path(
+        &self,
+        layer_idx: usize,
+        layer: &Gemma4Layer,
+        hidden: &[f32],
+        pos: usize,
+        kv_cache: &mut KvCache,
+        backend: &dyn ComputeBackend,
+    ) -> Result<Vec<f32>, String> {
+        let cfg = &self.config.base;
+        let normed_attn = rms_norm(hidden, &layer.attn_norm, cfg.rms_norm_eps);
+        let raw = self.forward_attention_cpu_fallback(layer_idx, layer, &normed_attn, pos, kv_cache, None, backend)?;
+        Ok(apply_post_norm(raw, layer.post_attention_norm.as_deref(), cfg.rms_norm_eps))
+    }
+
     fn forward_token_with_scratch(
         &self,
         token_id: usize,
@@ -1801,52 +2128,74 @@ impl Gemma4Model {
         for val in &mut hidden {
             *val *= emb_scale;
         }
+        if let Some(sc) = scratch.as_deref_mut() {
+            sc.hidden_dev.upload_f32_as_f16(&hidden).map_err(|e| e.to_string())?;
+        }
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let normed_attn = rms_norm(&hidden, &layer.attn_norm, cfg.rms_norm_eps);
-            let attn_out = if let Some(sc) = scratch.as_deref_mut() {
-                if let Some(vram_out) = self.try_forward_attention_vram(layer_idx, layer, &normed_attn, pos, sc)? {
-                    vram_out
-                } else {
-                    self.forward_attention_cpu_fallback(layer_idx, layer, &normed_attn, pos, kv_cache, None, backend)?
+            let t_attn = Instant::now();
+            let vram_attn = match scratch.as_deref_mut() {
+                Some(sc) => self.try_forward_attention_vram(layer_idx, layer, pos, sc)?,
+                None => None,
+            };
+            let attn_out = match vram_attn {
+                Some(vram_out) => vram_out,
+                None => self.forward_attention_cpu_path(layer_idx, layer, &hidden, pos, kv_cache, backend)?,
+            };
+            if let Some(sc) = scratch.as_deref_mut() {
+                if sc.prof_on {
+                    sc.prof.attn_ns += t_attn.elapsed().as_nanos();
+                    sc.prof.layers += 1;
                 }
-            } else {
-                self.forward_attention_cpu_fallback(layer_idx, layer, &normed_attn, pos, kv_cache, None, backend)?
-            };
-            let attn_out = if let Some(ref norm_w) = layer.post_attention_norm {
-                rms_norm(&attn_out, norm_w, cfg.rms_norm_eps)
-            } else {
-                attn_out
-            };
-            add_residual(&mut hidden, &attn_out);
+            }
 
-            let normed_ffn = rms_norm(&hidden, &layer.ffn_norm, cfg.rms_norm_eps);
+            let t_resid = Instant::now();
+            add_residual(&mut hidden, &attn_out);
+            if let Some(sc) = scratch.as_deref_mut() {
+                sc.hidden_dev.upload_f32_as_f16(&hidden).map_err(|e| e.to_string())?;
+                if sc.prof_on {
+                    sc.prof.resid_ns += t_resid.elapsed().as_nanos();
+                    sc.prof.h2d += 1;
+                }
+            }
+
+            let t_ffn = Instant::now();
             let mut ffn_out = match &layer.ffn {
                 Gemma4Ffn::Dense(dense_expert) => {
-                    forward_geglu_expert(&normed_ffn, dense_expert, scratch.as_deref_mut(), backend, true)?
+                    let vram_dense = match scratch.as_deref_mut() {
+                        Some(sc) => try_forward_resident_geglu_from_hidden_vram(
+                            &layer.ffn_norm,
+                            None,
+                            hidden_size,
+                            cfg.rms_norm_eps,
+                            dense_expert,
+                            sc,
+                        )?,
+                        None => None,
+                    };
+                    match vram_dense {
+                        Some(out) => out,
+                        None => {
+                            let normed_ffn = rms_norm(&hidden, &layer.ffn_norm, cfg.rms_norm_eps);
+                            forward_geglu_expert(&normed_ffn, dense_expert, scratch.as_deref_mut(), backend, true)?
+                        }
+                    }
                 }
                 Gemma4Ffn::Moe(moe) => {
                     let router_in = compute_router_input(&hidden, moe.router_scale.as_deref(), cfg.rms_norm_eps);
-                    let selected = route_top_k(
-                        &router_in,
-                        &moe.router,
-                        self.config.num_experts,
-                        self.effective_moe_top_k(),
-                    )?;
-                    let moe_in = if let Some(ref norm_w) = layer.pre_ffw_norm_2 {
-                        rms_norm(&hidden, norm_w, cfg.rms_norm_eps)
-                    } else {
-                        normed_ffn.clone()
-                    };
+                    let selected = self.route_experts_for_token(&router_in, &moe.router)?;
+                    let moe_norm_w = layer.pre_ffw_norm_2.as_deref().unwrap_or(&layer.ffn_norm);
                     let moe_out = match (&moe.experts, scratch.as_deref_mut()) {
                         (Gemma4Experts::LazyDisk(lazy), Some(sc)) => self.forward_moe_lazy_vram(
                             lazy,
                             &selected,
                             moe.expert_scales.as_deref(),
-                            &moe_in,
+                            moe_norm_w,
+                            cfg.rms_norm_eps,
                             sc,
                         )?,
                         _ => {
+                            let moe_in = rms_norm(&hidden, moe_norm_w, cfg.rms_norm_eps);
                             let mut acc_out = vec![0.0f32; hidden_size];
                             for (expert_idx, weight) in selected {
                                 let exp_vec = match &moe.experts {
@@ -1881,44 +2230,70 @@ impl Gemma4Model {
                             acc_out
                         }
                     };
-                    let mut out = if let Some(ref norm_w) = layer.post_ffw_norm_2 {
-                        rms_norm(&moe_out, norm_w, cfg.rms_norm_eps)
-                    } else {
-                        moe_out
-                    };
+                    let mut out = apply_post_norm(moe_out, layer.post_ffw_norm_2.as_deref(), cfg.rms_norm_eps);
                     if let Some(ref shared) = moe.shared_expert {
-                        let shared_vec =
-                            forward_geglu_expert(&normed_ffn, shared, scratch.as_deref_mut(), backend, true)?;
-                        let shared_vec = if let Some(ref norm_w) = layer.post_ffw_norm_1 {
-                            rms_norm(&shared_vec, norm_w, cfg.rms_norm_eps)
-                        } else {
-                            shared_vec
+                        let vram_shared = match scratch.as_deref_mut() {
+                            Some(sc) => try_forward_resident_geglu_from_hidden_vram(
+                                &layer.ffn_norm,
+                                layer.post_ffw_norm_1.as_deref(),
+                                hidden_size,
+                                cfg.rms_norm_eps,
+                                shared,
+                                sc,
+                            )?,
+                            None => None,
+                        };
+                        let shared_vec = match vram_shared {
+                            Some(v) => v,
+                            None => {
+                                let normed_ffn = rms_norm(&hidden, &layer.ffn_norm, cfg.rms_norm_eps);
+                                let raw = forward_geglu_expert(&normed_ffn, shared, scratch.as_deref_mut(), backend, true)?;
+                                apply_post_norm(raw, layer.post_ffw_norm_1.as_deref(), cfg.rms_norm_eps)
+                            }
                         };
                         add_residual(&mut out, &shared_vec);
                     }
                     out
                 }
             };
+            if let Some(sc) = scratch.as_deref_mut() {
+                if sc.prof_on {
+                    sc.prof.ffn_ns += t_ffn.elapsed().as_nanos();
+                }
+            }
+
+            let t_resid2 = Instant::now();
             if let Some(ref ple) = layer.ple_weights {
                 for (acc, &p) in ffn_out.iter_mut().zip(ple.iter()) {
                     *acc += p;
                 }
             }
-            let ffn_out = if let Some(ref norm_w) = layer.post_ffw_norm {
-                rms_norm(&ffn_out, norm_w, cfg.rms_norm_eps)
-            } else {
-                ffn_out
-            };
+            let ffn_out = apply_post_norm(ffn_out, layer.post_ffw_norm.as_deref(), cfg.rms_norm_eps);
             add_residual(&mut hidden, &ffn_out);
             if let Some(scale) = layer.layer_output_scale {
                 for val in &mut hidden {
                     *val *= scale;
                 }
             }
+            if let Some(sc) = scratch.as_deref_mut() {
+                sc.hidden_dev.upload_f32_as_f16(&hidden).map_err(|e| e.to_string())?;
+                if sc.prof_on {
+                    sc.prof.resid_ns += t_resid2.elapsed().as_nanos();
+                    sc.prof.h2d += 1;
+                }
+            }
         }
 
+        if let Some(sc) = scratch {
+            let t_logits = Instant::now();
+            let logits = self.compute_logits_from_hidden_dev(&hidden, sc)?;
+            if sc.prof_on {
+                sc.prof.logits_ns += t_logits.elapsed().as_nanos();
+            }
+            return Ok(logits);
+        }
         let final_hidden = rms_norm(&hidden, &self.final_norm, cfg.rms_norm_eps);
-        self.compute_logits_from_final_hidden(&final_hidden, scratch)
+        self.compute_logits_from_final_hidden(&final_hidden)
     }
 
     fn effective_moe_top_k(&self) -> usize {
@@ -1930,10 +2305,26 @@ impl Gemma4Model {
             .clamp(1, self.config.num_experts_per_tok)
     }
 
-    fn compute_logits_from_final_hidden(
+    fn effective_moe_top_p(&self) -> f32 {
+        static OVERRIDE_P: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *OVERRIDE_P.get_or_init(|| {
+            std::env::var("AIBOX_MOE_TOP_P")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .map(|p| p.clamp(0.5, 1.0))
+                .unwrap_or(1.0)
+        })
+    }
+
+    fn route_experts_for_token(&self, router_in: &[f32], router: &[f32]) -> Result<Vec<(usize, f32)>, String> {
+        let selected = route_top_k(router_in, router, self.config.num_experts, self.effective_moe_top_k())?;
+        Ok(truncate_by_cumulative_mass(selected, self.effective_moe_top_p()))
+    }
+
+    fn compute_logits_from_hidden_dev(
         &self,
-        final_hidden: &[f32],
-        scratch: Option<&mut Gemma4GpuScratch<'_>>,
+        hidden: &[f32],
+        sc: &mut Gemma4GpuScratch<'_>,
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.config.base;
         let hidden_size = cfg.hidden_size;
@@ -1942,36 +2333,71 @@ impl Gemma4Model {
             LmHead::TiedEmbedding => &self.token_embeddings,
             LmHead::Ternary(_) => return Err("Gemma4Model expects Dense or TiedEmbedding LmHead".to_string()),
         };
-        if let Some(sc) = scratch {
-            sc.x_dev.upload_f32_as_f16(final_hidden).map_err(|e| e.to_string())?;
-            match table {
-                EmbeddingTable::Quantized(tensor) => {
-                    sc.gpu
-                        .lm_head_quant_act_f16(
-                            &sc.x_dev,
-                            &tensor.packed_weights,
-                            &tensor.scales_fp16,
-                            &mut sc.logits_dev,
-                            cfg.vocab_size,
-                            hidden_size,
-                            tensor.bits,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let mut logits = vec![0.0f32; cfg.vocab_size];
-                    sc.logits_dev.download(&mut logits).map_err(|e| e.to_string())?;
-                    return Ok(logits);
-                }
-                EmbeddingTable::F16(data) => {
-                    sc.gpu
-                        .lm_head_f16_act_f16(&sc.x_dev, data, &mut sc.logits_dev, cfg.vocab_size, hidden_size)
-                        .map_err(|e| e.to_string())?;
-                    let mut logits = vec![0.0f32; cfg.vocab_size];
-                    sc.logits_dev.download(&mut logits).map_err(|e| e.to_string())?;
-                    return Ok(logits);
-                }
-                EmbeddingTable::F32(_) => {}
-            }
+        if matches!(table, EmbeddingTable::F32(_)) {
+            let final_hidden = rms_norm(hidden, &self.final_norm, cfg.rms_norm_eps);
+            return Ok(table.dot_all_rows(&final_hidden, cfg.vocab_size, hidden_size));
         }
+        sc.hidden_dev.upload_f32_as_f16(hidden).map_err(|e| e.to_string())?;
+        sc.gpu
+            .rms_norm_f16(
+                &sc.hidden_dev,
+                &self.final_norm,
+                &mut sc.x_dev,
+                1,
+                hidden_size,
+                cfg.rms_norm_eps,
+            )
+            .map_err(|e| e.to_string())?;
+        self.compute_logits_from_x_dev(table, sc)
+    }
+
+    fn compute_logits_from_x_dev(
+        &self,
+        table: &EmbeddingTable,
+        sc: &mut Gemma4GpuScratch<'_>,
+    ) -> Result<Vec<f32>, String> {
+        let cfg = &self.config.base;
+        let hidden_size = cfg.hidden_size;
+        match table {
+            EmbeddingTable::Quantized(tensor) => {
+                sc.gpu
+                    .lm_head_quant_act_f16(
+                        &sc.x_dev,
+                        &tensor.packed_weights,
+                        &tensor.scales_fp16,
+                        &mut sc.logits_dev,
+                        cfg.vocab_size,
+                        hidden_size,
+                        tensor.bits,
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            EmbeddingTable::F16(data) => {
+                sc.gpu
+                    .lm_head_f16_act_f16(&sc.x_dev, data, &mut sc.logits_dev, cfg.vocab_size, hidden_size)
+                    .map_err(|e| e.to_string())?;
+            }
+            EmbeddingTable::F32(_) => return Err("F32 lm_head requires CPU dot_all_rows".to_string()),
+        }
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        sc.logits_dev.download(&mut logits).map_err(|e| e.to_string())?;
+        if sc.prof_on {
+            sc.prof.d2h += 1;
+        }
+        Ok(logits)
+    }
+
+    fn compute_logits_from_final_hidden(
+        &self,
+        final_hidden: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let cfg = &self.config.base;
+        let hidden_size = cfg.hidden_size;
+        let table = match &self.lm_head {
+            LmHead::Dense(t) => t,
+            LmHead::TiedEmbedding => &self.token_embeddings,
+            LmHead::Ternary(_) => return Err("Gemma4Model expects Dense or TiedEmbedding LmHead".to_string()),
+        };
         Ok(table.dot_all_rows(final_hidden, cfg.vocab_size, hidden_size))
     }
 
@@ -1983,16 +2409,20 @@ impl Gemma4Model {
         normed_attn: &[f32],
         m: usize,
         kv_cache: &mut KvCache,
-        scratch: Option<&mut Gemma4GpuScratch<'_>>,
+        mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
         backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.config.base;
         let q_stride = cfg.num_attention_heads * layer.head_dim;
         let kv_stride = layer.num_kv_heads * layer.head_dim;
-        let mut q_all = layer.attn_q.forward_batch(normed_attn, m, backend)?;
-        let mut k_all = layer.attn_k.forward_batch(normed_attn, m, backend)?;
+        let mut q_all = layer
+            .attn_q
+            .forward_batch_with_scratch(normed_attn, m, scratch.as_deref_mut(), backend)?;
+        let mut k_all = layer
+            .attn_k
+            .forward_batch_with_scratch(normed_attn, m, scratch.as_deref_mut(), backend)?;
         let mut v_all = match &layer.attn_v {
-            Some(v_proj) => v_proj.forward_batch(normed_attn, m, backend)?,
+            Some(v_proj) => v_proj.forward_batch_with_scratch(normed_attn, m, scratch.as_deref_mut(), backend)?,
             None => k_all.clone(),
         };
         let global_freqs = if layer.is_global_attn {
@@ -2023,7 +2453,7 @@ impl Gemma4Model {
             kv_cache.keys[layer_idx].extend_from_slice(k);
             kv_cache.values[layer_idx].extend_from_slice(v);
         }
-        if let Some(sc) = scratch {
+        if let Some(sc) = scratch.as_deref_mut() {
             if m <= sc.max_kv_seq {
                 sc.kv_k_dev[layer_idx].upload_f32_as_f16(&k_all).map_err(|e| e.to_string())?;
                 sc.kv_v_dev[layer_idx].upload_f32_as_f16(&v_all).map_err(|e| e.to_string())?;
@@ -2045,7 +2475,7 @@ impl Gemma4Model {
                 window,
             ));
         }
-        layer.attn_o.forward_batch(&ctx_all, m, backend)
+        layer.attn_o.forward_batch_with_scratch(&ctx_all, m, scratch, backend)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2061,12 +2491,11 @@ impl Gemma4Model {
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.config.base;
         let hidden_size = cfg.hidden_size;
-        let top_k = self.effective_moe_top_k();
         let mut grouped: std::collections::BTreeMap<usize, Vec<(usize, f32)>> = std::collections::BTreeMap::new();
         for t in 0..m {
             let hidden = &hiddens[t * hidden_size..(t + 1) * hidden_size];
             let router_in = compute_router_input(hidden, moe.router_scale.as_deref(), cfg.rms_norm_eps);
-            let selected = route_top_k(&router_in, &moe.router, self.config.num_experts, top_k)?;
+            let selected = self.route_experts_for_token(&router_in, &moe.router)?;
             for (expert_idx, weight) in selected {
                 grouped.entry(expert_idx).or_default().push((t, weight));
             }
@@ -2085,10 +2514,12 @@ impl Gemma4Model {
             }
             let exp_out = match (&moe.experts, scratch.as_deref_mut()) {
                 (Gemma4Experts::LazyDisk(lazy), Some(sc)) => {
+                    let max_dim = lazy.inter_rows.max(lazy.hidden_size).max(lazy.down_rows);
+                    sc.ensure_batch_cap(m_e * max_dim)?;
                     let key = (lazy.layer_idx, expert_idx);
-                    if let Some(entry) = sc.vram_experts.get(&key) {
+                    let ptr: *const VramExpertEntry<'_> = if let Some(entry) = sc.vram_experts.get(&key) {
                         sc.vram_hits += m_e;
-                        forward_vram_expert_batch(entry, sc.gpu, &batch_in, m_e)?
+                        entry
                     } else {
                         let (expert, from_ram) = self.load_or_cache_ram_expert(lazy, expert_idx)?;
                         if from_ram {
@@ -2096,22 +2527,31 @@ impl Gemma4Model {
                         } else {
                             sc.disk_misses += m_e;
                         }
-                        let entry = insert_or_reuse_vram_expert(
+                        insert_or_reuse_vram_expert(
                             &mut sc.vram_experts,
                             &self.expert_ram_cache,
                             sc.gpu,
                             key,
                             &expert,
-                        )?;
-                        forward_vram_expert_batch(entry, sc.gpu, &batch_in, m_e)?
-                    }
+                        )?
+                    };
+                    forward_vram_expert_batch(
+                        unsafe { &*ptr },
+                        sc.gpu,
+                        &mut sc.batch_x_dev,
+                        &mut sc.batch_gate_dev,
+                        &mut sc.batch_up_dev,
+                        &mut sc.batch_out_dev,
+                        &batch_in,
+                        m_e,
+                    )?
                 }
                 (Gemma4Experts::InMemory(list), _) => {
-                    forward_geglu_expert_batch(&batch_in, m_e, &list[expert_idx], backend)?
+                    forward_geglu_expert_batch(&batch_in, m_e, &list[expert_idx], scratch.as_deref_mut(), backend)?
                 }
                 (Gemma4Experts::LazyDisk(lazy), None) => {
                     let (expert, _) = self.load_or_cache_ram_expert(lazy, expert_idx)?;
-                    forward_geglu_expert_batch(&batch_in, m_e, &expert, backend)?
+                    forward_geglu_expert_batch(&batch_in, m_e, &expert, None, backend)?
                 }
             };
             let exp_scale = moe
@@ -2134,7 +2574,7 @@ impl Gemma4Model {
             moe_out
         };
         if let Some(ref shared) = moe.shared_expert {
-            let shared_vec = forward_geglu_expert_batch(normed_ffns, m, shared, backend)?;
+            let shared_vec = forward_geglu_expert_batch(normed_ffns, m, shared, scratch, backend)?;
             let shared_vec = if let Some(ref norm_w) = layer.post_ffw_norm_1 {
                 rms_norm_batch(&shared_vec, norm_w, m, hidden_size, cfg.rms_norm_eps)
             } else {
@@ -2189,7 +2629,7 @@ impl Gemma4Model {
             let normed_ffns = rms_norm_batch(&hiddens, &layer.ffn_norm, m, hidden_size, cfg.rms_norm_eps);
             let mut ffn_out = match &layer.ffn {
                 Gemma4Ffn::Dense(dense_expert) => {
-                    forward_geglu_expert_batch(&normed_ffns, m, dense_expert, backend)?
+                    forward_geglu_expert_batch(&normed_ffns, m, dense_expert, scratch.as_deref_mut(), backend)?
                 }
                 Gemma4Ffn::Moe(moe) => self.forward_moe_batch_with_scratch(
                     layer,
@@ -2223,8 +2663,11 @@ impl Gemma4Model {
         }
 
         let last_hidden = &hiddens[(m - 1) * hidden_size..m * hidden_size];
+        if let Some(sc) = scratch {
+            return self.compute_logits_from_hidden_dev(last_hidden, sc);
+        }
         let final_hidden = rms_norm(last_hidden, &self.final_norm, cfg.rms_norm_eps);
-        self.compute_logits_from_final_hidden(&final_hidden, scratch)
+        self.compute_logits_from_final_hidden(&final_hidden)
     }
 }
 
@@ -2256,6 +2699,33 @@ mod tests {
         assert_eq!(selected[1].0, 3);
         let sum_w: f32 = selected.iter().map(|&(_, w)| w).sum();
         assert!((sum_w - 1.0).abs() < 1e-5);
+    }
+
+    fn make_peaked_selection() -> Vec<(usize, f32)> {
+        vec![(7, 0.60), (3, 0.20), (9, 0.08), (1, 0.05), (4, 0.03), (2, 0.02), (6, 0.01), (0, 0.01)]
+    }
+
+    #[test]
+    fn top_p_truncates_confident_routing_and_renormalizes() {
+        let truncated = truncate_by_cumulative_mass(make_peaked_selection(), 0.85);
+        assert_eq!(truncated.len(), MIN_DYNAMIC_EXPERTS);
+        assert_eq!(truncated[0].0, 7);
+        let sum_w: f32 = truncated.iter().map(|&(_, w)| w).sum();
+        assert!((sum_w - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn top_p_keeps_all_experts_when_routing_is_uncertain() {
+        let flat: Vec<(usize, f32)> = (0..8).map(|e| (e, 0.125)).collect();
+        let kept = truncate_by_cumulative_mass(flat, 0.85);
+        assert_eq!(kept.len(), 7);
+    }
+
+    #[test]
+    fn top_p_one_is_identity() {
+        let original = make_peaked_selection();
+        let kept = truncate_by_cumulative_mass(original.clone(), 1.0);
+        assert_eq!(kept, original);
     }
 
     #[test]
@@ -2489,6 +2959,30 @@ mod tests {
         }
         for (a, b) in seq_next.iter().zip(batch_next.iter()) {
             assert!((a - b).abs() < 1e-4, "decode-after-prefill mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn cpu_rms_norm_stable_under_f16_input_rounding() {
+        // CPU-only approximation of the GPU f16 path: verifies that pre-rounding the
+        // hidden state to f16 keeps rms_norm within tolerance. It does NOT exercise the
+        // `rms_norm_f16` GPU kernel (unavailable in unit tests).
+        use aibox_kernels::tensor::{f16_to_f32, f32_to_f16};
+        let dim = 128;
+        let eps = 1e-6;
+        let hidden: Vec<f32> = (0..dim).map(|i| ((i as f32) - 64.0) * 0.03125).collect();
+        let weight: Vec<f32> = (0..dim).map(|i| 0.8 + (i as f32) * 0.003).collect();
+        let cpu_normed: Vec<f32> = rms_norm(&hidden, &weight, eps)
+            .into_iter()
+            .map(|v| f16_to_f32(f32_to_f16(v)))
+            .collect();
+        let f16_hidden: Vec<f32> = hidden.iter().map(|&v| f16_to_f32(f32_to_f16(v))).collect();
+        let rounded_normed: Vec<f32> = rms_norm(&f16_hidden, &weight, eps)
+            .into_iter()
+            .map(|v| f16_to_f32(f32_to_f16(v)))
+            .collect();
+        for (a, b) in cpu_normed.iter().zip(rounded_normed.iter()) {
+            assert!((a - b).abs() < 1e-3, "rms_norm f16 mismatch: {a} vs {b}");
         }
     }
 }

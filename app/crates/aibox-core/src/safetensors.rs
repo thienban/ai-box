@@ -33,6 +33,34 @@ enum SafeTensorsSource {
     Memory { data_start: u64, buf: Vec<u8> },
 }
 
+/// Nombre maximal de lectures disque simultanées pour `read_tensor_slices_parallel`.
+const MAX_PARALLEL_READS: usize = 8;
+
+/// Lecture positionnée complète sans déplacer le curseur du fichier (`&self`, thread-safe).
+fn positioned_read_exact(file: &File, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(out, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < out.len() {
+            let read = file.seek_read(&mut out[done..], offset + done as u64)?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "positioned read reached EOF",
+                ));
+            }
+            done += read;
+        }
+        Ok(())
+    }
+}
+
 fn read_shard_header(path: &Path) -> Result<(u64, File, BTreeMap<String, TensorMeta>), String> {
     let mut file = File::open(path)
         .map_err(|e| format!("Failed to open '{}': {e}", path.display()))?;
@@ -160,6 +188,92 @@ impl SafeTensorsFile {
                 Ok(out)
             }
         }
+    }
+
+    /// Lit plusieurs tranches `(nom, offset_relatif, longueur)` en parallèle.
+    ///
+    /// Utilise des lectures positionnées (curseur fichier non partagé) : chaque tranche est
+    /// réellement lue en simultané. Réduit la latence I/O sur les systèmes de fichiers à
+    /// forte latence par appel (bind mounts conteneurs, réseau, virtiofs).
+    pub fn read_tensor_slices_parallel(
+        &self,
+        reqs: &[(&str, usize, usize)],
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let mut resolved: Vec<(usize, u64, usize)> = Vec::with_capacity(reqs.len());
+        for &(name, byte_offset, len) in reqs {
+            let meta = self
+                .tensors
+                .get(name)
+                .ok_or_else(|| format!("Tensor '{name}' not found in safetensors"))?;
+            let (start, end) = meta.data_offsets;
+            if end < start || byte_offset + len > (end - start) {
+                return Err(format!(
+                    "Slice [{byte_offset}..{}] out of bounds for '{name}'",
+                    byte_offset + len
+                ));
+            }
+            resolved.push((meta.shard_idx, (start + byte_offset) as u64, len));
+        }
+        let files = match &self.source {
+            SafeTensorsSource::Files(files) => files,
+            #[cfg(test)]
+            SafeTensorsSource::Memory { data_start, buf } => {
+                // Source en mémoire : lecture séquentielle directe (pas d'I/O à paralléliser).
+                let data_start = *data_start as usize;
+                let mut outs = Vec::with_capacity(resolved.len());
+                for &(_, offset, len) in &resolved {
+                    let s = data_start + offset as usize;
+                    outs.push(buf[s..s + len].to_vec());
+                }
+                return Ok(outs);
+            }
+        };
+        let n = resolved.len();
+        let n_threads = MAX_PARALLEL_READS.min(n);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let resolved_ref = &resolved;
+        let files_ref = files;
+        let collected: Vec<Vec<(usize, Vec<u8>)>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n_threads)
+                .map(|_| {
+                    let next = &next;
+                    scope.spawn(move || {
+                        let mut local: Vec<(usize, Vec<u8>)> = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= n {
+                                break;
+                            }
+                            let (shard_idx, offset, len) = resolved_ref[i];
+                            let mut out = vec![0u8; len];
+                            // `offset` est relatif à la section de données du shard : il faut
+                            // ajouter `data_start` (fin de l'en-tête), comme `read_tensor_slice`.
+                            let data_start = files_ref[shard_idx].0;
+                            positioned_read_exact(&files_ref[shard_idx].1, data_start + offset, &mut out)
+                                .map_err(|e| format!("Read failed: {e}"))?;
+                            local.push((i, out));
+                        }
+                        Ok::<_, String>(local)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("parallel read thread panicked".to_string()))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        let mut outs: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
+        for part in collected {
+            for (i, data) in part {
+                outs[i] = Some(data);
+            }
+        }
+        outs.into_iter()
+            .map(|o| o.ok_or_else(|| "missing parallel read result".to_string()))
+            .collect()
     }
 
     /// Lit les octets bruts d'un tenseur nommé.
