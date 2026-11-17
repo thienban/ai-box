@@ -486,7 +486,7 @@ fn parse_header_metadata(header_str: &str) -> Result<BTreeMap<String, TensorMeta
 mod tests {
     use super::*;
     use aibox_kernels::tensor::{f32_to_f16, pack_ternary_2bit_rows};
-    use aibox_kernels::{TernaryHadamardBackend, TmacCpuBackend};
+    use aibox_kernels::{ComputeBackend, TmacCpuBackend};
 
     #[test]
     fn loads_safetensors_and_runs_tmac_kernel() {

@@ -59,7 +59,7 @@ impl fmt::Display for BackendError {
 impl std::error::Error for BackendError {}
 
 /// Interface unifiée ("Interface First") pour tout backend matériel (CPU/GPU).
-pub trait TernaryHadamardBackend: Send + Sync {
+pub trait ComputeBackend: Send + Sync {
     /// Exécute `Y = (X * H_128) @ (W_ternary * scale_fp16)^T`.
     ///
     /// - `activations`: `[m, k]` en row-major (`f32`)
@@ -253,7 +253,7 @@ impl TmacCpuBackend {
     }
 }
 
-impl TernaryHadamardBackend for TmacCpuBackend {
+impl ComputeBackend for TmacCpuBackend {
     fn matmul_hadamard_ternary(
         &self,
         activations: &[f32],
@@ -302,7 +302,7 @@ impl TernaryHadamardBackend for TmacCpuBackend {
 }
 
 /// Sélectionne le backend GPU CUDA (`--gpu` ou `AIBOX_GPU=1`) avec bascule automatique sur CPU T-MAC.
-pub fn select_backend(prefer_gpu: bool) -> Box<dyn TernaryHadamardBackend> {
+pub fn select_backend(prefer_gpu: bool) -> Box<dyn ComputeBackend> {
     let env_gpu = std::env::var("AIBOX_GPU").ok().as_deref() == Some("1");
     if prefer_gpu || env_gpu {
         match GpuBackend::try_new() {

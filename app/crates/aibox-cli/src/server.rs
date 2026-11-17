@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aibox_kernels::{select_backend, TernaryHadamardBackend};
+use aibox_kernels::{select_backend, ComputeBackend};
 
 use crate::engine::{
     build_synthetic_tensor, EmbeddingTable, LmHead, ModelConfig, TernaryLayerWeights,
@@ -44,7 +44,7 @@ impl Default for ServerConfig {
 }
 
 struct ServerState {
-    backend: Box<dyn TernaryHadamardBackend>,
+    backend: Box<dyn ComputeBackend>,
     model: TransformerModel,
     tokenizer: Option<SimpleTokenizer>,
 }

@@ -60,7 +60,6 @@ Single-batch (`batch = 1`) LLM decoding is **memory-bandwidth bound** and strict
 
 - [app/crates/aibox-cli](app/crates/aibox-cli): CLI, HTTP server, tokenizer, and inference engines ([engine.rs](app/crates/aibox-cli/src/engine.rs), [gemma4.rs](app/crates/aibox-cli/src/engine/gemma4.rs)).
 - [app/crates/aibox-kernels](app/crates/aibox-kernels): CPU (AVX2) kernels and CUDA FFI wrappers ([gpu.rs](app/crates/aibox-kernels/src/gpu.rs), [aibox_ternary_gpu.cu](app/crates/aibox-kernels/cuda/aibox_ternary_gpu.cu)).
-- [app/crates/aibox-mistral](app/crates/aibox-mistral): Mistral compatibility crate.
 - [scripts/convert_gguf_to_aibox.py](scripts/convert_gguf_to_aibox.py): GGUF to `aibox` `safetensors` + `config.json` / `quant_config.json` converter.
 - [.tickets/](.tickets): Development & optimization tickets (`FEAT-001` through `FEAT-018`).
 - [docs/](docs): Architecture docs, benchmarks, and research references ([arxiv_references.md](docs/arxiv_references.md)).

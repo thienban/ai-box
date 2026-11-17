@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use aibox_kernels::scalar::{matmul_q2_affine, matmul_q4_affine};
 use aibox_kernels::tensor::{Q2AffineTensor, Q4AffineTensor};
-use aibox_kernels::{GpuBackend, TernaryHadamardBackend};
+use aibox_kernels::{GpuBackend, ComputeBackend};
 
 use super::attention::rms_norm_heads_inplace;
 use super::{add_residual, rms_norm, EmbeddingTable, GenerationStats, KvCache, LmHead, ModelConfig};
@@ -108,7 +108,7 @@ pub enum Gemma4Linear {
 }
 
 impl Gemma4Linear {
-    pub fn forward(&self, input: &[f32], backend: &dyn TernaryHadamardBackend) -> Result<Vec<f32>, String> {
+    pub fn forward(&self, input: &[f32], backend: &dyn ComputeBackend) -> Result<Vec<f32>, String> {
         self.forward_batch(input, 1, backend)
     }
 
@@ -139,7 +139,7 @@ impl Gemma4Linear {
         &self,
         input: &[f32],
         scratch: Option<&mut Gemma4GpuScratch<'_>>,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
         resident: bool,
     ) -> Result<Vec<f32>, String> {
         if let Some(sc) = scratch {
@@ -235,7 +235,7 @@ impl Gemma4Linear {
         &self,
         inputs: &[f32],
         m: usize,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         if m == 0 {
             return Ok(Vec::new());
@@ -948,7 +948,7 @@ fn forward_geglu_expert(
     normed: &[f32],
     expert: &Gemma4ExpertWeights,
     mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
-    backend: &dyn TernaryHadamardBackend,
+    backend: &dyn ComputeBackend,
     resident: bool,
 ) -> Result<Vec<f32>, String> {
     if resident {
@@ -995,7 +995,7 @@ fn forward_geglu_expert_batch(
     normed: &[f32],
     m: usize,
     expert: &Gemma4ExpertWeights,
-    backend: &dyn TernaryHadamardBackend,
+    backend: &dyn ComputeBackend,
 ) -> Result<Vec<f32>, String> {
     let gate = expert.gate.forward_batch(normed, m, backend)?;
     let up = expert.up.forward_batch(normed, m, backend)?;
@@ -1330,7 +1330,7 @@ impl Gemma4Model {
         max_new_tokens: usize,
         eos_token_id: Option<usize>,
         params: SamplingParams,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<GenerationStats, String> {
         if prompt_tokens.is_empty() {
             return Err("prompt_tokens must not be empty".to_string());
@@ -1434,7 +1434,7 @@ impl Gemma4Model {
         token_id: usize,
         pos: usize,
         kv_cache: &mut KvCache,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         self.forward_token_with_scratch(token_id, pos, kv_cache, None, backend)
     }
@@ -1700,7 +1700,7 @@ impl Gemma4Model {
         pos: usize,
         kv_cache: &mut KvCache,
         mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.config.base;
         let mut q = layer.attn_q.forward_with_scratch(normed_attn, scratch.as_deref_mut(), backend, true)?;
@@ -1743,7 +1743,7 @@ impl Gemma4Model {
         pos: usize,
         kv_cache: &mut KvCache,
         mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.config.base;
         if token_id >= cfg.vocab_size {
@@ -1938,7 +1938,7 @@ impl Gemma4Model {
         m: usize,
         kv_cache: &mut KvCache,
         scratch: Option<&mut Gemma4GpuScratch<'_>>,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.config.base;
         let q_stride = cfg.num_attention_heads * layer.head_dim;
@@ -2011,7 +2011,7 @@ impl Gemma4Model {
         normed_ffns: &[f32],
         m: usize,
         mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.config.base;
         let hidden_size = cfg.hidden_size;
@@ -2104,7 +2104,7 @@ impl Gemma4Model {
         prompt_tokens: &[usize],
         kv_cache: &mut KvCache,
         mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.config.base;
         let m = prompt_tokens.len();

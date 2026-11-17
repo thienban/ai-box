@@ -12,7 +12,7 @@ use std::env;
 use std::process::ExitCode;
 
 use aibox_kernels::tensor::{f32_to_f16, pack_ternary_2bit_rows};
-use aibox_kernels::{select_backend, TernaryHadamardBackend, TmacCpuBackend, GROUP_SIZE};
+use aibox_kernels::{select_backend, ComputeBackend, TmacCpuBackend, GROUP_SIZE};
 use engine::{
     build_synthetic_tensor, EmbeddingTable, LmHead, ModelConfig, TernaryLayerWeights,
     TransformerModel,

@@ -1,5 +1,5 @@
 //! SERV-03 : Boucle d'inférence autorégressive Transformer (GQA + RoPE + SwiGLU + KV Cache)
-//! utilisant `TernaryHadamardBackend`.
+//! utilisant `ComputeBackend`.
 
 mod attention;
 mod gdn;
@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use aibox_kernels::tensor::{f16_to_f32, f32_to_f16, pack_ternary_2bit_rows, TernaryTensor};
-use aibox_kernels::{GpuBackend, GpuBuffer, TernaryHadamardBackend, GROUP_SIZE};
+use aibox_kernels::{GpuBackend, GpuBuffer, ComputeBackend, GROUP_SIZE};
 
 use crate::json::{parse_json, JsonValue};
 use crate::safetensors::SafeTensorsFile;
@@ -330,7 +330,7 @@ fn rms_norm_batch(input: &[f32], weight: &[f32], m: usize, dim: usize, eps: f32)
 }
 
 fn project_linear_batch(
-    backend: &dyn TernaryHadamardBackend,
+    backend: &dyn ComputeBackend,
     input: &[f32],
     weight: &LinearWeight,
     m: usize,
@@ -378,7 +378,7 @@ fn load_linear_weight(
 }
 
 fn project_ternary(
-    backend: &dyn TernaryHadamardBackend,
+    backend: &dyn ComputeBackend,
     input: &[f32],
     tensor: &TernaryTensor,
     use_hadamard: bool,
@@ -387,7 +387,7 @@ fn project_ternary(
 }
 
 fn project_ternary_batch(
-    backend: &dyn TernaryHadamardBackend,
+    backend: &dyn ComputeBackend,
     input: &[f32],
     tensor: &TernaryTensor,
     m: usize,
@@ -576,7 +576,7 @@ impl TransformerModel {
         layer_idx: usize,
         pos: usize,
         kv_cache: &mut KvCache,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<(), String> {
         match &layer.block {
             LayerBlock::Attention(attn) => self.forward_full_attention_block(
@@ -598,7 +598,7 @@ impl TransformerModel {
         &self,
         hidden: &mut [f32],
         layer: &TernaryLayerWeights,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<(), String> {
         let use_hadamard = self.config.use_hadamard;
         let normed = rms_norm(hidden, &layer.ffn_norm, self.config.rms_norm_eps);
@@ -619,7 +619,7 @@ impl TransformerModel {
         token_id: usize,
         pos: usize,
         kv_cache: &mut KvCache,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         self.forward_token_internal(token_id, pos, kv_cache, backend, true)
     }
@@ -629,7 +629,7 @@ impl TransformerModel {
         token_id: usize,
         pos: usize,
         kv_cache: &mut KvCache,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
         compute_logits: bool,
     ) -> Result<Vec<f32>, String> {
         let hidden_size = self.config.hidden_size;
@@ -655,7 +655,7 @@ impl TransformerModel {
     fn compute_logits_cpu(
         &self,
         final_hidden: &[f32],
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         let hidden_size = self.config.hidden_size;
         match &self.lm_head {
@@ -682,7 +682,7 @@ impl TransformerModel {
         &self,
         prompt_tokens: &[usize],
         kv_cache: &mut KvCache,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         let m = prompt_tokens.len();
         if m == 1 {
@@ -736,7 +736,7 @@ impl TransformerModel {
         max_new_tokens: usize,
         eos_token_id: Option<usize>,
         params: SamplingParams,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<GenerationStats, String> {
         self.generate_tokens_streaming(prompt_tokens, max_new_tokens, eos_token_id, params, backend, |_| {
             Ok(())
@@ -749,7 +749,7 @@ impl TransformerModel {
         max_new_tokens: usize,
         eos_token_id: Option<usize>,
         params: SamplingParams,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
         mut on_token: F,
     ) -> Result<GenerationStats, String>
     where

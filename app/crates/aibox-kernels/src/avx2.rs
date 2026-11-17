@@ -9,7 +9,7 @@ use crate::{
     fwht::apply_fwht_128_rows,
     scalar::dot_row_scalar,
     tensor::{decode_ternary, f16_to_f32},
-    validate_matmul_inputs, BackendError, TernaryHadamardBackend, GROUP_SIZE,
+    validate_matmul_inputs, BackendError, ComputeBackend, GROUP_SIZE,
     PACKED_BYTES_PER_GROUP,
 };
 
@@ -20,7 +20,7 @@ const TILE_N: usize = 32;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Avx2Backend;
 
-impl TernaryHadamardBackend for Avx2Backend {
+impl ComputeBackend for Avx2Backend {
     fn matmul_hadamard_ternary(
         &self,
         activations: &[f32],

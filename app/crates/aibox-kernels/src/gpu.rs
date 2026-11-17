@@ -1,7 +1,7 @@
 //! Backend GPU CUDA chargé dynamiquement (`libaibox_gpu.so`) avec cache VRAM.
 
 use crate::tensor::f32_to_f16;
-use crate::{validate_matmul_inputs, BackendError, TernaryHadamardBackend};
+use crate::{validate_matmul_inputs, BackendError, ComputeBackend};
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
@@ -1963,7 +1963,7 @@ impl Drop for GpuBackend {
     }
 }
 
-impl TernaryHadamardBackend for GpuBackend {
+impl ComputeBackend for GpuBackend {
     fn as_gpu(&self) -> Option<&GpuBackend> {
         Some(self)
     }

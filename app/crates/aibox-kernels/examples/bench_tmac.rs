@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use aibox_kernels::{
     tensor::{f32_to_f16, pack_ternary_2bit_rows},
-    TernaryHadamardBackend, TmacCpuBackend, GROUP_SIZE,
+    ComputeBackend, TmacCpuBackend, GROUP_SIZE,
 };
 
 fn measure_ms<F: FnMut()>(warmup: usize, iters: usize, mut f: F) -> f64 {

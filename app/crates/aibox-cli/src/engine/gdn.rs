@@ -1,4 +1,4 @@
-use aibox_kernels::{GpuBackend, TernaryHadamardBackend};
+use aibox_kernels::{GpuBackend, ComputeBackend};
 
 use super::attention::sigmoid;
 use super::{
@@ -129,7 +129,7 @@ impl TransformerModel {
         gdn: &GatedDeltaNetWeights,
         layer_idx: usize,
         kv_cache: &mut KvCache,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<(), String> {
         let normed = rms_norm(hidden, attn_norm, self.config.rms_norm_eps);
         let ssm_proj = self.run_gdn_sequence_cpu(&normed, gdn, layer_idx, 1, kv_cache, backend)?;
@@ -144,7 +144,7 @@ impl TransformerModel {
         layer_idx: usize,
         m: usize,
         kv_cache: &mut KvCache,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.config;
         let head_dim = cfg.ssm_state_size;

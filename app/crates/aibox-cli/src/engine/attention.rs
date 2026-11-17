@@ -1,4 +1,4 @@
-use aibox_kernels::{GpuBackend, TernaryHadamardBackend};
+use aibox_kernels::{GpuBackend, ComputeBackend};
 
 use super::{
     add_residual, project_ternary, project_ternary_batch, rms_norm, AttentionBlockWeights,
@@ -121,7 +121,7 @@ impl TransformerModel {
         layer_idx: usize,
         pos: usize,
         kv_cache: &mut KvCache,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<(), String> {
         let head_dim = self.config.head_dim();
         let rope_dim = self.config.rope_dim();
@@ -196,7 +196,7 @@ impl TransformerModel {
         m: usize,
         hidden: &mut [f32],
         kv_cache: &mut KvCache,
-        backend: &dyn TernaryHadamardBackend,
+        backend: &dyn ComputeBackend,
     ) -> Result<(), String> {
         let head_dim = self.config.head_dim();
         let rope_dim = self.config.rope_dim();

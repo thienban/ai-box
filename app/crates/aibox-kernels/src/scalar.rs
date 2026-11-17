@@ -4,16 +4,16 @@ use crate::{
     fwht::apply_fwht_128_rows,
     tensor::{decode_ternary, f16_to_f32},
     validate_group64_affine_geometry, validate_matmul_inputs, validate_packed_geometry,
-    validate_q2_affine_geometry, BackendError, TernaryHadamardBackend,
+    validate_q2_affine_geometry, BackendError, ComputeBackend,
     BINARY_PACKED_BYTES_PER_GROUP, GROUP_SIZE, PACKED_BYTES_PER_GROUP, Q2_GROUP_SIZE,
     Q2_PACKED_BYTES_PER_GROUP, Q4_GROUP_SIZE, Q4_PACKED_BYTES_PER_GROUP,
 };
 
-/// Implémentation scalaire de référence de `TernaryHadamardBackend`.
+/// Implémentation scalaire de référence de `ComputeBackend`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScalarBackend;
 
-impl TernaryHadamardBackend for ScalarBackend {
+impl ComputeBackend for ScalarBackend {
     fn matmul_hadamard_ternary(
         &self,
         activations: &[f32],
