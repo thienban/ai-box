@@ -3,11 +3,11 @@
 use crate::tensor::f32_to_f16;
 use crate::{validate_matmul_inputs, BackendError, ComputeBackend};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::ffi::{c_char, c_int, c_void, CString};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
@@ -21,34 +21,82 @@ unsafe extern "C" {
     fn dlclose(handle: *mut c_void) -> c_int;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryA(lp_lib_file_name: *const c_char) -> *mut c_void;
+    fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const c_char) -> *mut c_void;
+    fn FreeLibrary(h_module: *mut c_void) -> c_int;
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+unsafe fn os_open_lib(c_path: *const c_char) -> *mut c_void {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { dlopen(c_path, RTLD_NOW) }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        unsafe { LoadLibraryA(c_path) }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+unsafe fn os_find_sym(handle: *mut c_void, c_name: *const c_char) -> *mut c_void {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { dlsym(handle, c_name) }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        unsafe { GetProcAddress(handle, c_name) }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+unsafe fn os_close_lib(handle: *mut c_void) {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            dlclose(handle);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        unsafe {
+            FreeLibrary(handle);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnIsAvailable = unsafe extern "C" fn() -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnAlloc = unsafe extern "C" fn(usize) -> *mut c_void;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnAllocCopy = unsafe extern "C" fn(*const c_void, usize) -> *mut c_void;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnFree = unsafe extern "C" fn(*mut c_void);
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMemcpyH2D = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMemcpyD2H = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnArgmaxF32 = unsafe extern "C" fn(*const f32, c_int, *mut u32) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnFwht128F16 = unsafe extern "C" fn(*mut u16, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMatmulTernaryF16Dev =
     unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut u16, c_int, c_int, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMatmulTernaryF16ToF32Dev =
     unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut f32, c_int, c_int, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnRmsNormF16 = unsafe extern "C" fn(*const u16, *const f32, *mut u16, c_int, c_int, f32) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnRmsNormHeadsRopeF16 =
     unsafe extern "C" fn(*mut u16, *const f32, c_int, c_int, c_int, c_int, c_int, f32, f32) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnKvAppendGqaF16 = unsafe extern "C" fn(
     *const u16,
     *const u16,
@@ -62,16 +110,16 @@ type FnKvAppendGqaF16 = unsafe extern "C" fn(
     c_int,
     c_int,
 ) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnSwigluInplaceF16 = unsafe extern "C" fn(*mut u16, *const u16, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnLmHeadF16ActF16 = unsafe extern "C" fn(*const u16, *const u16, *mut f32, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnLmHeadF32ActF16 = unsafe extern "C" fn(*const u16, *const f32, *mut f32, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnLmHeadQuantActF16 =
     unsafe extern "C" fn(*const u16, *const u8, *const u16, *mut f32, c_int, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMatmulTernarySwigluF16Dev = unsafe extern "C" fn(
     *const u16,
     *const u8,
@@ -83,7 +131,7 @@ type FnMatmulTernarySwigluF16Dev = unsafe extern "C" fn(
     c_int,
     c_int,
 ) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnSampleCandidatesF32 = unsafe extern "C" fn(
     *const f32,
     c_int,
@@ -93,11 +141,11 @@ type FnSampleCandidatesF32 = unsafe extern "C" fn(
     c_int,
     *mut c_int,
 ) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnGraphCapture = unsafe extern "C" fn() -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnGraphLaunch = unsafe extern "C" fn(*mut u16, *const u16, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMatmulTernary = unsafe extern "C" fn(
     *const f32,
     *const u8,
@@ -108,15 +156,15 @@ type FnMatmulTernary = unsafe extern "C" fn(
     c_int,
     c_int,
 ) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnDeinterleaveQGateF16 =
     unsafe extern "C" fn(*const u16, *mut u16, *mut u16, c_int, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMulSigmoidInplaceF16 = unsafe extern "C" fn(*mut u16, *const u16, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnGdnConvSiluF16 =
     unsafe extern "C" fn(*const u16, *const f32, *mut f32, *mut u16, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnGdnStepF16 = unsafe extern "C" fn(
     *const u16,
     *const u16,
@@ -132,10 +180,10 @@ type FnGdnStepF16 = unsafe extern "C" fn(
     c_int,
     f32,
 ) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMatmulDenseF16Dev =
     unsafe extern "C" fn(*const u16, *const u16, *mut u16, c_int, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMatmulQ2AffineF16Dev = unsafe extern "C" fn(
     *const u16,
     *const u8,
@@ -146,19 +194,19 @@ type FnMatmulQ2AffineF16Dev = unsafe extern "C" fn(
     c_int,
     c_int,
 ) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnAllocPinned = unsafe extern "C" fn(usize) -> *mut c_void;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnFreePinned = unsafe extern "C" fn(*mut c_void);
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMemcpyH2DAsync = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnGegluInplaceF16 = unsafe extern "C" fn(*mut u16, *const u16, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnWeightedAccF16ToF32 = unsafe extern "C" fn(*mut f32, *const u16, f32, c_int, c_int) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnVramFreeBytes = unsafe extern "C" fn() -> usize;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnMatmulQ2AffineGegluF16Dev = unsafe extern "C" fn(
     *const u16,
     *const u8,
@@ -171,7 +219,7 @@ type FnMatmulQ2AffineGegluF16Dev = unsafe extern "C" fn(
     c_int,
     c_int,
 ) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnGemma4NormRopeF16 = unsafe extern "C" fn(
     *mut u16,
     *const f32,
@@ -183,7 +231,7 @@ type FnGemma4NormRopeF16 = unsafe extern "C" fn(
     f32,
     f32,
 ) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnGemma4AttentionF16 = unsafe extern "C" fn(
     *const u16,
     *const u16,
@@ -230,9 +278,9 @@ impl Default for Gemma4MoeBatchArgs {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnCopyD2DBytes = unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type FnGemma4MoeQ2Batch = unsafe extern "C" fn(
     *const u16,
     *const Gemma4MoeBatchArgs,
@@ -242,25 +290,25 @@ type FnGemma4MoeQ2Batch = unsafe extern "C" fn(
     c_int,
 ) -> c_int;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct GpuWeightPair {
     dev_w: *mut c_void,
     dev_scales: *mut c_void,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 unsafe impl Send for GpuWeightPair {}
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 unsafe impl Sync for GpuWeightPair {}
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct RawPtr(*mut c_void);
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 unsafe impl Send for RawPtr {}
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 unsafe impl Sync for RawPtr {}
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct CudaSymbols {
     handle: *mut c_void,
     alloc: FnAlloc,
@@ -308,26 +356,26 @@ struct CudaSymbols {
     gemma4_moe_q2_batch: FnGemma4MoeQ2Batch,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 unsafe impl Send for CudaSymbols {}
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 unsafe impl Sync for CudaSymbols {}
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 type WeightCacheKey = (usize, usize, usize, usize);
 
 /// Tampon typé alloué en VRAM avec libération automatique (RAII).
 pub struct GpuBuffer<'a, T = f32> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     gpu: &'a GpuBackend,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     ptr: *mut T,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     _phantom: std::marker::PhantomData<&'a T>,
     len: usize,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl<T> Drop for GpuBuffer<'_, T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -346,7 +394,7 @@ impl<'a, T> GpuBuffer<'a, T> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl<'a, T> GpuBuffer<'a, T> {
     pub fn as_ptr(&self) -> *const T {
         self.ptr
@@ -357,7 +405,7 @@ impl<'a, T> GpuBuffer<'a, T> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl<'a, T> GpuBuffer<'a, T> {
     pub fn download(&self, out: &mut [T]) -> Result<(), BackendError> {
         if out.len() > self.len {
@@ -378,7 +426,7 @@ impl<'a, T> GpuBuffer<'a, T> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl<'a> GpuBuffer<'a, f32> {
     pub fn upload_f32(&mut self, data: &[f32]) -> Result<(), BackendError> {
         if data.len() > self.len {
@@ -399,7 +447,7 @@ impl<'a> GpuBuffer<'a, f32> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl<'a> GpuBuffer<'a, u16> {
     pub fn upload_f32_as_f16(&mut self, data: &[f32]) -> Result<(), BackendError> {
         if data.len() > self.len {
@@ -476,7 +524,7 @@ impl<'a> GpuBuffer<'a, u16> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 impl<'a, T> GpuBuffer<'a, T> {
     pub fn as_ptr(&self) -> *const T {
         std::ptr::null()
@@ -487,14 +535,14 @@ impl<'a, T> GpuBuffer<'a, T> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 impl<'a> GpuBuffer<'a, f32> {
     pub fn upload_f32(&mut self, _data: &[f32]) -> Result<(), BackendError> {
         Err(linux_only_err())
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 impl<'a> GpuBuffer<'a, u16> {
     pub fn upload_f32_as_f16(&mut self, data: &[f32]) -> Result<(), BackendError> {
         let _ = f32_to_f16(data.first().copied().unwrap_or(0.0));
@@ -512,22 +560,22 @@ impl<'a> GpuBuffer<'a, u16> {
 
 /// Backend d'inférence ternaire sur GPU CUDA (via `libaibox_gpu.so`).
 pub struct GpuBackend {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     symbols: CudaSymbols,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     weight_cache: Mutex<HashMap<WeightCacheKey, GpuWeightPair>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     raw_cache: Mutex<HashMap<(usize, usize), RawPtr>>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn linux_only_err() -> BackendError {
     BackendError::UnsupportedFeature(
         "CUDA dynamic library backend is only supported on Linux".to_string(),
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn check_cuda_status(op: &str, status: c_int) -> Result<(), BackendError> {
     if status == 0 {
         Ok(())
@@ -538,25 +586,35 @@ fn check_cuda_status(op: &str, status: c_int) -> Result<(), BackendError> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 unsafe fn load_symbol<T>(handle: *mut c_void, name: &str) -> Result<T, BackendError> {
     let c_name = CString::new(name)
         .map_err(|_| BackendError::UnsupportedFeature(format!("Invalid symbol name: {name}")))?;
-    let ptr = unsafe { dlsym(handle, c_name.as_ptr()) };
+    let ptr = unsafe { os_find_sym(handle, c_name.as_ptr()) };
     if ptr.is_null() {
         return Err(BackendError::UnsupportedFeature(format!(
-            "Missing CUDA symbol `{name}` in libaibox_gpu.so"
+            "Missing CUDA symbol `{name}` in CUDA shared library"
         )));
     }
     Ok(unsafe { std::mem::transmute_copy(&ptr) })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn open_cuda_library() -> Result<*mut c_void, BackendError> {
     let mut candidates = Vec::new();
     if let Ok(custom) = std::env::var("AIBOX_GPU_LIB") {
         candidates.push(custom);
     }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                candidates.push(dir.join("aibox_gpu.dll").to_string_lossy().into_owned());
+            }
+        }
+        candidates.extend(["aibox_gpu.dll".to_string(), ".\\aibox_gpu.dll".to_string()]);
+    }
+    #[cfg(target_os = "linux")]
     candidates.extend([
         "libaibox_gpu.so".to_string(),
         "./libaibox_gpu.so".to_string(),
@@ -567,7 +625,7 @@ fn open_cuda_library() -> Result<*mut c_void, BackendError> {
         let Ok(c_path) = CString::new(path.as_str()) else {
             continue;
         };
-        let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW) };
+        let handle = unsafe { os_open_lib(c_path.as_ptr()) };
         if !handle.is_null() {
             return Ok(handle);
         }
@@ -579,7 +637,7 @@ fn open_cuda_library() -> Result<*mut c_void, BackendError> {
     )))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl GpuBackend {
     pub fn try_new() -> Result<Self, BackendError> {
         let handle = open_cuda_library()?;
@@ -645,7 +703,7 @@ impl GpuBackend {
                 raw_cache: Mutex::new(HashMap::new()),
             }),
             Err(err) => {
-                unsafe { dlclose(handle) };
+                unsafe { os_close_lib(handle) };
                 Err(err)
             }
         }
@@ -1695,7 +1753,7 @@ impl GpuBackend {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 impl GpuBackend {
     pub fn try_new() -> Result<Self, BackendError> {
         Err(linux_only_err())
@@ -1943,7 +2001,7 @@ impl GpuBackend {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl Drop for GpuBackend {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.weight_cache.lock() {
@@ -1959,7 +2017,7 @@ impl Drop for GpuBackend {
                 unsafe { (self.symbols.free)(raw.0) };
             }
         }
-        unsafe { dlclose(self.symbols.handle) };
+        unsafe { os_close_lib(self.symbols.handle) };
     }
 }
 
@@ -1992,7 +2050,7 @@ impl ComputeBackend for GpuBackend {
     ) -> Result<Vec<f32>, BackendError> {
         validate_matmul_inputs(activations, packed_weights, scales_fp16, m, n, k)?;
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             let (dev_w, dev_scales) = self.get_or_upload_weights(packed_weights, scales_fp16)?;
             let mut out = vec![0.0f32; m * n];
@@ -2012,7 +2070,7 @@ impl ComputeBackend for GpuBackend {
             Ok(out)
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             let _ = use_hadamard;
             Err(linux_only_err())
@@ -2026,9 +2084,9 @@ mod tests {
 
     #[test]
     fn gpu_backend_reports_unavailable_cleanly_without_library() {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         unsafe {
-            std::env::set_var("AIBOX_GPU_LIB", "/nonexistent/libaibox_gpu_missing.so");
+            std::env::set_var("AIBOX_GPU_LIB", "/nonexistent/libaibox_gpu_missing");
         }
         let err = GpuBackend::try_new().err().expect("expected error without CUDA lib");
         assert!(matches!(err, BackendError::UnsupportedFeature(_)));

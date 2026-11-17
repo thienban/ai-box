@@ -5,6 +5,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#ifdef _WIN32
+#define AIBOX_EXPORT __declspec(dllexport)
+#else
+#define AIBOX_EXPORT
+#endif
+
 #define GROUP_SIZE 128
 #define PACKED_BYTES_PER_GROUP 32
 #define BINARY_PACKED_BYTES_PER_GROUP 16
@@ -1196,13 +1202,13 @@ static int launch_gemv_f16(
 
 extern "C" {
 
-int aibox_gpu_is_available(void) {
+AIBOX_EXPORT int aibox_gpu_is_available(void) {
     int count = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     return (err == cudaSuccess && count > 0) ? 1 : 0;
 }
 
-void* aibox_gpu_alloc(size_t bytes) {
+AIBOX_EXPORT void* aibox_gpu_alloc(size_t bytes) {
     void* dev_ptr = nullptr;
     if (cudaMalloc(&dev_ptr, bytes) != cudaSuccess) {
         return nullptr;
@@ -1210,7 +1216,7 @@ void* aibox_gpu_alloc(size_t bytes) {
     return dev_ptr;
 }
 
-void* aibox_gpu_alloc_copy(const void* host_ptr, size_t bytes) {
+AIBOX_EXPORT void* aibox_gpu_alloc_copy(const void* host_ptr, size_t bytes) {
     void* dev_ptr = aibox_gpu_alloc(bytes);
     if (dev_ptr == nullptr) {
         return nullptr;
@@ -1222,21 +1228,21 @@ void* aibox_gpu_alloc_copy(const void* host_ptr, size_t bytes) {
     return dev_ptr;
 }
 
-void aibox_gpu_free(void* dev_ptr) {
+AIBOX_EXPORT void aibox_gpu_free(void* dev_ptr) {
     if (dev_ptr != nullptr) {
         cudaFree(dev_ptr);
     }
 }
 
-int aibox_gpu_memcpy_h2d(void* dev_dst, const void* host_src, size_t bytes) {
+AIBOX_EXPORT int aibox_gpu_memcpy_h2d(void* dev_dst, const void* host_src, size_t bytes) {
     return (cudaMemcpy(dev_dst, host_src, bytes, cudaMemcpyHostToDevice) == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_memcpy_d2h(void* host_dst, const void* dev_src, size_t bytes) {
+AIBOX_EXPORT int aibox_gpu_memcpy_d2h(void* host_dst, const void* dev_src, size_t bytes) {
     return (cudaMemcpy(host_dst, dev_src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_argmax_f32(const float* dev_logits, int len, uint32_t* host_out_idx) {
+AIBOX_EXPORT int aibox_gpu_argmax_f32(const float* dev_logits, int len, uint32_t* host_out_idx) {
     if (len <= 0 || host_out_idx == nullptr) {
         return -1;
     }
@@ -1261,7 +1267,7 @@ int aibox_gpu_argmax_f32(const float* dev_logits, int len, uint32_t* host_out_id
     return 0;
 }
 
-int aibox_gpu_sample_candidates_f32(
+AIBOX_EXPORT int aibox_gpu_sample_candidates_f32(
     const float* dev_logits,
     int len,
     float margin,
@@ -1315,7 +1321,7 @@ int aibox_gpu_sample_candidates_f32(
     return 0;
 }
 
-int aibox_gpu_matmul_ternary(
+AIBOX_EXPORT int aibox_gpu_matmul_ternary(
     const float* host_x,
     const uint8_t* dev_w,
     const uint16_t* dev_scales,
@@ -1358,14 +1364,14 @@ int aibox_gpu_matmul_ternary(
     return 0;
 }
 
-int aibox_gpu_fwht128_f16(uint16_t* dev_x, int m, int k) {
+AIBOX_EXPORT int aibox_gpu_fwht128_f16(uint16_t* dev_x, int m, int k) {
     int total_groups = m * (k / GROUP_SIZE);
     int blocks = (total_groups + 3) / 4;
     fwht128_rows_f16_kernel<<<blocks, 128, 0, g_active_stream>>>(reinterpret_cast<__half*>(dev_x), total_groups);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_matmul_ternary_f16_dev(
+AIBOX_EXPORT int aibox_gpu_matmul_ternary_f16_dev(
     const uint16_t* dev_x,
     const uint8_t* dev_w,
     const uint16_t* dev_scales,
@@ -1380,7 +1386,7 @@ int aibox_gpu_matmul_ternary_f16_dev(
     );
 }
 
-int aibox_gpu_matmul_ternary_f16_add_dev(
+AIBOX_EXPORT int aibox_gpu_matmul_ternary_f16_add_dev(
     const uint16_t* dev_x,
     const uint8_t* dev_w,
     const uint16_t* dev_scales,
@@ -1395,7 +1401,7 @@ int aibox_gpu_matmul_ternary_f16_add_dev(
     );
 }
 
-int aibox_gpu_matmul_ternary_f16_to_f32_dev(
+AIBOX_EXPORT int aibox_gpu_matmul_ternary_f16_to_f32_dev(
     const uint16_t* dev_x,
     const uint8_t* dev_w,
     const uint16_t* dev_scales,
@@ -1408,7 +1414,7 @@ int aibox_gpu_matmul_ternary_f16_to_f32_dev(
     return launch_gemv_f16<false, float>(dev_x, dev_w, dev_scales, dev_out, m, n, k, bits);
 }
 
-int aibox_gpu_rms_norm_f16(
+AIBOX_EXPORT int aibox_gpu_rms_norm_f16(
     const uint16_t* dev_x,
     const float* dev_w,
     uint16_t* dev_out,
@@ -1426,7 +1432,7 @@ int aibox_gpu_rms_norm_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_rms_norm_fwht128_f16(
+AIBOX_EXPORT int aibox_gpu_rms_norm_fwht128_f16(
     const uint16_t* dev_x,
     const float* dev_w,
     uint16_t* dev_out,
@@ -1450,7 +1456,7 @@ int aibox_gpu_rms_norm_fwht128_f16(
     return aibox_gpu_fwht128_f16(dev_out, m, dim);
 }
 
-int aibox_gpu_rms_norm_heads_rope_f16(
+AIBOX_EXPORT int aibox_gpu_rms_norm_heads_rope_f16(
     uint16_t* dev_vec,
     const float* dev_norm_w,
     int m,
@@ -1476,7 +1482,7 @@ int aibox_gpu_rms_norm_heads_rope_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_kv_append_gqa_f16(
+AIBOX_EXPORT int aibox_gpu_kv_append_gqa_f16(
     const uint16_t* dev_q,
     const uint16_t* dev_k,
     const uint16_t* dev_v,
@@ -1524,7 +1530,7 @@ int aibox_gpu_kv_append_gqa_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_swiglu_inplace_f16(uint16_t* dev_gate, const uint16_t* dev_up, int len) {
+AIBOX_EXPORT int aibox_gpu_swiglu_inplace_f16(uint16_t* dev_gate, const uint16_t* dev_up, int len) {
     int blocks = (len + 255) / 256;
     swiglu_inplace_f16_kernel<<<blocks, 256, 0, g_active_stream>>>(
         reinterpret_cast<__half*>(dev_gate),
@@ -1534,7 +1540,7 @@ int aibox_gpu_swiglu_inplace_f16(uint16_t* dev_gate, const uint16_t* dev_up, int
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_swiglu_fwht128_inplace_f16(uint16_t* dev_gate, const uint16_t* dev_up, int len) {
+AIBOX_EXPORT int aibox_gpu_swiglu_fwht128_inplace_f16(uint16_t* dev_gate, const uint16_t* dev_up, int len) {
     if ((len % GROUP_SIZE) == 0) {
         int total_groups = len / GROUP_SIZE;
         int blocks = (total_groups + 3) / 4;
@@ -1551,7 +1557,7 @@ int aibox_gpu_swiglu_fwht128_inplace_f16(uint16_t* dev_gate, const uint16_t* dev
     return aibox_gpu_fwht128_f16(dev_gate, 1, len);
 }
 
-int aibox_gpu_lm_head_f16_act_f16(
+AIBOX_EXPORT int aibox_gpu_lm_head_f16_act_f16(
     const uint16_t* dev_hidden,
     const uint16_t* dev_emb_f16,
     float* dev_logits,
@@ -1569,7 +1575,7 @@ int aibox_gpu_lm_head_f16_act_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_matmul_ternary_swiglu_f16_dev(
+AIBOX_EXPORT int aibox_gpu_matmul_ternary_swiglu_f16_dev(
     const uint16_t* dev_x,
     const uint8_t* dev_w_gate,
     const uint16_t* dev_scales_gate,
@@ -1599,7 +1605,7 @@ int aibox_gpu_matmul_ternary_swiglu_f16_dev(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_lm_head_f32_act_f16(
+AIBOX_EXPORT int aibox_gpu_lm_head_f32_act_f16(
     const uint16_t* dev_hidden,
     const float* dev_emb_f32,
     float* dev_logits,
@@ -1617,7 +1623,7 @@ int aibox_gpu_lm_head_f32_act_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_lm_head_quant_act_f16(
+AIBOX_EXPORT int aibox_gpu_lm_head_quant_act_f16(
     const uint16_t* dev_hidden,
     const uint8_t* dev_w,
     const uint16_t* dev_scales,
@@ -1644,7 +1650,7 @@ int aibox_gpu_lm_head_quant_act_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_graph_begin_capture(void) {
+AIBOX_EXPORT int aibox_gpu_graph_begin_capture(void) {
     if (g_graph_stream == nullptr) {
         if (cudaStreamCreateWithFlags(&g_graph_stream, cudaStreamNonBlocking) != cudaSuccess) {
             return -1;
@@ -1670,7 +1676,7 @@ int aibox_gpu_graph_begin_capture(void) {
     return 0;
 }
 
-int aibox_gpu_graph_end_capture(void) {
+AIBOX_EXPORT int aibox_gpu_graph_end_capture(void) {
     g_active_stream = nullptr;
     if (cudaStreamEndCapture(g_graph_stream, &g_decode_graph) != cudaSuccess) {
         return -1;
@@ -1683,7 +1689,7 @@ int aibox_gpu_graph_end_capture(void) {
     return 0;
 }
 
-int aibox_gpu_graph_launch(
+AIBOX_EXPORT int aibox_gpu_graph_launch(
     uint16_t* dev_hidden,
     const uint16_t* host_hidden_f16,
     int hidden_len,
@@ -1881,7 +1887,7 @@ __global__ void gdn_step_f16_kernel(
     out[hv * head_dim + j] = __float2half(o_j * s_inv_rms * ssm_norm[j] * silu_z);
 }
 
-int aibox_gpu_deinterleave_q_gate_f16(
+AIBOX_EXPORT int aibox_gpu_deinterleave_q_gate_f16(
     const uint16_t* dev_q_full,
     uint16_t* dev_q_out,
     uint16_t* dev_gate_out,
@@ -1901,7 +1907,7 @@ int aibox_gpu_deinterleave_q_gate_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_mul_sigmoid_inplace_f16(
+AIBOX_EXPORT int aibox_gpu_mul_sigmoid_inplace_f16(
     uint16_t* dev_out,
     const uint16_t* dev_gate,
     int len
@@ -1915,7 +1921,7 @@ int aibox_gpu_mul_sigmoid_inplace_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_gdn_conv_silu_f16(
+AIBOX_EXPORT int aibox_gpu_gdn_conv_silu_f16(
     const uint16_t* dev_qkv_in,
     const float* dev_conv_w,
     float* dev_conv_state,
@@ -1935,7 +1941,7 @@ int aibox_gpu_gdn_conv_silu_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_gdn_step_f16(
+AIBOX_EXPORT int aibox_gpu_gdn_step_f16(
     const uint16_t* dev_qkv,
     const uint16_t* dev_alpha,
     const uint16_t* dev_beta,
@@ -1996,7 +2002,7 @@ __global__ void matmul_dense_f16_dev_kernel(
     }
 }
 
-int aibox_gpu_matmul_dense_f16_dev(
+AIBOX_EXPORT int aibox_gpu_matmul_dense_f16_dev(
     const uint16_t* dev_x,
     const uint16_t* dev_w,
     uint16_t* dev_out,
@@ -2101,7 +2107,7 @@ __global__ void q2_affine_gemv_f16_kernel(
     }
 }
 
-int aibox_gpu_matmul_q2_affine_f16_dev(
+AIBOX_EXPORT int aibox_gpu_matmul_q2_affine_f16_dev(
     const uint16_t* dev_x,
     const uint8_t* dev_w,
     const uint16_t* dev_scales,
@@ -2128,7 +2134,7 @@ int aibox_gpu_matmul_q2_affine_f16_dev(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-void* aibox_gpu_alloc_pinned(size_t bytes) {
+AIBOX_EXPORT void* aibox_gpu_alloc_pinned(size_t bytes) {
     void* host_ptr = nullptr;
     if (cudaHostAlloc(&host_ptr, bytes, cudaHostAllocDefault) != cudaSuccess) {
         return nullptr;
@@ -2136,13 +2142,13 @@ void* aibox_gpu_alloc_pinned(size_t bytes) {
     return host_ptr;
 }
 
-void aibox_gpu_free_pinned(void* host_ptr) {
+AIBOX_EXPORT void aibox_gpu_free_pinned(void* host_ptr) {
     if (host_ptr != nullptr) {
         cudaFreeHost(host_ptr);
     }
 }
 
-int aibox_gpu_memcpy_h2d_async(void* dev_dst, const void* host_src, size_t bytes) {
+AIBOX_EXPORT int aibox_gpu_memcpy_h2d_async(void* dev_dst, const void* host_src, size_t bytes) {
     return (cudaMemcpyAsync(dev_dst, host_src, bytes, cudaMemcpyHostToDevice, g_active_stream) == cudaSuccess) ? 0 : -1;
 }
 
@@ -2232,7 +2238,7 @@ __global__ void q4_affine_gemv_f16_kernel(
     }
 }
 
-int aibox_gpu_matmul_q4_affine_f16_dev(
+AIBOX_EXPORT int aibox_gpu_matmul_q4_affine_f16_dev(
     const uint16_t* dev_x,
     const uint8_t* dev_w,
     const uint16_t* dev_scales,
@@ -2277,7 +2283,7 @@ __global__ void geglu_inplace_f16_kernel(
     gate[idx] = __float2half(gelu * u);
 }
 
-int aibox_gpu_geglu_inplace_f16(
+AIBOX_EXPORT int aibox_gpu_geglu_inplace_f16(
     uint16_t* dev_gate,
     const uint16_t* dev_up,
     int n
@@ -2309,7 +2315,7 @@ __global__ void weighted_acc_f16_to_f32_kernel(
     acc[idx] = reset ? val : (acc[idx] + val);
 }
 
-int aibox_gpu_weighted_acc_f16_to_f32(
+AIBOX_EXPORT int aibox_gpu_weighted_acc_f16_to_f32(
     float* dev_acc,
     const uint16_t* dev_x,
     float weight,
@@ -2330,7 +2336,7 @@ int aibox_gpu_weighted_acc_f16_to_f32(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-size_t aibox_gpu_vram_free_bytes() {
+AIBOX_EXPORT size_t aibox_gpu_vram_free_bytes() {
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
@@ -2454,7 +2460,7 @@ __global__ void q2_affine_gemv_geglu_f16_kernel(
     }
 }
 
-int aibox_gpu_matmul_q2_affine_geglu_f16_dev(
+AIBOX_EXPORT int aibox_gpu_matmul_q2_affine_geglu_f16_dev(
     const uint16_t* dev_x,
     const uint8_t* dev_wg,
     const uint16_t* dev_sg,
@@ -2653,7 +2659,7 @@ __global__ void gemma4_gqa_attention_f16_kernel(
     }
 }
 
-int aibox_gpu_gemma4_norm_rope_f16(
+AIBOX_EXPORT int aibox_gpu_gemma4_norm_rope_f16(
     uint16_t* dev_vec,
     const float* dev_norm_w,
     const float* dev_rope_freqs,
@@ -2681,7 +2687,7 @@ int aibox_gpu_gemma4_norm_rope_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_gemma4_attention_f16(
+AIBOX_EXPORT int aibox_gpu_gemma4_attention_f16(
     const uint16_t* dev_q,
     const uint16_t* dev_k_new,
     const uint16_t* dev_v_new,
@@ -2724,7 +2730,7 @@ int aibox_gpu_gemma4_attention_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-int aibox_gpu_copy_d2d_bytes(void* dev_dst, const void* dev_src, size_t bytes) {
+AIBOX_EXPORT int aibox_gpu_copy_d2d_bytes(void* dev_dst, const void* dev_src, size_t bytes) {
     return (cudaMemcpyAsync(dev_dst, dev_src, bytes, cudaMemcpyDeviceToDevice, g_active_stream) == cudaSuccess) ? 0 : -1;
 }
 
@@ -2939,7 +2945,7 @@ __global__ void grouped_q2_affine_down_acc_f16_kernel(
     }
 }
 
-int aibox_gpu_gemma4_moe_q2_batch(
+AIBOX_EXPORT int aibox_gpu_gemma4_moe_q2_batch(
     const uint16_t* dev_x,
     const Gemma4MoeBatchArgs* batch_ptr,
     uint16_t* dev_gate_scratch,
