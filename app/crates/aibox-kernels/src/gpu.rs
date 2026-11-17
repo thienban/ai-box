@@ -600,11 +600,31 @@ unsafe fn load_symbol<T>(handle: *mut c_void, name: &str) -> Result<T, BackendEr
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn open_cuda_library() -> Result<*mut c_void, BackendError> {
-    let mut candidates = Vec::new();
-    if let Ok(custom) = std::env::var("AIBOX_GPU_LIB") {
-        candidates.push(custom);
+fn open_cuda_library_from_candidates(candidates: &[String]) -> Result<*mut c_void, BackendError> {
+    for path in candidates {
+        let Ok(c_path) = CString::new(path.as_str()) else {
+            continue;
+        };
+        let handle = unsafe { os_open_lib(c_path.as_ptr()) };
+        if !handle.is_null() {
+            return Ok(handle);
+        }
     }
+
+    Err(BackendError::UnsupportedFeature(format!(
+        "Could not load CUDA library (tried: {})",
+        candidates.join(", ")
+    )))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn open_cuda_library() -> Result<*mut c_void, BackendError> {
+    if let Ok(custom) = std::env::var("AIBOX_GPU_LIB") {
+        if !custom.trim().is_empty() {
+            return open_cuda_library_from_candidates(&[custom]);
+        }
+    }
+    let mut candidates = Vec::new();
     #[cfg(target_os = "windows")]
     {
         if let Ok(exe_path) = std::env::current_exe() {
@@ -620,21 +640,7 @@ fn open_cuda_library() -> Result<*mut c_void, BackendError> {
         "./libaibox_gpu.so".to_string(),
         "/usr/local/lib/libaibox_gpu.so".to_string(),
     ]);
-
-    for path in &candidates {
-        let Ok(c_path) = CString::new(path.as_str()) else {
-            continue;
-        };
-        let handle = unsafe { os_open_lib(c_path.as_ptr()) };
-        if !handle.is_null() {
-            return Ok(handle);
-        }
-    }
-
-    Err(BackendError::UnsupportedFeature(format!(
-        "Could not load CUDA library (tried: {})",
-        candidates.join(", ")
-    )))
+    open_cuda_library_from_candidates(&candidates)
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2085,9 +2091,10 @@ mod tests {
     #[test]
     fn gpu_backend_reports_unavailable_cleanly_without_library() {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
-        unsafe {
-            std::env::set_var("AIBOX_GPU_LIB", "/nonexistent/libaibox_gpu_missing");
-        }
+        let err = open_cuda_library_from_candidates(&["/nonexistent/libaibox_gpu_missing".to_string()])
+            .err()
+            .expect("expected error without CUDA lib");
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         let err = GpuBackend::try_new().err().expect("expected error without CUDA lib");
         assert!(matches!(err, BackendError::UnsupportedFeature(_)));
     }
