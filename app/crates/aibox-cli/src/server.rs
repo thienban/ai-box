@@ -59,8 +59,8 @@ struct LoadedModel {
 }
 
 struct ServerState {
-    backend: Box<dyn ComputeBackend>,
     loaded: Mutex<LoadedModel>,
+    backend: Box<dyn ComputeBackend>,
 }
 
 struct HttpRequest {
@@ -248,15 +248,14 @@ fn ensure_model_loaded(
         loaded.last_used = Instant::now();
         return Ok(());
     }
-    let Ok(safe_id) = models::sanitize_repo_id(req_name) else {
+    let candidate = if PathBuf::from("/models").join(req_name).is_dir() {
+        PathBuf::from("/models").join(req_name)
+    } else if let (Ok(safe_id), Ok(models_dir)) = (models::sanitize_repo_id(req_name), models::resolve_models_dir()) {
+        models_dir.join(safe_id)
+    } else {
         loaded.last_used = Instant::now();
         return Ok(());
     };
-    let Ok(models_dir) = models::resolve_models_dir() else {
-        loaded.last_used = Instant::now();
-        return Ok(());
-    };
-    let candidate = models_dir.join(safe_id);
     if models::verify_model_files(&candidate).is_err() {
         loaded.last_used = Instant::now();
         return Ok(());
@@ -350,11 +349,11 @@ fn handle_connection(mut stream: TcpStream, state: &ServerState) -> Result<(), S
             "aibox is running",
             origin,
         ),
-        ("GET", "/v1/models") => handle_openai_models(&mut stream),
-        ("GET", "/api/tags") => handle_ollama_tags(&mut stream),
-        ("POST", "/v1/chat/completions") => handle_openai_chat(&mut stream, &req.body, state),
-        ("POST", "/api/chat") => handle_ollama_chat(&mut stream, &req.body, state),
-        ("POST", "/api/generate") => handle_ollama_generate(&mut stream, &req.body, state),
+        ("GET", "/v1/models") => handle_openai_models(&mut stream, state, origin),
+        ("GET", "/api/tags") => handle_ollama_tags(&mut stream, state, origin),
+        ("POST", "/v1/chat/completions") => handle_openai_chat(&mut stream, &req.body, state, origin),
+        ("POST", "/api/chat") => handle_ollama_chat(&mut stream, &req.body, state, origin),
+        ("POST", "/api/generate") => handle_ollama_generate(&mut stream, &req.body, state, origin),
         _ => write_json_error(&mut stream, "404 Not Found", &format!("Route inconnue: {} {}", req.method, path)),
     }
 }
@@ -424,13 +423,28 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpReadErro
     })
 }
 
-fn list_available_models() -> Vec<String> {
-    let mut names: Vec<String> = models::list_cached_models()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, complete)| *complete)
-        .map(|(name, _)| name)
-        .collect();
+fn list_available_models(state: &ServerState) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(loaded) = state.loaded.lock() {
+        if loaded.name != DEFAULT_MODEL_NAME {
+            names.push(loaded.name.clone());
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/models") {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().is_dir() && models::verify_model_files(&entry.path()).is_ok() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    for (name, complete) in models::list_cached_models().unwrap_or_default() {
+        if complete && !names.contains(&name) {
+            names.push(name);
+        }
+    }
     if names.is_empty() {
         names.push(DEFAULT_MODEL_NAME.to_string());
     }
@@ -444,9 +458,9 @@ fn unix_timestamp_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn handle_openai_models(stream: &mut TcpStream) -> Result<(), String> {
+fn handle_openai_models(stream: &mut TcpStream, state: &ServerState, origin: Option<&str>) -> Result<(), String> {
     let created = unix_timestamp_secs();
-    let items: Vec<String> = list_available_models()
+    let items: Vec<String> = list_available_models(state)
         .into_iter()
         .map(|id| {
             format!(
@@ -456,11 +470,11 @@ fn handle_openai_models(stream: &mut TcpStream) -> Result<(), String> {
         })
         .collect();
     let body = format!("{{\"object\":\"list\",\"data\":[{}]}}", items.join(","));
-    write_http_response(stream, "200 OK", "application/json", &body)
+    write_http_response_with_origin(stream, "200 OK", "application/json", &body, origin)
 }
 
-fn handle_ollama_tags(stream: &mut TcpStream) -> Result<(), String> {
-    let items: Vec<String> = list_available_models()
+fn handle_ollama_tags(stream: &mut TcpStream, state: &ServerState, origin: Option<&str>) -> Result<(), String> {
+    let items: Vec<String> = list_available_models(state)
         .into_iter()
         .map(|name| {
             let escaped = escape_json_string(&name);
@@ -470,16 +484,21 @@ fn handle_ollama_tags(stream: &mut TcpStream) -> Result<(), String> {
         })
         .collect();
     let body = format!("{{\"models\":[{}]}}", items.join(","));
-    write_http_response(stream, "200 OK", "application/json", &body)
+    write_http_response_with_origin(stream, "200 OK", "application/json", &body, origin)
 }
 
-fn handle_openai_chat(stream: &mut TcpStream, body: &str, state: &ServerState) -> Result<(), String> {
+fn handle_openai_chat(
+    stream: &mut TcpStream,
+    body: &str,
+    state: &ServerState,
+    origin: Option<&str>,
+) -> Result<(), String> {
     let req = match parse_completion_request(body, false, true) {
         Ok(req) => req,
         Err(err) => return write_json_error(stream, "400 Bad Request", &err),
     };
     if req.stream {
-        return stream_openai_sse(stream, &req, state);
+        return stream_openai_sse(stream, &req, state, origin);
     }
 
     let output = run_inference(&req, state)?;
@@ -495,16 +514,21 @@ fn handle_openai_chat(stream: &mut TcpStream, body: &str, state: &ServerState) -
         output.completion_tokens,
         total_tokens
     );
-    write_http_response(stream, "200 OK", "application/json", &payload)
+    write_http_response_with_origin(stream, "200 OK", "application/json", &payload, origin)
 }
 
-fn handle_ollama_chat(stream: &mut TcpStream, body: &str, state: &ServerState) -> Result<(), String> {
+fn handle_ollama_chat(
+    stream: &mut TcpStream,
+    body: &str,
+    state: &ServerState,
+    origin: Option<&str>,
+) -> Result<(), String> {
     let req = match parse_completion_request(body, true, true) {
         Ok(req) => req,
         Err(err) => return write_json_error(stream, "400 Bad Request", &err),
     };
     if req.stream {
-        return stream_ollama_ndjson(stream, &req, state, true);
+        return stream_ollama_ndjson(stream, &req, state, true, origin);
     }
 
     let output = run_inference(&req, state)?;
@@ -519,16 +543,21 @@ fn handle_ollama_chat(stream: &mut TcpStream, body: &str, state: &ServerState) -
         output.prompt_tokens,
         output.completion_tokens
     );
-    write_http_response(stream, "200 OK", "application/json", &payload)
+    write_http_response_with_origin(stream, "200 OK", "application/json", &payload, origin)
 }
 
-fn handle_ollama_generate(stream: &mut TcpStream, body: &str, state: &ServerState) -> Result<(), String> {
+fn handle_ollama_generate(
+    stream: &mut TcpStream,
+    body: &str,
+    state: &ServerState,
+    origin: Option<&str>,
+) -> Result<(), String> {
     let req = match parse_completion_request(body, true, false) {
         Ok(req) => req,
         Err(err) => return write_json_error(stream, "400 Bad Request", &err),
     };
     if req.stream {
-        return stream_ollama_ndjson(stream, &req, state, false);
+        return stream_ollama_ndjson(stream, &req, state, false, origin);
     }
 
     let output = run_inference(&req, state)?;
@@ -542,7 +571,7 @@ fn handle_ollama_generate(stream: &mut TcpStream, body: &str, state: &ServerStat
         output.prompt_tokens,
         output.completion_tokens
     );
-    write_http_response(stream, "200 OK", "application/json", &payload)
+    write_http_response_with_origin(stream, "200 OK", "application/json", &payload, origin)
 }
 
 fn parse_completion_request(
@@ -607,13 +636,20 @@ fn extract_chat_prompt(obj: &BTreeMap<String, JsonValue>) -> Result<String, Stri
     }
 
     let mut lines = Vec::with_capacity(messages.len());
-    for msg in messages {
+    for (idx, msg) in messages.iter().enumerate() {
         let msg_obj = msg
             .as_object()
             .ok_or_else(|| "Chaque message doit être un objet JSON".to_string())?;
         let role = msg_obj.get("role").and_then(JsonValue::as_str).unwrap_or("user");
         let content = msg_obj.get("content").and_then(JsonValue::as_str).unwrap_or("");
-        lines.push(format!("{role}: {content}"));
+        if messages.len() == 1 && role == "user" {
+            return Ok(content.to_string());
+        }
+        if idx + 1 == messages.len() && role == "user" {
+            lines.push(content.to_string());
+        } else {
+            lines.push(format!("{role}: {content}"));
+        }
     }
     Ok(lines.join("\n"))
 }
@@ -622,7 +658,12 @@ fn parse_sampling_params(
     obj: &BTreeMap<String, JsonValue>,
     options: Option<&BTreeMap<String, JsonValue>>,
 ) -> SamplingParams {
-    let mut params = SamplingParams::default();
+    let mut params = SamplingParams {
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        seed: 42,
+    };
     if let Some(temp) = obj
         .get("temperature")
         .or_else(|| options.and_then(|o| o.get("temperature")))
@@ -707,6 +748,7 @@ fn stream_openai_sse(
     stream: &mut TcpStream,
     req: &CompletionRequest,
     state: &ServerState,
+    origin: Option<&str>,
 ) -> Result<(), String> {
     let mut loaded = state
         .loaded
@@ -718,7 +760,7 @@ fn stream_openai_sse(
          Content-Type: text/event-stream; charset=utf-8\r\n\
          Cache-Control: no-cache\r\n\
          Connection: close\r\n{}",
-        format_cors_headers(None)
+        format_cors_headers(origin)
     );
     stream.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
@@ -782,6 +824,7 @@ fn stream_ollama_ndjson(
     req: &CompletionRequest,
     state: &ServerState,
     is_chat: bool,
+    origin: Option<&str>,
 ) -> Result<(), String> {
     let mut loaded = state
         .loaded
@@ -792,7 +835,7 @@ fn stream_ollama_ndjson(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/x-ndjson; charset=utf-8\r\n\
          Connection: close\r\n{}",
-        format_cors_headers(None)
+        format_cors_headers(origin)
     );
     stream.write_all(headers.as_bytes()).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;

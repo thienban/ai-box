@@ -520,7 +520,10 @@ pub struct Gemma4Model {
     pub rope_freqs: Option<Vec<f32>>,
     pub safetensors: Option<Mutex<SafeTensorsFile>>,
     pub expert_ram_cache: Mutex<LruMap<(usize, usize), Arc<Gemma4ExpertWeights>>>,
+    persistent_scratch: Mutex<Option<Gemma4GpuScratch<'static>>>,
 }
+
+unsafe impl Send for Gemma4GpuScratch<'_> {}
 
 fn load_affine_slice_from_st(
     st: &mut SafeTensorsFile,
@@ -1321,6 +1324,7 @@ impl Gemma4Model {
             rope_freqs,
             safetensors: Some(Mutex::new(st)),
             expert_ram_cache: Mutex::new(LruMap::new(if is_moe_q4 { 1024 } else { 2048 })),
+            persistent_scratch: Mutex::new(None),
         })
     }
 
@@ -1356,32 +1360,55 @@ impl Gemma4Model {
             Gemma4Ffn::Dense(_) => false,
         });
         let total_experts = self.layers.len() * self.config.num_experts.max(1);
-        let mut scratch = match backend.as_gpu() {
+        let mut scratch_guard = self
+            .persistent_scratch
+            .lock()
+            .map_err(|_| "persistent_scratch lock poisoned".to_string())?;
+        let mut scratch: Option<&mut Gemma4GpuScratch<'_>> = match backend.as_gpu() {
             Some(gpu) => {
-                let free_bytes = gpu.vram_free_bytes();
-                let reserved_bytes = 1520usize * 1024 * 1024;
-                let weights_per_exp = 3 * self.config.moe_intermediate_size * self.config.base.hidden_size;
-                let bytes_per_exp = if is_moe_q4 {
-                    (weights_per_exp * 9) / 16
-                } else {
-                    (weights_per_exp * 5) / 16
-                }
-                .max(1);
-                let vram_cap = if free_bytes > reserved_bytes {
-                    ((free_bytes - reserved_bytes) / bytes_per_exp).clamp(256, total_experts)
-                } else if is_moe_q4 {
-                    1050
-                } else {
-                    1850
+                let needs_init = match scratch_guard.as_ref() {
+                    Some(sc) => !std::ptr::eq(sc.gpu, gpu),
+                    None => true,
                 };
-                if std::env::var("AIBOX_MOE_STATS").is_ok() {
-                    eprintln!(
-                        "[VRAM Budget] free={:.0} MiB reserved=1400 MiB expert={:.2} MiB -> vram_cap={vram_cap}/{total_experts}",
-                        free_bytes as f64 / (1024.0 * 1024.0),
-                        bytes_per_exp as f64 / (1024.0 * 1024.0)
-                    );
+                if needs_init {
+                    let free_bytes = gpu.vram_free_bytes();
+                    let reserved_bytes = 1520usize * 1024 * 1024;
+                    let weights_per_exp = 3 * self.config.moe_intermediate_size * self.config.base.hidden_size;
+                    let bytes_per_exp = if is_moe_q4 {
+                        (weights_per_exp * 9) / 16
+                    } else {
+                        (weights_per_exp * 5) / 16
+                    }
+                    .max(1);
+                    let vram_cap = if free_bytes > reserved_bytes {
+                        ((free_bytes - reserved_bytes) / bytes_per_exp).clamp(256, total_experts)
+                    } else if is_moe_q4 {
+                        1050
+                    } else {
+                        1850
+                    };
+                    if std::env::var("AIBOX_MOE_STATS").is_ok() {
+                        eprintln!(
+                            "[VRAM Budget] free={:.0} MiB reserved=1400 MiB expert={:.2} MiB -> vram_cap={vram_cap}/{total_experts}",
+                            free_bytes as f64 / (1024.0 * 1024.0),
+                            bytes_per_exp as f64 / (1024.0 * 1024.0)
+                        );
+                    }
+                    let new_sc = Gemma4GpuScratch::new(gpu, &self.config, &self.layers, vram_cap)?;
+                    *scratch_guard = Some(unsafe {
+                        std::mem::transmute::<Gemma4GpuScratch<'_>, Gemma4GpuScratch<'static>>(new_sc)
+                    });
                 }
-                Some(Gemma4GpuScratch::new(gpu, &self.config, &self.layers, vram_cap)?)
+                if let Some(sc) = scratch_guard.as_mut() {
+                    sc.vram_hits = 0;
+                    sc.ram_hits = 0;
+                    sc.disk_misses = 0;
+                    Some(unsafe {
+                        std::mem::transmute::<&mut Gemma4GpuScratch<'static>, &mut Gemma4GpuScratch<'_>>(sc)
+                    })
+                } else {
+                    None
+                }
             }
             None => None,
         };
@@ -1391,7 +1418,7 @@ impl Gemma4Model {
             self.forward_prefill_batch_with_scratch(
                 prompt_tokens,
                 &mut kv_cache,
-                scratch.as_mut(),
+                scratch.as_deref_mut(),
                 backend,
             )?
         } else {
@@ -1399,7 +1426,7 @@ impl Gemma4Model {
                 prompt_tokens[0],
                 0,
                 &mut kv_cache,
-                scratch.as_mut(),
+                scratch.as_deref_mut(),
                 backend,
             )?
         };
@@ -1424,13 +1451,13 @@ impl Gemma4Model {
                 next_tok,
                 cur_pos,
                 &mut kv_cache,
-                scratch.as_mut(),
+                scratch.as_deref_mut(),
                 backend,
             )?;
             cur_pos += 1;
         }
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-        if let Some(sc) = scratch.as_ref() {
+        if let Some(sc) = scratch.as_deref() {
             if std::env::var("AIBOX_MOE_STATS").is_ok() {
                 let total = sc.vram_hits + sc.ram_hits + sc.disk_misses;
                 let vram_pct = if total > 0 { 100.0 * sc.vram_hits as f64 / total as f64 } else { 0.0 };
@@ -2316,6 +2343,7 @@ mod tests {
             rope_freqs: None,
             safetensors: None,
             expert_ram_cache: Mutex::new(LruMap::new(16)),
+            persistent_scratch: Mutex::new(None),
         };
         let mut kv = KvCache::new(2);
         let backend = ScalarBackend;
@@ -2438,6 +2466,7 @@ mod tests {
             rope_freqs: None,
             safetensors: None,
             expert_ram_cache: std::sync::Mutex::new(LruMap::new(4)),
+            persistent_scratch: std::sync::Mutex::new(None),
         };
         let prompt = [1usize, 2, 3, 4];
         let backend = ScalarBackend;

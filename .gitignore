@@ -4,7 +4,15 @@ docs/
 # Rust build artifacts
 target/
 app/target/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/src-tauri/binaries/*.exe
+desktop/src-tauri/binaries/*.dll
 **/*.rs.bk
+
+# Node / Desktop frontend
+desktop/node_modules/
+desktop/dist/
 
 # Python / Jupyter
 __pycache__/
