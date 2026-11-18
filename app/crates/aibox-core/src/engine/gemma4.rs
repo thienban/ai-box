@@ -2,14 +2,14 @@
 //! Per-Layer Embeddings et quantification 2-bit affine `q2_affine`).
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use aibox_kernels::scalar::{matmul_q2_affine, matmul_q4_affine};
-use aibox_kernels::tensor::{Q2AffineTensor, Q4AffineTensor};
+use aibox_kernels::tensor::{f32_to_f16, Q2AffineTensor, Q4AffineTensor};
 use aibox_kernels::{GpuBackend, ComputeBackend};
 
 use super::attention::rms_norm_heads_inplace;
@@ -557,6 +557,27 @@ impl<K: Copy + Eq + std::hash::Hash, V> LruMap<K, V> {
         self.map.remove(&oldest).map(|v| (oldest, v))
     }
 
+    /// Comme `pop_oldest_entry_if_full`, mais saute les clés épinglées (prefetch) tant qu'il
+    /// reste au moins une entrée non épinglée ; retombe sur la plus ancienne si tout est épinglé.
+    /// Dans ce cas de repli, l'entrée renvoyée peut être épinglée : **l'appelant doit retirer la
+    /// clé évincée de son `HashSet`** pour ne pas laisser de clé fantôme (cf. `insert_or_reuse_vram_expert`).
+    pub fn pop_oldest_entry_if_full_unpinned(&mut self, pinned: &HashSet<K>) -> Option<(K, V)> {
+        if self.order.len() < self.capacity {
+            return None;
+        }
+        let pos = self.order.iter().position(|k| !pinned.contains(k)).unwrap_or(0);
+        let key = self.order.remove(pos)?;
+        self.map.remove(&key).map(|v| (key, v))
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn contains(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+
     pub fn pop_oldest_if_full(&mut self) -> Option<V> {
         self.pop_oldest_entry_if_full().map(|(_, v)| v)
     }
@@ -763,14 +784,33 @@ impl<'a> VramExpertEntry<'a> {
     }
 }
 
+/// Capacité du cache RAM des experts MoE (`expert_ram_cache`).
+/// Par défaut : `1024` si experts en Q4, `2048` si Q2.
+/// `AIBOX_MOE_RAM_CACHE` surcharge ce cap (knob **diagnostique**). Augmenter le cap ne
+/// réduit pas les `disk_misses` : ce sont des **premières visites** (compulsives, non
+/// évincées, donc insensibles à la capacité). Mesuré : compteurs identiques à `2048`
+/// et `3072` (`disk_misses=4106`, `ram_hits=711`).
+fn ram_cache_cap(is_moe_q4: bool) -> usize {
+    if let Ok(v) = std::env::var("AIBOX_MOE_RAM_CACHE") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    if is_moe_q4 { 1024 } else { 2048 }
+}
+
 fn insert_or_reuse_vram_expert<'a>(
     cache: &mut LruMap<(usize, usize), VramExpertEntry<'a>>,
     ram_victim_cache: &Mutex<LruMap<(usize, usize), Arc<Gemma4ExpertWeights>>>,
     gpu: &'a GpuBackend,
     key: (usize, usize),
     exp: &Gemma4ExpertWeights,
+    pinned: &mut HashSet<(usize, usize)>,
 ) -> Result<&'a VramExpertEntry<'a>, String> {
-    let slot = if let Some((evicted_key, mut reused)) = cache.pop_oldest_entry_if_full() {
+    let slot = if let Some((evicted_key, mut reused)) = cache.pop_oldest_entry_if_full_unpinned(pinned) {
+        // L'entrée évincée n'est plus résidente : si elle était épinglée (repli « tout épinglé »),
+        // la retirer du set pour éviter une clé fantôme désynchronisant `pinned` du contenu réel.
+        pinned.remove(&evicted_key);
         if let Ok(victim) = reused.to_expert_weights() {
             if let Ok(mut guard) = ram_victim_cache.lock() {
                 guard.insert(evicted_key, Arc::new(victim));
@@ -876,6 +916,51 @@ struct Gemma4GpuScratch<'a> {
     disk_misses: usize,
     prof_on: bool,
     prof: Gemma4Prof,
+    /// Trace d'activation des experts (activé par `AIBOX_MOE_TRACE`) : histogramme
+    /// `[layer * num_experts + expert]` incrémenté à chaque routage (prefill + decode).
+    trace_on: bool,
+    trace_num_experts: usize,
+    expert_hits: Vec<u32>,
+    trace_file: Option<String>,
+    /// Prefetch piloté par le routeur (`AIBOX_MOE_PREFETCH=<N>`) : après le prefill, les N
+    /// experts les plus routés par le prompt sont **épinglés** (non évincés par le LRU) pour
+    /// rester résidents pendant le decode.
+    prefetch_n: usize,
+    pinned: HashSet<(usize, usize)>,
+    prefetch_loaded: usize,
+    prefetch_resident: usize,
+    /// Snapshot de l'histogramme à la fin du prefill (sert à mesurer le gaspillage : experts
+    /// épinglés jamais re-routés pendant le decode).
+    prefill_snapshot: Vec<u32>,
+    /// Dissection (A1/A2) : dump complet du routeur activé par `AIBOX_MOE_DUMP=<fichier TSV>`.
+    /// Une ligne par **événement de routage** `(couche, position, token)` : entropie de la
+    /// distribution softmax sur les `num_experts` experts, probabilité du top-1, marge au
+    /// seuil `top_k`, et la liste `expert:rang:poids` des `top_k` retenus.
+    dump_on: bool,
+    dump_file: Option<String>,
+    dump_rows: Vec<String>,
+    dump_events: usize,
+    dump_entropy_sum: f64,
+    /// Dissection (D1) : logit-lens activé par `AIBOX_LAYER_LOGITS=1`. À chaque frontière de
+    /// couche on projette le hidden du **dernier token du prompt** (`final_norm` + `lm_head`) et
+    /// on empile les logits → mesure du « polissage » de la prédiction avec la profondeur.
+    lens_on: bool,
+    lens_logits: Vec<Vec<f32>>,
+    /// Dissection (B1) : dump des **logits par pas de decode** activé par `AIBOX_LOGITS_DUMP=<fichier>`.
+    /// Permet de comparer deux runs (`top_k=8` vs `top_k=7`) en divergence KL sur la distribution
+    /// de sortie de chaque pas (greedy déterministe).
+    logits_dump_on: bool,
+    logits_dump_file: Option<String>,
+    logits_dump: Vec<u8>,
+    /// Dissection (B3) : capture des **hidden par couche** (prefill, toutes les positions),
+    /// activée par `AIBOX_HIDDEN_DUMP=<fichier>`. Sert à ajuster un *tuned lens* / sonde linéaire.
+    hidden_dump_on: bool,
+    hidden_dump_file: Option<String>,
+    hidden_dump: Vec<u8>,
+    /// Intervalle (en pas de decode) de vidage des buffers de dump vers le disque, réglable par
+    /// `AIBOX_DUMP_FLUSH_EVERY` (défaut `64`). Borne l'empreinte RAM des dumps.
+    dump_flush_every: usize,
+    num_layers: usize,
 }
 
 impl Drop for Gemma4GpuScratch<'_> {
@@ -953,6 +1038,37 @@ impl<'a> Gemma4GpuScratch<'a> {
             disk_misses: 0,
             prof_on: std::env::var("AIBOX_GEMMA4_PROFILE").is_ok(),
             prof: Gemma4Prof::default(),
+            trace_on: std::env::var("AIBOX_MOE_TRACE").is_ok(),
+            trace_num_experts: cfg.num_experts.max(1),
+            expert_hits: vec![0u32; layers.len() * cfg.num_experts.max(1)],
+            trace_file: std::env::var("AIBOX_MOE_TRACE_FILE").ok(),
+            prefetch_n: std::env::var("AIBOX_MOE_PREFETCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            pinned: HashSet::new(),
+            prefetch_loaded: 0,
+            prefetch_resident: 0,
+            prefill_snapshot: Vec::new(),
+            dump_on: std::env::var("AIBOX_MOE_DUMP").ok().is_some_and(|v| !v.is_empty()),
+            dump_file: std::env::var("AIBOX_MOE_DUMP").ok().filter(|v| !v.is_empty()),
+            dump_rows: Vec::new(),
+            dump_events: 0,
+            dump_entropy_sum: 0.0,
+            lens_on: std::env::var("AIBOX_LAYER_LOGITS").ok().is_some_and(|v| !v.is_empty() && v != "0"),
+            lens_logits: Vec::new(),
+            logits_dump_on: std::env::var("AIBOX_LOGITS_DUMP").ok().is_some_and(|v| !v.is_empty()),
+            logits_dump_file: std::env::var("AIBOX_LOGITS_DUMP").ok().filter(|v| !v.is_empty()),
+            logits_dump: Vec::new(),
+            hidden_dump_on: std::env::var("AIBOX_HIDDEN_DUMP").ok().is_some_and(|v| !v.is_empty()),
+            hidden_dump_file: std::env::var("AIBOX_HIDDEN_DUMP").ok().filter(|v| !v.is_empty()),
+            hidden_dump: Vec::new(),
+            dump_flush_every: std::env::var("AIBOX_DUMP_FLUSH_EVERY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(64),
+            num_layers: layers.len(),
         })
     }
 
@@ -965,6 +1081,379 @@ impl<'a> Gemma4GpuScratch<'a> {
             self.batch_out_dev = self.gpu.alloc_f16(cap).map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    /// Enregistre les experts routés pour un token d'une couche.
+    /// Actif si `AIBOX_MOE_TRACE` (rapport) **ou** `AIBOX_MOE_PREFETCH` (prefetch) est défini.
+    #[inline]
+    fn record_routed(&mut self, layer_idx: usize, selected: &[(usize, f32)]) {
+        if !self.trace_on && self.prefetch_n == 0 {
+            return;
+        }
+        let base = layer_idx * self.trace_num_experts;
+        for &(expert_idx, _) in selected {
+            if let Some(c) = self.expert_hits.get_mut(base + expert_idx) {
+                *c += 1;
+            }
+        }
+    }
+
+    fn reset_run(&mut self) {
+        if self.trace_on || self.prefetch_n > 0 {
+            for c in self.expert_hits.iter_mut() {
+                *c = 0;
+            }
+        }
+        self.pinned.clear();
+        self.prefill_snapshot.clear();
+        self.prefetch_loaded = 0;
+        self.prefetch_resident = 0;
+        self.dump_rows.clear();
+        self.dump_events = 0;
+        self.dump_entropy_sum = 0.0;
+        self.lens_logits.clear();
+        self.logits_dump.clear();
+        self.hidden_dump.clear();
+    }
+
+    /// Dissection (A1/A2) : recompute la distribution **complète** du routeur (`num_experts`
+    /// experts) pour un événement de routage et l'empile (softmax stable, entropie en nats).
+    /// Gated par `AIBOX_MOE_DUMP` : aucun coût si désactivé.
+    fn record_router_dump(
+        &mut self,
+        layer_idx: usize,
+        token_pos: usize,
+        token_id: usize,
+        router_in: &[f32],
+        router: &[f32],
+        selected: &[(usize, f32)],
+    ) {
+        if !self.dump_on {
+            return;
+        }
+        let ne = self.trace_num_experts.max(1);
+        let hidden = router_in.len();
+        if router.len() != ne * hidden || hidden == 0 {
+            return;
+        }
+        let mut logits = vec![0f32; ne];
+        let mut max_l = f32::NEG_INFINITY;
+        for e in 0..ne {
+            let row = &router[e * hidden..(e + 1) * hidden];
+            let dot: f32 = row.iter().zip(router_in).map(|(&w, &x)| w * x).sum();
+            logits[e] = dot;
+            if dot > max_l {
+                max_l = dot;
+            }
+        }
+        let mut probs = vec![0f32; ne];
+        let mut sum = 0f64;
+        for e in 0..ne {
+            let p = ((logits[e] - max_l) as f64).exp();
+            probs[e] = p as f32;
+            sum += p;
+        }
+        let mut entropy = 0f64;
+        if sum > 0.0 {
+            for p in probs.iter_mut() {
+                let v = *p as f64 / sum;
+                *p = v as f32;
+                if v > 0.0 {
+                    entropy -= v * v.ln();
+                }
+            }
+        }
+        let mut idx: Vec<usize> = (0..ne).collect();
+        idx.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+        let top1 = probs[idx[0]];
+        let k = selected.len();
+        let margin = if k >= 1 && k < ne { probs[idx[k - 1]] - probs[idx[k]] } else { 0.0 };
+        let experts = selected
+            .iter()
+            .enumerate()
+            .map(|(r, &(e, w))| format!("{e}:{r}:{w:.5}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.dump_rows.push(format!(
+            "{layer_idx}\t{token_pos}\t{token_id}\t{entropy:.5}\t{top1:.5}\t{margin:.6}\t{experts}"
+        ));
+        self.dump_events += 1;
+        self.dump_entropy_sum += entropy;
+    }
+
+    /// Écrit le dump (`AIBOX_MOE_DUMP`) et résume l'entropie moyenne du routeur.
+    fn report_dump(&self) {
+        if !self.dump_on {
+            return;
+        }
+        let mean_h = if self.dump_events > 0 {
+            self.dump_entropy_sum / self.dump_events as f64
+        } else {
+            0.0
+        };
+        let max_h = (self.trace_num_experts.max(1) as f64).ln();
+        eprintln!(
+            "[MoE Dump] events={} mean_router_entropy={mean_h:.4} nats (max={max_h:.4} = uniform over {} experts)",
+            self.dump_events,
+            self.trace_num_experts.max(1)
+        );
+        if let Some(ref path) = self.dump_file {
+            let mut out = String::from("layer\ttoken_pos\ttoken_id\tentropy\ttop1_prob\tmargin\texperts(expert:rank:weight)\n");
+            for r in &self.dump_rows {
+                out.push_str(r);
+                out.push('\n');
+            }
+            if let Err(e) = fs::write(path, out) {
+                eprintln!("[MoE Dump] write {path} failed: {e}");
+            } else {
+                eprintln!("[MoE Dump] wrote {path}");
+            }
+        }
+    }
+
+    /// Dissection (D1) : imprime la courbe logit-lens — pour chaque couche, le rang et la
+    /// probabilité du token finalement prédit par le modèle (`target`), et le top-1 de la couche.
+    fn report_lens(&self, target: usize) {
+        if !self.lens_on || self.lens_logits.is_empty() {
+            return;
+        }
+        eprintln!(
+            "[Logit Lens] layers={} target_token={target}",
+            self.lens_logits.len()
+        );
+        for (layer_idx, lg) in self.lens_logits.iter().enumerate() {
+            if target >= lg.len() || lg.is_empty() {
+                continue;
+            }
+            let max_l = lg.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let tv_ref = lg[target];
+            let mut sum = 0f64;
+            let mut pt = 0f64;
+            let mut rank = 0usize;
+            let mut top1 = 0usize;
+            let mut tv = f32::NEG_INFINITY;
+            for (i, &v) in lg.iter().enumerate() {
+                let e = ((v - max_l) as f64).exp();
+                sum += e;
+                if i == target {
+                    pt = e;
+                }
+                if v > tv {
+                    tv = v;
+                    top1 = i;
+                }
+                if v > tv_ref {
+                    rank += 1;
+                }
+            }
+            let p = if sum > 0.0 { pt / sum } else { 0.0 };
+            let p_top1 = if sum > 0.0 { ((tv - max_l) as f64).exp() / sum } else { 0.0 };
+            eprintln!(
+                "[Logit Lens]   L{layer_idx:02} rank={rank} p={p:.5} top1_tok={top1} top1_p={p_top1:.5}"
+            );
+        }
+    }
+
+    /// Rapport d'activation : nombre d'experts distincts et taille du sous-ensemble
+    /// couvrant X % des routages — c'est la borne basse pour une résidence VRAM.
+    fn report_trace(&self, tokens: usize) {
+        if !self.trace_on {
+            return;
+        }
+        let num_layers = self.expert_hits.len() / self.trace_num_experts.max(1);
+        let slots = num_layers * self.trace_num_experts;
+        let events: u64 = self.expert_hits.iter().map(|&c| c as u64).sum();
+        let mut counts: Vec<u32> = self.expert_hits.iter().copied().filter(|&c| c > 0).collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let distinct = counts.len();
+        eprintln!(
+            "[MoE Trace] tokens={tokens} layers={num_layers} routing_events={events} distinct_experts={distinct}/{slots}"
+        );
+        if events == 0 {
+            return;
+        }
+        let thresholds = [0.5f64, 0.8, 0.9, 0.95, 0.99];
+        let mut needed = vec![0usize; thresholds.len()];
+        let mut cum = 0u64;
+        let mut ti = 0usize;
+        for (i, &c) in counts.iter().enumerate() {
+            cum += c as u64;
+            while ti < thresholds.len() && cum as f64 >= thresholds[ti] * events as f64 {
+                needed[ti] = i + 1;
+                ti += 1;
+            }
+            if ti >= thresholds.len() {
+                break;
+            }
+        }
+        let cov = |k: usize| format!("{}%->{}", (thresholds[k] * 100.0) as u32, needed[k]);
+        eprintln!(
+            "[MoE Trace]   experts to cover {} {} {} {} {} (of {distinct} active)",
+            cov(0), cov(1), cov(2), cov(3), cov(4)
+        );
+        if let Some(ref path) = self.trace_file {
+            let mut out = String::from("layer\texpert\tcount\n");
+            for (i, &c) in self.expert_hits.iter().enumerate() {
+                if c > 0 {
+                    out.push_str(&format!(
+                        "{}\t{}\t{}\n",
+                        i / self.trace_num_experts,
+                        i % self.trace_num_experts,
+                        c
+                    ));
+                }
+            }
+            if let Err(e) = fs::write(path, out) {
+                eprintln!("[MoE Trace] write {path} failed: {e}");
+            } else {
+                eprintln!("[MoE Trace] wrote {path}");
+            }
+        }
+    }
+
+    /// Prefetch piloté par le routeur : échantillonne l'histogramme du prompt (déjà accumulé
+    /// par `record_routed` pendant le prefill), prend les `top_n` experts les plus routés et
+    /// les **épingle** pour tout le decode. Retourne `(pinned, already_resident)` ; le
+    /// chargement disque des manquants est fait par l'appelant (`prefetch_missing_into`).
+    fn pin_top_experts(&mut self, top_n: usize) -> (usize, usize) {
+        self.prefill_snapshot = self.expert_hits.clone();
+        let ne = self.trace_num_experts.max(1);
+        let mut entries: Vec<(u32, usize, usize)> = self
+            .expert_hits
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(i, &c)| (c, i / ne, i % ne))
+            .collect();
+        entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let cap = self.vram_experts.capacity();
+        let n = top_n.min(entries.len()).min(cap);
+        let mut resident = 0usize;
+        for &(_, layer_idx, expert_idx) in entries.iter().take(n) {
+            self.pinned.insert((layer_idx, expert_idx));
+            if self.vram_experts.contains(&(layer_idx, expert_idx)) {
+                resident += 1;
+            }
+        }
+        (self.pinned.len(), resident)
+    }
+
+    /// Experts épinglés qui ne sont pas encore résidents en VRAM (à charger par l'appelant).
+    fn pinned_missing(&self) -> Vec<(usize, usize)> {
+        self.pinned
+            .iter()
+            .copied()
+            .filter(|k| !self.vram_experts.contains(k))
+            .collect()
+    }
+
+    fn report_prefetch(&self, decode_tokens: usize) {
+        if self.prefetch_n == 0 {
+            return;
+        }
+        // Gaspillage : experts épinglés jamais re-routés pendant le decode.
+        let ne = self.trace_num_experts.max(1);
+        let mut used = 0usize;
+        for &(layer_idx, expert_idx) in &self.pinned {
+            let i = layer_idx * ne + expert_idx;
+            let before = self.prefill_snapshot.get(i).copied().unwrap_or(0);
+            let after = self.expert_hits.get(i).copied().unwrap_or(0);
+            if after > before {
+                used += 1;
+            }
+        }
+        let waste = if self.pinned.is_empty() {
+            0.0
+        } else {
+            100.0 * (self.pinned.len() - used) as f64 / self.pinned.len() as f64
+        };
+        eprintln!(
+            "[MoE Prefetch] pinned={} loaded_from_disk={} already_resident={} re_used_in_decode={} ({:.1}%) waste={:.1}% decode_tokens={}",
+            self.pinned.len(),
+            self.prefetch_loaded,
+            self.prefetch_resident,
+            used,
+            if self.pinned.is_empty() { 0.0 } else { 100.0 * used as f64 / self.pinned.len() as f64 },
+            waste,
+            decode_tokens,
+        );
+    }
+
+    /// Dissection (B1) : enregistre les logits d'un pas de decode. Flux auto-descriptif
+    /// (little-endian) : `magic u32, pos u32, step u32, next_tok u32, vocab u32, f32[vocab]`.
+    fn record_logits_dump(&mut self, step: usize, pos: usize, next_tok: usize, logits: &[f32]) {
+        if !self.logits_dump_on {
+            return;
+        }
+        const MAGIC: u32 = 0x4C4F4753; // "LOGS"
+        self.logits_dump.extend_from_slice(&MAGIC.to_le_bytes());
+        self.logits_dump.extend_from_slice(&(pos as u32).to_le_bytes());
+        self.logits_dump.extend_from_slice(&(step as u32).to_le_bytes());
+        self.logits_dump.extend_from_slice(&(next_tok as u32).to_le_bytes());
+        self.logits_dump.extend_from_slice(&(logits.len() as u32).to_le_bytes());
+        for &v in logits {
+            self.logits_dump.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// Dissection (B3) : en-tête d'un enregistrement de capture des hidden (prefill).
+    /// Format : `magic u32, num_layers u32, hidden u32, m u32, [token_id u32; m]`, puis
+    /// `num_layers` blocs `f16[m*hidden]` (hidden après chaque couche) et un bloc final
+    /// `f16[m*hidden]` (hidden final, entrée de `final_norm`).
+    fn hidden_dump_begin(&mut self, token_ids: &[usize], hidden: usize) {
+        if !self.hidden_dump_on {
+            return;
+        }
+        const MAGIC: u32 = 0x48494444; // "HIDD"
+        self.hidden_dump.extend_from_slice(&MAGIC.to_le_bytes());
+        self.hidden_dump.extend_from_slice(&(self.num_layers as u32).to_le_bytes());
+        self.hidden_dump.extend_from_slice(&(hidden as u32).to_le_bytes());
+        self.hidden_dump.extend_from_slice(&(token_ids.len() as u32).to_le_bytes());
+        for &t in token_ids {
+            self.hidden_dump.extend_from_slice(&(t as u32).to_le_bytes());
+        }
+    }
+
+    /// Empile un bloc de hidden (`m * hidden` valeurs f32) en f16.
+    fn hidden_dump_push(&mut self, hiddens: &[f32]) {
+        if !self.hidden_dump_on {
+            return;
+        }
+        for &v in hiddens {
+            self.hidden_dump.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+        }
+    }
+
+    /// Écrit et vide les flux de dissection accumulés. Ouverture en **append** pour pouvoir
+    /// accumuler plusieurs prompts (plusieurs runs) dans un même fichier. Appelée périodiquement
+    /// pendant le decode (cf. `AIBOX_DUMP_FLUSH_EVERY`) afin de borner l'empreinte RAM : le flux
+    /// `logits_dump` croît d'environ `vocab * 4` octets par pas de decode.
+    fn report_flush_dumps(&mut self) {
+        use std::io::Write;
+        if self.logits_dump_on && !self.logits_dump.is_empty() {
+            if let Some(ref path) = self.logits_dump_file {
+                match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    Ok(mut f) => match f.write_all(&self.logits_dump) {
+                        Ok(()) => eprintln!("[Logits Dump] +{} bytes -> {path}", self.logits_dump.len()),
+                        Err(e) => eprintln!("[Logits Dump] write {path} failed: {e}"),
+                    },
+                    Err(e) => eprintln!("[Logits Dump] open {path} failed: {e}"),
+                }
+            }
+            self.logits_dump.clear();
+        }
+        if self.hidden_dump_on && !self.hidden_dump.is_empty() {
+            if let Some(ref path) = self.hidden_dump_file {
+                match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    Ok(mut f) => match f.write_all(&self.hidden_dump) {
+                        Ok(()) => eprintln!("[Hidden Dump] +{} bytes -> {path}", self.hidden_dump.len()),
+                        Err(e) => eprintln!("[Hidden Dump] write {path} failed: {e}"),
+                    },
+                    Err(e) => eprintln!("[Hidden Dump] open {path} failed: {e}"),
+                }
+            }
+            self.hidden_dump.clear();
+        }
     }
 }
 
@@ -1594,7 +2083,7 @@ impl Gemma4Model {
             lm_head,
             rope_freqs,
             safetensors: Some(Mutex::new(st)),
-            expert_ram_cache: Mutex::new(LruMap::new(if is_moe_q4 { 1024 } else { 2048 })),
+            expert_ram_cache: Mutex::new(LruMap::new(ram_cache_cap(is_moe_q4))),
             persistent_scratch: Mutex::new(None),
         })
     }
@@ -1679,6 +2168,7 @@ impl Gemma4Model {
                     sc.vram_hits = 0;
                     sc.ram_hits = 0;
                     sc.disk_misses = 0;
+                    sc.reset_run();
                     if sc.prof_on {
                         sc.prof = Gemma4Prof::default();
                     }
@@ -1711,6 +2201,63 @@ impl Gemma4Model {
         };
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
+        // Prefetch piloté par le routeur : le prefill vient de router tous les tokens du prompt.
+        // On épingle et précharge en VRAM les N experts les plus routés avant le decode, ce qui
+        // élimine la majorité des *cold misses* disque sans modifier le routage (`top_k` inchangé).
+        if let Some(sc) = scratch.as_deref_mut() {
+            if sc.prefetch_n > 0 {
+                let (pinned, resident) = sc.pin_top_experts(sc.prefetch_n);
+                let missing = sc.pinned_missing();
+                let t_prefetch = Instant::now();
+                let mut loaded = 0usize;
+                for (layer_idx, expert_idx) in missing {
+                    let lazy = match self.layers.get(layer_idx).map(|l| &l.ffn) {
+                        Some(Gemma4Ffn::Moe(m)) => match &m.experts {
+                            Gemma4Experts::LazyDisk(l) => Some(l),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let Some(lazy) = lazy else { continue };
+                    let (expert, _) = self.load_or_cache_ram_expert(lazy, expert_idx)?;
+                    let _ = insert_or_reuse_vram_expert(
+                        &mut sc.vram_experts,
+                        &self.expert_ram_cache,
+                        sc.gpu,
+                        (layer_idx, expert_idx),
+                        &expert,
+                        &mut sc.pinned,
+                    )?;
+                    loaded += 1;
+                }
+                let prefetch_ms = t_prefetch.elapsed().as_secs_f64() * 1000.0;
+                sc.prefetch_loaded = loaded;
+                sc.prefetch_resident = resident;
+                if std::env::var("AIBOX_MOE_STATS").is_ok() {
+                    eprintln!(
+                        "[MoE Prefetch] requested={} pinned={} preloaded_from_disk={} already_resident={} vram_cap={} prefetch_ms={:.1}",
+                        sc.prefetch_n, pinned, loaded, resident, sc.vram_experts.capacity(), prefetch_ms
+                    );
+                }
+            }
+        }
+
+        // Dissection (D1) : rapport logit-lens. Le prefill vient de remplir `lens_logits` ; la
+        // cible est le token prédit par le modèle complet (top-1 des logits de prefill).
+        if let Some(sc) = scratch.as_deref() {
+            if sc.lens_on {
+                let mut best = 0usize;
+                let mut bv = f32::NEG_INFINITY;
+                for (i, &v) in logits.iter().enumerate() {
+                    if v > bv {
+                        bv = v;
+                        best = i;
+                    }
+                }
+                sc.report_lens(best);
+            }
+        }
+
         let decode_start = Instant::now();
         let mut rng = XorShift64::new(params.seed);
         let mut generated = Vec::with_capacity(max_new_tokens);
@@ -1718,6 +2265,14 @@ impl Gemma4Model {
 
         for step in 0..max_new_tokens {
             let next_tok = sample_token(&logits, params, &mut rng)?;
+            if let Some(sc) = scratch.as_deref_mut() {
+                sc.record_logits_dump(step, cur_pos, next_tok, &logits);
+                // Vidage périodique : borne l'empreinte RAM des dumps pendant le decode.
+                let every = sc.dump_flush_every;
+                if (step + 1) % every == 0 {
+                    sc.report_flush_dumps();
+                }
+            }
             generated.push(next_tok);
             if Some(next_tok) == eos_token_id {
                 break;
@@ -1736,7 +2291,7 @@ impl Gemma4Model {
             cur_pos += 1;
         }
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-        if let Some(sc) = scratch.as_deref() {
+        if let Some(sc) = scratch.as_deref_mut() {
             if std::env::var("AIBOX_MOE_STATS").is_ok() {
                 let total = sc.vram_hits + sc.ram_hits + sc.disk_misses;
                 let vram_pct = if total > 0 { 100.0 * sc.vram_hits as f64 / total as f64 } else { 0.0 };
@@ -1749,6 +2304,10 @@ impl Gemma4Model {
             if sc.prof_on {
                 sc.prof.report(generated.len());
             }
+            sc.report_trace(generated.len());
+            sc.report_prefetch(generated.len());
+            sc.report_dump();
+            sc.report_flush_dumps();
         }
         Ok(GenerationStats {
             tokens: generated,
@@ -1842,6 +2401,7 @@ impl Gemma4Model {
                         sc.gpu,
                         key,
                         &expert,
+                        &mut sc.pinned,
                     )?;
                     if sc.prof_on {
                         let dt = t_load.elapsed().as_nanos();
@@ -1906,6 +2466,7 @@ impl Gemma4Model {
                 sc.gpu,
                 key,
                 &expert,
+                &mut sc.pinned,
             )?;
             if sc.prof_on {
                 let dt = t_load.elapsed().as_nanos();
@@ -2184,6 +2745,10 @@ impl Gemma4Model {
                 Gemma4Ffn::Moe(moe) => {
                     let router_in = compute_router_input(&hidden, moe.router_scale.as_deref(), cfg.rms_norm_eps);
                     let selected = self.route_experts_for_token(&router_in, &moe.router)?;
+                    if let Some(sc) = scratch.as_deref_mut() {
+                        sc.record_routed(layer_idx, &selected);
+                        sc.record_router_dump(layer_idx, pos, token_id, &router_in, &moe.router, &selected);
+                    }
                     let moe_norm_w = layer.pre_ffw_norm_2.as_deref().unwrap_or(&layer.ffn_norm);
                     let moe_out = match (&moe.experts, scratch.as_deref_mut()) {
                         (Gemma4Experts::LazyDisk(lazy), Some(sc)) => self.forward_moe_lazy_vram(
@@ -2481,11 +3046,13 @@ impl Gemma4Model {
     #[allow(clippy::too_many_arguments)]
     fn forward_moe_batch_with_scratch(
         &self,
+        layer_idx: usize,
         layer: &Gemma4Layer,
         moe: &Gemma4MoeWeights,
         hiddens: &[f32],
         normed_ffns: &[f32],
         m: usize,
+        token_ids: &[usize],
         mut scratch: Option<&mut Gemma4GpuScratch<'_>>,
         backend: &dyn ComputeBackend,
     ) -> Result<Vec<f32>, String> {
@@ -2496,6 +3063,11 @@ impl Gemma4Model {
             let hidden = &hiddens[t * hidden_size..(t + 1) * hidden_size];
             let router_in = compute_router_input(hidden, moe.router_scale.as_deref(), cfg.rms_norm_eps);
             let selected = self.route_experts_for_token(&router_in, &moe.router)?;
+            if let Some(sc) = scratch.as_deref_mut() {
+                sc.record_routed(layer_idx, &selected);
+                let token_id = token_ids.get(t).copied().unwrap_or(0);
+                sc.record_router_dump(layer_idx, t, token_id, &router_in, &moe.router, &selected);
+            }
             for (expert_idx, weight) in selected {
                 grouped.entry(expert_idx).or_default().push((t, weight));
             }
@@ -2533,6 +3105,7 @@ impl Gemma4Model {
                             sc.gpu,
                             key,
                             &expert,
+                            &mut sc.pinned,
                         )?
                     };
                     forward_vram_expert_batch(
@@ -2608,6 +3181,11 @@ impl Gemma4Model {
             hiddens.extend_from_slice(&row);
         }
 
+        // Dissection (B3) : en-tête de l'enregistrement de capture des hidden (prefill).
+        if let Some(sc) = scratch.as_deref_mut() {
+            sc.hidden_dump_begin(prompt_tokens, hidden_size);
+        }
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let normed_attn = rms_norm_batch(&hiddens, &layer.attn_norm, m, hidden_size, cfg.rms_norm_eps);
             let attn_out = self.forward_attention_batch_with_scratch(
@@ -2632,11 +3210,13 @@ impl Gemma4Model {
                     forward_geglu_expert_batch(&normed_ffns, m, dense_expert, scratch.as_deref_mut(), backend)?
                 }
                 Gemma4Ffn::Moe(moe) => self.forward_moe_batch_with_scratch(
+                    layer_idx,
                     layer,
                     moe,
                     &hiddens,
                     &normed_ffns,
                     m,
+                    prompt_tokens,
                     scratch.as_deref_mut(),
                     backend,
                 )?,
@@ -2660,8 +3240,25 @@ impl Gemma4Model {
                     *val *= scale;
                 }
             }
+            // Dissection (D1) : logit-lens — projette le hidden du dernier token du prompt via
+            // `final_norm` + `lm_head` à chaque frontière de couche.
+            if let Some(sc) = scratch.as_deref_mut() {
+                if sc.hidden_dump_on {
+                    sc.hidden_dump_push(&hiddens);
+                }
+                if sc.lens_on {
+                    let row = &hiddens[(m - 1) * hidden_size..m * hidden_size];
+                    let fh = rms_norm(row, &self.final_norm, cfg.rms_norm_eps);
+                    let lens = self.compute_logits_from_final_hidden(&fh)?;
+                    sc.lens_logits.push(lens);
+                }
+            }
         }
 
+        // Dissection (B3) : bloc final = hidden final (entrée de `final_norm`).
+        if let Some(sc) = scratch.as_deref_mut() {
+            sc.hidden_dump_push(&hiddens);
+        }
         let last_hidden = &hiddens[(m - 1) * hidden_size..m * hidden_size];
         if let Some(sc) = scratch {
             return self.compute_logits_from_hidden_dev(last_hidden, sc);
