@@ -799,6 +799,21 @@ fn ram_cache_cap(is_moe_q4: bool) -> usize {
     if is_moe_q4 { 1024 } else { 2048 }
 }
 
+/// Repli VRAM→RAM à l'éviction (`ram_victim_cache`). **Désactivé par défaut** : sur une charge où
+/// les `disk_misses` sont compulsives, il ne rapporte que `~1,4 %` de hits RAM pour un coût de
+/// recopie GPU→hôte (`to_expert_weights`, 9 D2H + allocs) sur le chemin critique de **chaque**
+/// éviction. Mesuré (Gemma 4 q2, 200 tok, hôte stabilisé) : désactivé ⇒ decode `+23 %`
+/// (`15,5 → 19,1 tok/s`), `expert-load −48 %`. `AIBOX_MOE_VICTIM_CACHE=1` (ou `true`) réactive le
+/// comportement historique (cache victime actif).
+fn victim_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AIBOX_MOE_VICTIM_CACHE")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 fn insert_or_reuse_vram_expert<'a>(
     cache: &mut LruMap<(usize, usize), VramExpertEntry<'a>>,
     ram_victim_cache: &Mutex<LruMap<(usize, usize), Arc<Gemma4ExpertWeights>>>,
@@ -811,9 +826,11 @@ fn insert_or_reuse_vram_expert<'a>(
         // L'entrée évincée n'est plus résidente : si elle était épinglée (repli « tout épinglé »),
         // la retirer du set pour éviter une clé fantôme désynchronisant `pinned` du contenu réel.
         pinned.remove(&evicted_key);
-        if let Ok(victim) = reused.to_expert_weights() {
-            if let Ok(mut guard) = ram_victim_cache.lock() {
-                guard.insert(evicted_key, Arc::new(victim));
+        if victim_cache_enabled() {
+            if let Ok(victim) = reused.to_expert_weights() {
+                if let Ok(mut guard) = ram_victim_cache.lock() {
+                    guard.insert(evicted_key, Arc::new(victim));
+                }
             }
         }
         reused.gate.overwrite_linear(gpu, &exp.gate)?;
