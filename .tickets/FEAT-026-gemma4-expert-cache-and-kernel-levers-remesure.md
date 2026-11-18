@@ -1,6 +1,6 @@
 # FEAT-026: Re-mesure des leviers cache experts & kernel (Gemma 4 MoE) sur hôte stabilisé
 
-- **Statut**: IN_REVIEW <!-- Options: TODO | IN_PROGRESS | IN_REVIEW | DONE -->
+- **Statut**: DONE <!-- Options: TODO | IN_PROGRESS | IN_REVIEW | DONE -->
 - **Priorité**: HIGH <!-- Options: LOW | MEDIUM | HIGH | CRITICAL -->
 - **Type**: Performance <!-- Options: Feature | Bug | Refactor | Docs | Chore | Performance -->
 - **Date de création**: 2026-11-19
@@ -113,3 +113,4 @@ Contrôles d'environnement : `free -h` et `/proc/meminfo` (Exp 1, écarter le sw
 | 2026-11-19 | - | TODO | Antigravity | Création. Planifie la re-mesure, sur l'**hôte stabilisé** (`.wslconfig memory=10GB`, WSL2/Docker relancés, conteneur `aibox-g4`), des 3 candidats restants : (1) agrandir `AIBOX_MOE_RAM_CACHE`, (2) désactiver le cache victime (`AIBOX_MOE_VICTIM_CACHE=0`, knob à créer), (3) leviers kernel CUDA. Protocole commun : `top_k=8` verrouillé, volume nommé Linux, runs froid/chaud, `≥ 3` runs par config. |
 | 2026-11-19 | TODO | IN_PROGRESS | Antigravity | **Exp 1** : `AIBOX_MOE_RAM_CACHE` = **non-levier** (`ram_hits=711`/`disk_misses=4106` **identiques** à `2048`/`3840`/`4096`) ; contrôle `64` ⇒ `121`/`4696` (cache exercé mais saturé). **Exp 2** : knob `AIBOX_MOE_VICTIM_CACHE` implémenté ; A/B 5 runs ⇒ **victime OFF = decode `+23 %`** (`15.5 → 19.1 tok/s`), `expert-load −48 %`, `ram_hits 711→0`, `disk_misses 4106→4817`. **Qualité inchangée** (même routage, sortie identique). **Cible `≥14 tok/s` dépassée.** |
 | 2026-11-19 | IN_PROGRESS | IN_REVIEW | Antigravity | **Décision** : défaut de `AIBOX_MOE_VICTIM_CACHE` passé à **`0` (OFF)** (rétro-compat `1`/`true`) ; smoke test 64 tok confirme `ram_hits=0`/`load-ram=0.0 ms` sans variable. **Exp 3 clôturée en profilé** : 3 leviers kernel listés (vectorisation 128-bit, `__ldg`/`cp.async`, réduction `__shfl_xor_sync`), **aucun implémenté**. Ticket en revue avant commit. |
+| 2026-11-19 | IN_REVIEW | DONE | Antigravity | Revue de code (`TRAE-code-review`) sur le diff : **aucun problème** (knob `OnceLock` cohérent avec `AIBOX_MOE_TOP_K`, `ram_victim_cache` toujours utilisé, défaut documenté). Commit `2ae9725` `perf(gemma4): disable RAM victim cache by default (FEAT-026)`. Objectif `≥ 14 tok/s` atteint (`19.1 tok/s`). |
