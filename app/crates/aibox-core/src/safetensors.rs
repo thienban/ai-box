@@ -230,20 +230,29 @@ impl SafeTensorsFile {
         };
         let n = resolved.len();
         let n_threads = MAX_PARALLEL_READS.min(n);
-        let next = std::sync::atomic::AtomicUsize::new(0);
+        // Répartition en **blocs contigus équilibrés** (et non en tourniquet) : chaque thread lit des
+        // tranches voisines, ce qui préserve la localité et laisse la prélecture du noyau opérer, au
+        // lieu de sauter de tranche en tranche à travers le fichier. Les `n % n_threads` premiers
+        // threads prennent une tranche de plus, de sorte qu'aucun thread ne reste inactif quand `n`
+        // n'est pas un multiple de `n_threads` (ex. 9 tranches / 8 threads).
+        let base = n / n_threads;
+        let rem = n % n_threads;
+        let bounds: Vec<(usize, usize)> = (0..n_threads)
+            .map(|t| {
+                let lo = t * base + t.min(rem);
+                (lo, lo + base + usize::from(t < rem))
+            })
+            .collect();
+        let bounds_ref = &bounds;
         let resolved_ref = &resolved;
         let files_ref = files;
         let collected: Vec<Vec<(usize, Vec<u8>)>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..n_threads)
-                .map(|_| {
-                    let next = &next;
+                .map(|t| {
+                    let (lo, hi) = bounds_ref[t];
                     scope.spawn(move || {
-                        let mut local: Vec<(usize, Vec<u8>)> = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= n {
-                                break;
-                            }
+                        let mut local: Vec<(usize, Vec<u8>)> = Vec::with_capacity(hi - lo);
+                        for i in lo..hi {
                             let (shard_idx, offset, len) = resolved_ref[i];
                             let mut out = vec![0u8; len];
                             // `offset` est relatif à la section de données du shard : il faut
