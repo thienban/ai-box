@@ -2748,6 +2748,11 @@ struct Gemma4MoeBatchArgs {
     int k_count;
 };
 
+// FEAT-028 : 8 lanes par groupe (uint4 = 8 halfs / lane), 4 groupes traités par
+// itération (sub_g = lane >> 3), réduction sur 3 passes (offset 4,2,1) au lieu
+// de 4. Mesuré ~15 % plus rapide sur `expert-compute` que la variante 16-lane
+// historique (cf. .tickets/FEAT-028-gemma4-moe-kernel-expert-compute.md).
+
 __global__ void grouped_q2_affine_gemv_geglu_f16_kernel(
     const __half* __restrict__ x,
     Gemma4MoeBatchArgs batch,
@@ -2775,33 +2780,45 @@ __global__ void grouped_q2_affine_gemv_geglu_f16_kernel(
 
     float total_g = 0.0f;
     float total_u = 0.0f;
-    int sub_g = lane >> 4;
-    int sub_lane = lane & 15;
+    int sub_g = lane >> 3;   // 0..3 : groupe dans la tuile de 4
+    int sub_lane = lane & 7; // 0..7 : 8 lanes par groupe (8 valeurs x / lane)
+
     int g = 0;
-    for (; g + 2 <= groups_per_row; g += 2) {
+    for (; g + 4 <= groups_per_row; g += 4) {
         int cur_g = g + sub_g;
-        uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[cur_g * 64 + sub_lane * 4]);
-        const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+        uint4 xv = *reinterpret_cast<const uint4*>(&x[cur_g * 64 + sub_lane * 8]);
+        const __half2* h2 = reinterpret_cast<const __half2*>(&xv);
         float2 f0 = __half22float2(h2[0]);
         float2 f1 = __half22float2(h2[1]);
-        float sum_x = f0.x + f0.y + f1.x + f1.y;
+        float2 f2 = __half22float2(h2[2]);
+        float2 f3 = __half22float2(h2[3]);
+        float sum_x = (f0.x + f0.y) + (f1.x + f1.y) + (f2.x + f2.y) + (f3.x + f3.y);
 
-        uint8_t pg = wg_row[cur_g * bytes_per_group + sub_lane];
-        float sum_qg = f0.x * static_cast<float>(pg & 0x03)
-                     + f0.y * static_cast<float>((pg >> 2) & 0x03)
-                     + f1.x * static_cast<float>((pg >> 4) & 0x03)
-                     + f1.y * static_cast<float>((pg >> 6) & 0x03);
+        uchar2 pg = *reinterpret_cast<const uchar2*>(&wg_row[cur_g * bytes_per_group + sub_lane * 2]);
+        float sum_qg = f0.x * static_cast<float>(pg.x & 0x03)
+                     + f0.y * static_cast<float>((pg.x >> 2) & 0x03)
+                     + f1.x * static_cast<float>((pg.x >> 4) & 0x03)
+                     + f1.y * static_cast<float>((pg.x >> 6) & 0x03)
+                     + f2.x * static_cast<float>(pg.y & 0x03)
+                     + f2.y * static_cast<float>((pg.y >> 2) & 0x03)
+                     + f3.x * static_cast<float>((pg.y >> 4) & 0x03)
+                     + f3.y * static_cast<float>((pg.y >> 6) & 0x03);
 
-        uint8_t pu = wu_row[cur_g * bytes_per_group + sub_lane];
-        float sum_qu = f0.x * static_cast<float>(pu & 0x03)
-                     + f0.y * static_cast<float>((pu >> 2) & 0x03)
-                     + f1.x * static_cast<float>((pu >> 4) & 0x03)
-                     + f1.y * static_cast<float>((pu >> 6) & 0x03);
+        uchar2 pu = *reinterpret_cast<const uchar2*>(&wu_row[cur_g * bytes_per_group + sub_lane * 2]);
+        float sum_qu = f0.x * static_cast<float>(pu.x & 0x03)
+                     + f0.y * static_cast<float>((pu.x >> 2) & 0x03)
+                     + f1.x * static_cast<float>((pu.x >> 4) & 0x03)
+                     + f1.y * static_cast<float>((pu.x >> 6) & 0x03)
+                     + f2.x * static_cast<float>(pu.y & 0x03)
+                     + f2.y * static_cast<float>((pu.y >> 2) & 0x03)
+                     + f3.x * static_cast<float>((pu.y >> 4) & 0x03)
+                     + f3.y * static_cast<float>((pu.y >> 6) & 0x03);
 
-        for (int offset = 8; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
             sum_qg += __shfl_down_sync(0xFFFFFFFF, sum_qg, offset);
             sum_qu += __shfl_down_sync(0xFFFFFFFF, sum_qu, offset);
-            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+            sum_x  += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
         }
         if (sub_lane == 0) {
             float sc_g = __half2float(*reinterpret_cast<const __half*>(&sg_row[cur_g]));
@@ -2812,43 +2829,58 @@ __global__ void grouped_q2_affine_gemv_geglu_f16_kernel(
             total_u += sum_qu * sc_u + sum_x * zr_u;
         }
     }
-    if (g < groups_per_row) {
+    for (; g < groups_per_row; g += 4) {
+        int cur_g = g + sub_g;
         float sum_qg = 0.0f;
         float sum_qu = 0.0f;
         float sum_x = 0.0f;
-        if (lane < 16) {
-            uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[g * 64 + lane * 4]);
-            const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+        if (cur_g < groups_per_row) {
+            uint4 xv = *reinterpret_cast<const uint4*>(&x[cur_g * 64 + sub_lane * 8]);
+            const __half2* h2 = reinterpret_cast<const __half2*>(&xv);
             float2 f0 = __half22float2(h2[0]);
             float2 f1 = __half22float2(h2[1]);
-            sum_x = f0.x + f0.y + f1.x + f1.y;
-            uint8_t pg = wg_row[g * bytes_per_group + lane];
-            sum_qg = f0.x * static_cast<float>(pg & 0x03)
-                   + f0.y * static_cast<float>((pg >> 2) & 0x03)
-                   + f1.x * static_cast<float>((pg >> 4) & 0x03)
-                   + f1.y * static_cast<float>((pg >> 6) & 0x03);
-            uint8_t pu = wu_row[g * bytes_per_group + lane];
-            sum_qu = f0.x * static_cast<float>(pu & 0x03)
-                   + f0.y * static_cast<float>((pu >> 2) & 0x03)
-                   + f1.x * static_cast<float>((pu >> 4) & 0x03)
-                   + f1.y * static_cast<float>((pu >> 6) & 0x03);
+            float2 f2 = __half22float2(h2[2]);
+            float2 f3 = __half22float2(h2[3]);
+            sum_x = (f0.x + f0.y) + (f1.x + f1.y) + (f2.x + f2.y) + (f3.x + f3.y);
+            uchar2 pg = *reinterpret_cast<const uchar2*>(&wg_row[cur_g * bytes_per_group + sub_lane * 2]);
+            sum_qg = f0.x * static_cast<float>(pg.x & 0x03)
+                   + f0.y * static_cast<float>((pg.x >> 2) & 0x03)
+                   + f1.x * static_cast<float>((pg.x >> 4) & 0x03)
+                   + f1.y * static_cast<float>((pg.x >> 6) & 0x03)
+                   + f2.x * static_cast<float>(pg.y & 0x03)
+                   + f2.y * static_cast<float>((pg.y >> 2) & 0x03)
+                   + f3.x * static_cast<float>((pg.y >> 4) & 0x03)
+                   + f3.y * static_cast<float>((pg.y >> 6) & 0x03);
+            uchar2 pu = *reinterpret_cast<const uchar2*>(&wu_row[cur_g * bytes_per_group + sub_lane * 2]);
+            sum_qu = f0.x * static_cast<float>(pu.x & 0x03)
+                   + f0.y * static_cast<float>((pu.x >> 2) & 0x03)
+                   + f1.x * static_cast<float>((pu.x >> 4) & 0x03)
+                   + f1.y * static_cast<float>((pu.x >> 6) & 0x03)
+                   + f2.x * static_cast<float>(pu.y & 0x03)
+                   + f2.y * static_cast<float>((pu.y >> 2) & 0x03)
+                   + f3.x * static_cast<float>((pu.y >> 4) & 0x03)
+                   + f3.y * static_cast<float>((pu.y >> 6) & 0x03);
         }
-        for (int offset = 8; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
             sum_qg += __shfl_down_sync(0xFFFFFFFF, sum_qg, offset);
             sum_qu += __shfl_down_sync(0xFFFFFFFF, sum_qu, offset);
-            sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
+            sum_x  += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
         }
-        if (lane == 0) {
-            float sc_g = __half2float(*reinterpret_cast<const __half*>(&sg_row[g]));
-            float zr_g = __half2float(*reinterpret_cast<const __half*>(&zg_row[g]));
-            float sc_u = __half2float(*reinterpret_cast<const __half*>(&su_row[g]));
-            float zr_u = __half2float(*reinterpret_cast<const __half*>(&zu_row[g]));
+        if (sub_lane == 0 && cur_g < groups_per_row) {
+            float sc_g = __half2float(*reinterpret_cast<const __half*>(&sg_row[cur_g]));
+            float zr_g = __half2float(*reinterpret_cast<const __half*>(&zg_row[cur_g]));
+            float sc_u = __half2float(*reinterpret_cast<const __half*>(&su_row[cur_g]));
+            float zr_u = __half2float(*reinterpret_cast<const __half*>(&zu_row[cur_g]));
             total_g += sum_qg * sc_g + sum_x * zr_g;
             total_u += sum_qu * sc_u + sum_x * zr_u;
         }
     }
+    // Fusion des 4 lanes accumulatrices (sub_lane == 0 : lanes 0, 8, 16, 24).
     total_g += __shfl_down_sync(0xFFFFFFFF, total_g, 16);
+    total_g += __shfl_down_sync(0xFFFFFFFF, total_g, 8);
     total_u += __shfl_down_sync(0xFFFFFFFF, total_u, 16);
+    total_u += __shfl_down_sync(0xFFFFFFFF, total_u, 8);
 
     if (lane == 0) {
         const float sqrt_2_over_pi = 0.7978845608f;
@@ -2876,8 +2908,8 @@ __global__ void grouped_q2_affine_down_acc_f16_kernel(
     const int bytes_per_group = 16;
     size_t w_off = (size_t)row_n * groups_per_row * bytes_per_group;
     size_t s_off = (size_t)row_n * groups_per_row;
-    int sub_g = lane >> 4;
-    int sub_lane = lane & 15;
+    int sub_g = lane >> 3;
+    int sub_lane = lane & 7;
 
     float acc = 0.0f;
     for (int e = 0; e < batch.k_count; ++e) {
@@ -2888,19 +2920,26 @@ __global__ void grouped_q2_affine_down_acc_f16_kernel(
 
         float total = 0.0f;
         int g = 0;
-        for (; g + 2 <= groups_per_row; g += 2) {
+        for (; g + 4 <= groups_per_row; g += 4) {
             int cur_g = g + sub_g;
-            uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[cur_g * 64 + sub_lane * 4]);
-            const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+            uint4 xv = *reinterpret_cast<const uint4*>(&x[cur_g * 64 + sub_lane * 8]);
+            const __half2* h2 = reinterpret_cast<const __half2*>(&xv);
             float2 f0 = __half22float2(h2[0]);
             float2 f1 = __half22float2(h2[1]);
-            uint8_t packed = w_row[cur_g * bytes_per_group + sub_lane];
-            float sum_q = f0.x * static_cast<float>(packed & 0x03)
-                        + f0.y * static_cast<float>((packed >> 2) & 0x03)
-                        + f1.x * static_cast<float>((packed >> 4) & 0x03)
-                        + f1.y * static_cast<float>((packed >> 6) & 0x03);
-            float sum_x = f0.x + f0.y + f1.x + f1.y;
-            for (int offset = 8; offset > 0; offset >>= 1) {
+            float2 f2 = __half22float2(h2[2]);
+            float2 f3 = __half22float2(h2[3]);
+            uchar2 w2 = *reinterpret_cast<const uchar2*>(&w_row[cur_g * bytes_per_group + sub_lane * 2]);
+            float sum_q = f0.x * static_cast<float>(w2.x & 0x03)
+                        + f0.y * static_cast<float>((w2.x >> 2) & 0x03)
+                        + f1.x * static_cast<float>((w2.x >> 4) & 0x03)
+                        + f1.y * static_cast<float>((w2.x >> 6) & 0x03)
+                        + f2.x * static_cast<float>(w2.y & 0x03)
+                        + f2.y * static_cast<float>((w2.y >> 2) & 0x03)
+                        + f3.x * static_cast<float>((w2.y >> 4) & 0x03)
+                        + f3.y * static_cast<float>((w2.y >> 6) & 0x03);
+            float sum_x = (f0.x + f0.y) + (f1.x + f1.y) + (f2.x + f2.y) + (f3.x + f3.y);
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset >>= 1) {
                 sum_q += __shfl_down_sync(0xFFFFFFFF, sum_q, offset);
                 sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
             }
@@ -2910,32 +2949,41 @@ __global__ void grouped_q2_affine_down_acc_f16_kernel(
                 total += sum_q * s + sum_x * z;
             }
         }
-        if (g < groups_per_row) {
+        for (; g < groups_per_row; g += 4) {
+            int cur_g = g + sub_g;
             float sum_q = 0.0f;
             float sum_x = 0.0f;
-            if (lane < 16) {
-                uint2 x_u2 = *reinterpret_cast<const uint2*>(&x[g * 64 + lane * 4]);
-                const __half2* h2 = reinterpret_cast<const __half2*>(&x_u2);
+            if (cur_g < groups_per_row) {
+                uint4 xv = *reinterpret_cast<const uint4*>(&x[cur_g * 64 + sub_lane * 8]);
+                const __half2* h2 = reinterpret_cast<const __half2*>(&xv);
                 float2 f0 = __half22float2(h2[0]);
                 float2 f1 = __half22float2(h2[1]);
-                uint8_t packed = w_row[g * bytes_per_group + lane];
-                sum_q = f0.x * static_cast<float>(packed & 0x03)
-                      + f0.y * static_cast<float>((packed >> 2) & 0x03)
-                      + f1.x * static_cast<float>((packed >> 4) & 0x03)
-                      + f1.y * static_cast<float>((packed >> 6) & 0x03);
-                sum_x = f0.x + f0.y + f1.x + f1.y;
+                float2 f2 = __half22float2(h2[2]);
+                float2 f3 = __half22float2(h2[3]);
+                uchar2 w2 = *reinterpret_cast<const uchar2*>(&w_row[cur_g * bytes_per_group + sub_lane * 2]);
+                sum_q = f0.x * static_cast<float>(w2.x & 0x03)
+                      + f0.y * static_cast<float>((w2.x >> 2) & 0x03)
+                      + f1.x * static_cast<float>((w2.x >> 4) & 0x03)
+                      + f1.y * static_cast<float>((w2.x >> 6) & 0x03)
+                      + f2.x * static_cast<float>(w2.y & 0x03)
+                      + f2.y * static_cast<float>((w2.y >> 2) & 0x03)
+                      + f3.x * static_cast<float>((w2.y >> 4) & 0x03)
+                      + f3.y * static_cast<float>((w2.y >> 6) & 0x03);
+                sum_x = (f0.x + f0.y) + (f1.x + f1.y) + (f2.x + f2.y) + (f3.x + f3.y);
             }
-            for (int offset = 8; offset > 0; offset >>= 1) {
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset >>= 1) {
                 sum_q += __shfl_down_sync(0xFFFFFFFF, sum_q, offset);
                 sum_x += __shfl_down_sync(0xFFFFFFFF, sum_x, offset);
             }
-            if (lane == 0) {
-                float s = __half2float(*reinterpret_cast<const __half*>(&s_row[g]));
-                float z = __half2float(*reinterpret_cast<const __half*>(&z_row[g]));
+            if (sub_lane == 0 && cur_g < groups_per_row) {
+                float s = __half2float(*reinterpret_cast<const __half*>(&s_row[cur_g]));
+                float z = __half2float(*reinterpret_cast<const __half*>(&z_row[cur_g]));
                 total += sum_q * s + sum_x * z;
             }
         }
         total += __shfl_down_sync(0xFFFFFFFF, total, 16);
+        total += __shfl_down_sync(0xFFFFFFFF, total, 8);
         if (lane == 0) {
             acc += batch.weights[e] * total;
         }
@@ -2961,6 +3009,7 @@ AIBOX_EXPORT int aibox_gpu_gemma4_moe_q2_batch(
     }
     Gemma4MoeBatchArgs batch = *batch_ptr;
     dim3 grid_g((inter_dim + 3) / 4, batch.k_count);
+    int grid_d = (hidden_dim + 3) / 4;
     grouped_q2_affine_gemv_geglu_f16_kernel<<<grid_g, 128, 0, g_active_stream>>>(
         reinterpret_cast<const __half*>(dev_x),
         batch,
@@ -2968,7 +3017,6 @@ AIBOX_EXPORT int aibox_gpu_gemma4_moe_q2_batch(
         inter_dim,
         hidden_dim
     );
-    int grid_d = (hidden_dim + 3) / 4;
     grouped_q2_affine_down_acc_f16_kernel<<<grid_d, 128, 0, g_active_stream>>>(
         reinterpret_cast<const __half*>(dev_gate_scratch),
         batch,
